@@ -1,4 +1,5 @@
 """Volume-level ACL model and permission check function."""
+from asgiref.sync import sync_to_async
 from django.contrib.auth.models import Group, User
 from django.db import models
 from django.db.models import Q
@@ -34,8 +35,9 @@ async def has_volume_permission(user, volume: Volume, permission: str) -> bool:
     """Check if a user has a given permission on a volume."""
     if volume.public_read and permission == "read":
         return True
-    # AnonymousUser has no groups and can never have ACL entries
-    if not user or not user.is_authenticated:
+    # Resolve the lazy user object in a thread to avoid sync DB access in async context
+    is_authenticated = await sync_to_async(lambda: bool(user and user.is_authenticated))()
+    if not is_authenticated:
         return False
     group_ids = [gid async for gid in Group.objects.filter(user=user).values_list('pk', flat=True).aiterator()]
     return await VolumeACL.objects.filter(

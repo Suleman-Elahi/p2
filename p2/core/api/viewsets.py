@@ -45,7 +45,7 @@ class VolumeViewSet(ModelViewSet):
     def upload(self, request, pk=None):
         """Create blob from HTML Form upload"""
         volume = get_object_for_user_or_404(request.user, 'p2_core.use_volume', pk=pk)
-        count = 0
+        blobs = []
         if not request.user.has_perm('p2_core.create_blob'):
             raise PermissionDenied()
         # If upload was made from a subdirectory, we accept the ?prefix parameter
@@ -54,12 +54,10 @@ class VolumeViewSet(ModelViewSet):
             file = request.FILES[key]
             try:
                 blob = Blob.from_uploaded_file(file, volume, prefix=prefix)
-                count += 1
+                blobs.append({'uuid': blob.uuid, 'path': blob.path, 'filename': blob.filename})
             except BlobException as exc:
                 raise APIException(detail=repr(exc))
-        return Response({
-            'count': count
-        })
+        return Response(blobs)
 
     @action(detail=True, methods=['post'])
     # pylint: disable=invalid-name
