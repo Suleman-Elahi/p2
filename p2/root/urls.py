@@ -1,5 +1,6 @@
 """p2 Root URLs"""
 from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.contrib.auth import views
 from django.urls import include, path
@@ -26,7 +27,7 @@ urlpatterns = [
     path('_/auth/login/', views.LoginView.as_view(), name='auth_login'),
     path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),
     path('', include('p2.s3.urls', namespace='p2_s3')),
-]
+] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
 if settings.DEBUG:
     import debug_toolbar

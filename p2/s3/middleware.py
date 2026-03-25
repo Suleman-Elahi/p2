@@ -15,16 +15,20 @@ CONTENT_LENGTH_HEADER = 'CONTENT_LENGTH'
 class S3RoutingMiddleware:
     """Handle request as S3 request if X-Amz-Date Header is set.
 
-    This middleware is async-compatible: __call__ is defined as async so that
-    the AWS v4 validate() coroutine (which performs an async ORM lookup) can be
-    awaited without blocking the event loop."""
+    Supports both sync and async modes so that non-S3 requests flow through
+    the normal sync middleware chain (preserving session cookie handling)."""
 
     async_capable = True
-    sync_capable = False
+    sync_capable = True
 
     def __init__(self, get_response):
         self.get_response = get_response
         self._s3_base = '.' + CONFIG.y('s3.base_domain')
+        import asyncio
+        if asyncio.iscoroutinefunction(self.get_response):
+            self._is_async = True
+        else:
+            self._is_async = False
 
     def process_exception(self, request: HttpRequest, exception):
         """Catch AWS-specific exceptions and show them as XML response"""
@@ -72,35 +76,38 @@ class S3RoutingMiddleware:
         if ours < theirs_int:
             raise AWSIncompleteBody
 
-    async def __call__(self, request: HttpRequest):
+    def _prepare_s3_request(self, request: HttpRequest, bucket):
+        """Shared setup for S3 requests (sync and async paths)."""
+        request.urlconf = 'p2.s3.explicit_urls'
+        if bucket:
+            request.path = '/' + bucket + request.path
+            request.path_info = '/' + bucket + request.path_info
+        self.check_content_length(request)
+        setattr(request, '_dont_enforce_csrf_checks', True)
+        if request.method in ['GET', 'HEAD']:
+            request.META['HTTP_X_FORWARDED_PROTO'] = 'https'
+
+    def __call__(self, request: HttpRequest):
+        if self._is_async:
+            return self.__acall__(request)
         bucket = self.extract_host_header(request)
         if self.is_aws_request(request) or bucket:
-            # Check if Host header ends with s3.base_domain, if so extract bucket from Host
-            request.urlconf = 'p2.s3.explicit_urls'
-            if bucket:
-                # If bucket was taken from URL, we need to set it as kwarg
-                request.path = '/' + bucket + request.path
-                request.path_info = '/' + bucket + request.path_info
             try:
-                self.check_content_length(request)
-                # Check AWS Authentication.
-                # validate() is async: it awaits the database lookup for the APIKey.
-                # HMAC computation inside validate() is CPU-bound (microseconds) and stays sync.
+                self._prepare_s3_request(request, bucket)
+            except AWSError as exc:
+                return self.process_exception(request, exc)
+        return self.get_response(request)
+
+    async def __acall__(self, request: HttpRequest):
+        bucket = self.extract_host_header(request)
+        if self.is_aws_request(request) or bucket:
+            try:
+                self._prepare_s3_request(request, bucket)
                 if AWSV4Authentication.can_handle(request):
                     handler = AWSV4Authentication(request)
                     user = await handler.validate()
                     request.user = user
-                    # since we don't use django's auth.login, we
-                    # send the signal ourselves
-                    # this also updates user.last_login
                     user_logged_in.send(sender=self, request=request, user=user)
             except AWSError as exc:
                 return self.process_exception(request, exc)
-            # AWS Views don't have CSRF Tokens, hence we use csrf_exempt
-            setattr(request, '_dont_enforce_csrf_checks', True)
-            # GET and HEAD requests are allowed over http, everything else is redirect to https
-            if request.method in ['GET', 'HEAD']:
-                # Set SECURE_PROXY_SSL_HEADER so SecurityMiddleware doesn't return a 302
-                request.META['HTTP_X_FORWARDED_PROTO'] = 'https'
-        response = await self.get_response(request)
-        return response
+        return await self.get_response(request)

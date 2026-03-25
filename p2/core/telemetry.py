@@ -4,25 +4,22 @@ OpenTelemetry instrumentation setup for p2.
 Configures traces, metrics, and log correlation via the OpenTelemetry SDK.
 Called from ASGI application startup before the Django app handles requests.
 """
-from django.conf import settings
 from opentelemetry import metrics, trace
-from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.django import DjangoInstrumentor
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
 def setup_telemetry() -> None:
-    """Initialise OpenTelemetry SDK: traces, metrics, and log correlation.
+    """Initialise OpenTelemetry SDK: traces, metrics, and log correlation."""
+    from django.conf import settings
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.django import DjangoInstrumentor
+    from opentelemetry.instrumentation.logging import LoggingInstrumentor
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    Must be called once at ASGI startup before any requests are handled.
-    Satisfies Requirements 9.1, 9.2, 9.6.
-    """
     resource = Resource.create({"service.name": settings.OTEL_SERVICE_NAME})
 
     tracer_provider = TracerProvider(resource=resource)
