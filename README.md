@@ -123,7 +123,69 @@ Clients (AWS CLI / boto3 / SDKs / Browser)
 
 **tier0 / Serve** — a gRPC service that maps URL patterns (regex) to blob lookups, enabling custom URL schemes for serving files.
 
-## API
+## S3 CLI usage
+
+Configure an AWS CLI profile pointing at your local p2 instance:
+
+```bash
+aws configure --profile p2
+# AWS Access Key ID: <your API key>
+# AWS Secret Access Key: <your API secret>
+# Default region name: us-east-1
+# Default output format: json
+```
+
+Or add it directly to `~/.aws/credentials` and `~/.aws/config`:
+
+```ini
+# ~/.aws/credentials
+[p2]
+aws_access_key_id = <your-api-key>
+aws_secret_access_key = <your-api-secret>
+
+# ~/.aws/config
+[profile p2]
+region = us-east-1
+```
+
+API keys are managed at `/_/ui/api/key/`.
+
+### Common operations
+
+```bash
+# List buckets (volumes)
+aws s3 ls --profile p2 --endpoint-url http://localhost:8000
+
+# Upload a single file
+aws s3 cp README.md s3://my-volume/ --profile p2 --endpoint-url http://localhost:8000
+
+# Upload a directory recursively (exclude common noise)
+aws s3 sync . s3://my-volume/ --profile p2 --endpoint-url http://localhost:8000 \
+  --exclude ".git/*" \
+  --exclude ".venv/*"
+
+# Download a file
+aws s3 cp s3://my-volume/README.md ./README.md --profile p2 --endpoint-url http://localhost:8000
+
+# List objects in a bucket
+aws s3 ls s3://my-volume/ --profile p2 --endpoint-url http://localhost:8000
+
+# Delete an object
+aws s3 rm s3://my-volume/README.md --profile p2 --endpoint-url http://localhost:8000
+```
+
+> Note: volumes must have a `VolumeACL` entry for your user before S3 access works.
+> New volumes created via the UI automatically get full permissions for the creator.
+> For volumes created via migrations or scripts, add the ACL through the Django shell:
+> ```python
+> from p2.core.models import Volume
+> from p2.core.acl import VolumeACL
+> from django.contrib.auth.models import User
+> user = User.objects.get(username='admin')
+> volume = Volume.objects.get(name='my-volume')
+> VolumeACL.objects.get_or_create(volume=volume, user=user,
+>     defaults={'permissions': ['read', 'write', 'delete', 'list', 'admin']})
+> ```
 
 The REST API is available at `/_/api/v1/`. Interactive docs:
 - Swagger UI: `/_/api/schema/swagger-ui/`
