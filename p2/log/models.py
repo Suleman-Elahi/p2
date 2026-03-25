@@ -1,6 +1,5 @@
 """p2 log models"""
 
-from django.contrib.postgres.fields import JSONField
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.utils.translation import gettext as _
@@ -42,7 +41,7 @@ class Record(UUIDModel):
     start_time = models.DateTimeField()
     end_time = models.DateTimeField(blank=True, null=True)
     request_uid = models.UUIDField(blank=True, null=True)
-    body = JSONField(default=dict, encoder=DjangoJSONEncoder)
+    body = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
 
     def __str__(self):
         body_string = ' '.join(["%s=%s" % kv for kv in self.body.items()])

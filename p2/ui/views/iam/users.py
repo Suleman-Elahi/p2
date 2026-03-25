@@ -3,19 +3,18 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionListMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.auth.models import User
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
-from guardian.shortcuts import get_anonymous_user
 
 from p2.iam.forms import UserForm
 from p2.lib.views import CreateAssignPermView
 
 
-class UserListView(PermissionListMixin, LoginRequiredMixin, ListView):
+class UserListView(LoginRequiredMixin, ListView):
     """List all Users the user has access to"""
 
     model = User
@@ -24,7 +23,7 @@ class UserListView(PermissionListMixin, LoginRequiredMixin, ListView):
     paginate_by = 10
 
     def get_queryset(self, *args, **kwargs):
-        return super().get_queryset(*args, **kwargs).exclude(pk=get_anonymous_user().pk)
+        return super().get_queryset(*args, **kwargs)
 
 
 class UserCreateView(SuccessMessageMixin, DjangoPermissionListMixin, CreateAssignPermView):

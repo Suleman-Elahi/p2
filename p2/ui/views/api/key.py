@@ -3,18 +3,18 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionListMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
 
 from p2.api.forms import APIKeyForm
 from p2.api.models import APIKey
 from p2.lib.views import CreateAssignPermView
 
 
-class APIKeyListView(PermissionListMixin, LoginRequiredMixin, ListView):
+class APIKeyListView(LoginRequiredMixin, ListView):
     """List all access keys the user has access to"""
 
     model = APIKey

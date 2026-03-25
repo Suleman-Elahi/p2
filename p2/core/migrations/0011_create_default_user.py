@@ -5,9 +5,9 @@ from django.db import migrations
 
 def create_default_user(apps, schema_editor):
     from django.contrib.auth.models import User
-    from guardian.conf import settings as guardian_settings
-    # Ignore Anonymous User
-    if not User.objects.all().exclude(username=guardian_settings.ANONYMOUS_USER_NAME).exists():
+    # 'AnonymousUser' was the default guardian ANONYMOUS_USER_NAME
+    anonymous_username = 'AnonymousUser'
+    if not User.objects.all().exclude(username=anonymous_username).exists():
         User.objects.create_superuser(
             username='admin',
             email='admin@p2.local',

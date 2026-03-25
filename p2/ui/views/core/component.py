@@ -2,13 +2,12 @@
 from django.contrib import messages
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionRequiredMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.http import Http404
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, UpdateView
-from guardian.mixins import PermissionRequiredMixin
-from guardian.shortcuts import get_objects_for_user
 
 from p2.core.models import Component
 from p2.lib.reflection import path_to_class
@@ -36,8 +35,8 @@ class ComponentCreateView(SuccessMessageMixin, DjangoPermissionRequiredMixin, Cr
 
     def get_form_class(self):
         # We need to lookup the volume so we know which volume to assign the component to
-        self.volume = get_objects_for_user(self.request.user, 'p2_core.view_volume') \
-            .filter(pk=self.kwargs.get('pk')).first()
+        from p2.core.models import Volume
+        self.volume = Volume.objects.filter(pk=self.kwargs.get('pk')).first()
         controller_path = self.request.GET.get('controller')
         if controller_path in COMPONENT_MANAGER:
             controller = path_to_class(controller_path)

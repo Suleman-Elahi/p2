@@ -4,9 +4,9 @@ from collections import ChainMap
 from time import time
 from uuid import uuid4
 
-from structlog import get_logger
+import logging
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 class LogAdaptor:
     """Cache logged data and add log method to request"""

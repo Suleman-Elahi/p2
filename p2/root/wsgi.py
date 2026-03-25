@@ -10,11 +10,11 @@ import os
 from time import time
 
 from django.core.wsgi import get_wsgi_application
-from structlog import get_logger
+import logging
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "p2.root.settings")
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 
 class WSGILogger:

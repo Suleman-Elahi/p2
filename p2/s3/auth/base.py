@@ -13,7 +13,6 @@ class BaseAuth:
         """Return True if this class can handle request"""
         raise NotImplementedError
 
-    def validate(self):
-        """Return a tuple of User, None if authentication was
-        successful or None, ErrorCode if not"""
+    async def validate(self):
+        """Return a User if authentication was successful, or raise an AWSError subclass"""
         raise NotImplementedError

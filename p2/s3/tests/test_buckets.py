@@ -4,9 +4,9 @@ from uuid import uuid4
 import boto3
 from django.contrib.auth.models import User
 from django.test import LiveServerTestCase
-from guardian.shortcuts import assign_perm
 
 from p2.api.models import APIKey
+from p2.core.acl import VolumeACL
 from p2.core.models import Storage, Volume
 from p2.s3.constants import TAG_S3_DEFAULT_STORAGE
 
@@ -31,7 +31,7 @@ class BucketTests(LiveServerTestCase):
         self.boto3 = session.client(
             service_name='s3',
             aws_access_key_id=self.access_key.access_key,
-            aws_secret_access_key=self.access_key.secret_key,
+            aws_secret_access_key=self.access_key.decrypt_secret_key(),
             endpoint_url=self.live_server_url,
         )
 
@@ -39,7 +39,11 @@ class BucketTests(LiveServerTestCase):
         """Test bucket list operation"""
         self.assertEqual(len(self.boto3.list_buckets()['Buckets']), 0)
         volume = Volume.objects.create(name='test-1', storage=self.storage)
-        assign_perm('use_volume', self.user, volume)
+        VolumeACL.objects.create(
+            volume=volume,
+            user=self.user,
+            permissions=['read', 'write', 'list'],
+        )
         self.assertEqual(len(self.boto3.list_buckets()['Buckets']), 1)
         self.assertEqual(self.boto3.list_buckets()['Buckets'][0]['Name'], 'test-1')
         volume.delete()

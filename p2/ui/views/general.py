@@ -2,14 +2,12 @@
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.cache import cache
 from django.views.generic import ListView
-from guardian.mixins import PermissionListMixin
-from guardian.shortcuts import get_objects_for_user
 
 from p2.core.models import Blob, Volume
 from p2.ui.constants import CACHE_KEY_BLOB_COUNT
 
 
-class IndexView(LoginRequiredMixin, PermissionListMixin, ListView):
+class IndexView(LoginRequiredMixin, ListView):
     """Show overview of volumes"""
 
     model = Volume
@@ -41,5 +39,5 @@ class SearchView(LoginRequiredMixin, ListView):
     template_name = 'search/results.html'
 
     def get_queryset(self):
-        return get_objects_for_user(self.request.user, 'p2_core.view_blob').filter(
+        return Blob.objects.filter(
             path__icontains=self.request.GET.get('q', '')).order_by(self.ordering)

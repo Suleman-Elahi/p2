@@ -9,14 +9,14 @@ from urllib.parse import urlparse
 import yaml
 from django.conf import ImproperlyConfigured
 from django.utils.autoreload import autoreload_started
-from structlog import get_logger
+import logging
 
 SEARCH_PATHS = [
     'p2/lib/default.yml',
     '/etc/p2/config.yml',
     '',
 ] + glob('/etc/p2/config.d/*.yml', recursive=True)
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 ENV_PREFIX = 'P2'
 ENVIRONMENT = os.getenv(f'{ENV_PREFIX}_ENV', 'local')
 

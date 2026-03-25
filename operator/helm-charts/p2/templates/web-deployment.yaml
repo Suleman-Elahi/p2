@@ -1,4 +1,4 @@
-apiVersion: apps/v1beta2
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "p2.fullname" . }}-web
@@ -73,16 +73,15 @@ spec:
           image: "docker.beryju.org/p2/server:{{ .Values.version }}"
           imagePullPolicy: IfNotPresent
           command:
-            - uwsgi
+            - uvicorn
           args:
-            - --http 0.0.0.0:8000
-            - --wsgi-file p2/root/wsgi.py
-            - --master
-            - --processes 24
-            - --threads 2
-            - --offload-threads 4
-            - --stats 0.0.0.0:8001
-            - --stats-http
+            - p2.core.asgi:application
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --loop
+            - uvloop
           envFrom:
             - configMapRef:
                 name: {{ include "p2.fullname" . }}-config
@@ -112,9 +111,6 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
-            - name: uwsgiStats
-              containerPort: 8000
-              protocol: TCP
             - name: prometheus
               containerPort: 9102
               protocol: TCP
@@ -124,11 +120,11 @@ spec:
           livenessProbe:
             httpGet:
               path: /
-              port: uwsgiStats
+              port: http
           readinessProbe:
             httpGet:
               path: /
-              port: uwsgiStats
+              port: http
           resources:
             requests:
               cpu: 100m

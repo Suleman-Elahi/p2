@@ -1,43 +1,13 @@
-"""p2 replication component tasks"""
-from structlog import get_logger
+"""
+p2 replication component tasks — DEPRECATED (Celery removed).
 
-from p2.components.replication.controller import ReplicationController
-from p2.core.celery import CELERY_APP
-from p2.core.models import Blob, Volume
+Async arq implementations are in ``p2.core.worker``:
 
-LOGGER = get_logger()
+    - ``replicate_metadata(ctx, blob_pk)``
+    - ``replicate_payload(ctx, blob_pk)``
+    - ``replicate_delete(ctx, blob_pk)``
+    - ``initial_full_replication(ctx, volume_pk)``
 
-@CELERY_APP.task
-def replicate_metadata_update_task(source_blob_pk):
-    """Run Replication-MetadataUpdate operation in worker thread"""
-    blob = Blob.objects.get(pk=source_blob_pk)
-    replication_component = blob.volume.component(ReplicationController)
-    if replication_component:
-        replication_component.controller.metadata_update(blob).save()
-
-
-@CELERY_APP.task
-def replicate_payload_update_task(source_blob_pk):
-    """Run Replication-PayloadUpdate operation in worker thread"""
-    blob = Blob.objects.get(pk=source_blob_pk)
-    replication_component = blob.volume.component(ReplicationController)
-    if replication_component:
-        replication_component.controller.payload_update(blob).save()
-
-
-@CELERY_APP.task
-def replicate_delete_task(source_blob_pk):
-    """Run Replication-Save operation in worker thread"""
-    blob = Blob.objects.get(pk=source_blob_pk)
-    replication_component = blob.volume.component(ReplicationController)
-    if replication_component:
-        replication_component.controller.delete(blob)
-
-
-@CELERY_APP.task
-def initial_full_replication(volume_pk):
-    """Initial full replication after Component is configured"""
-    source_volume = Volume.objects.get(pk=volume_pk)
-    replication_component = source_volume.component(ReplicationController)
-    assert replication_component, "ReplicationController not configured"
-    replication_component.controller.full_replication(source_volume)
+These functions are registered in ``WorkerSettings.functions`` and are
+enqueued via an arq Redis pool (see ``p2/components/replication/signals.py``).
+"""

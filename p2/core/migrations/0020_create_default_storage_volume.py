@@ -8,7 +8,6 @@ def create_default_storage(apps, schema_editor):
     from django.conf import settings
     from p2.lib.reflection import class_to_path
     from p2.storage.local.constants import TAG_ROOT_PATH
-    from guardian.conf import settings as guardian_settings
     from p2.storage.local.controller import LocalStorageController
     Storage = apps.get_model('p2_core', 'Storage')
     Volume = apps.get_model('p2_core', 'Volume')

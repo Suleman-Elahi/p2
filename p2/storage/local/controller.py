@@ -1,18 +1,22 @@
 """p2 local store controller"""
+import mimetypes
 import os
 from io import RawIOBase
 from shutil import copyfileobj
+from typing import AsyncIterator
 
+import aiofiles
+import aiofiles.os
 import magic
-from structlog import get_logger
+import logging
 
 from p2.core.constants import (ATTR_BLOB_IS_TEXT, ATTR_BLOB_MIME,
                                ATTR_BLOB_SIZE_BYTES)
 from p2.core.models import Blob
-from p2.core.storages.base import StorageController
+from p2.core.storages.base import AsyncStorageController, StorageController
 from p2.storage.local.constants import TAG_ROOT_PATH
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 TEXT_CHARACTERS = str.encode("".join(list(map(chr, range(32, 127))) + list("\n\r\t\b")))
 
 class LocalStorageController(StorageController):
@@ -87,3 +91,57 @@ class LocalStorageController(StorageController):
             LOGGER.debug("LocalStorageController::Delete", file=fs_path)
         else:
             LOGGER.warning("File does not exist during deletion attempt.", file=fs_path)
+
+
+CHUNK_SIZE = 64 * 1024  # 64 KB
+
+
+class AsyncLocalStorageController(AsyncStorageController):
+    """Async local storage controller using aiofiles for filesystem I/O."""
+
+    def __init__(self, tags: dict):
+        self.tags = tags
+
+    def _build_path(self, blob: Blob) -> str:
+        root = self.tags.get(TAG_ROOT_PATH)
+        return os.path.join(root, blob.uuid.hex)
+
+    async def _get_read_stream(self, blob: Blob) -> AsyncIterator[bytes]:
+        """Yield 64 KB chunks from the blob file asynchronously."""
+        fs_path = self._build_path(blob)
+        async with aiofiles.open(fs_path, 'rb') as f:
+            while True:
+                chunk = await f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+
+    async def _commit(self, blob: Blob, stream: AsyncIterator[bytes]) -> None:
+        """Write blob data from an async iterator to the filesystem."""
+        fs_path = self._build_path(blob)
+        os.makedirs(os.path.dirname(fs_path), exist_ok=True)
+        async with aiofiles.open(fs_path, 'wb') as f:
+            async for chunk in stream:
+                await f.write(chunk)
+
+    async def _collect_attributes(self, blob: Blob) -> dict:
+        """Collect size and MIME type using stdlib; update blob.attributes."""
+        fs_path = self._build_path(blob)
+        size = os.path.getsize(fs_path)
+        mime_type, _ = mimetypes.guess_type(fs_path)
+        if mime_type is None:
+            mime_type = 'application/octet-stream'
+        blob.attributes[ATTR_BLOB_SIZE_BYTES] = str(size)
+        blob.attributes[ATTR_BLOB_MIME] = mime_type
+        return {
+            ATTR_BLOB_SIZE_BYTES: str(size),
+            ATTR_BLOB_MIME: mime_type,
+        }
+
+    async def _delete(self, blob: Blob) -> None:
+        """Delete the blob file asynchronously."""
+        fs_path = self._build_path(blob)
+        try:
+            await aiofiles.os.remove(fs_path)
+        except FileNotFoundError:
+            LOGGER.warning("File does not exist during async deletion attempt.", file=fs_path)

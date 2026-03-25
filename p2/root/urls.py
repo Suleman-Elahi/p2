@@ -21,7 +21,7 @@ urlpatterns = [
     path('_/admin/', admin.site.urls),
     path('_/api/', include('p2.api.urls', namespace='p2_api')),
     path('_/ui/', include('p2.ui.urls', namespace='p2_ui')),
-    path('_/oidc/', include('mozilla_django_oidc.urls')),
+    path('_/oidc/', include('p2.auth.urls', namespace='p2_auth')),
     path('_/auth/password/', views.PasswordChangeView.as_view(), name='auth_password'),
     path('_/auth/login/', views.LoginView.as_view(), name='auth_login'),
     path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),

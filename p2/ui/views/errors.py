@@ -7,7 +7,6 @@ from django.http.response import (HttpResponseBadRequest,
                                   HttpResponseServerError)
 from django.template.response import TemplateResponse
 from django.views.generic import TemplateView
-from sentry_sdk import last_event_id
 
 
 class BadRequestTemplateResponse(TemplateResponse, HttpResponseBadRequest):
@@ -39,6 +38,5 @@ class ServerErrorView(TemplateView):
             'exception': str(type_),
             'error': traceback.format_tb(trace),
             'hide_navbar': True,
-            'sentry_event_id': last_event_id()
         }
         return super().dispatch(*args, **kwargs)

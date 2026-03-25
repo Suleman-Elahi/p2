@@ -4,7 +4,6 @@ from uuid import uuid4
 import boto3
 from django.contrib.auth.models import User
 from django.test import LiveServerTestCase
-from guardian.shortcuts import assign_perm
 
 from p2.api.models import APIKey
 from p2.core.models import Volume
@@ -28,12 +27,10 @@ class S3TestCase(LiveServerTestCase):
         self.storage.save()
         self.volume = Volume.objects.create(
             name='test-1', storage=self.storage)
-        assign_perm('p2_core.use_volume', self.user, self.volume)
-        assign_perm('p2_core.add_blob', self.user)
         session = boto3.session.Session()
         self.boto3 = session.client(
             service_name='s3',
             aws_access_key_id=self.access_key.access_key,
-            aws_secret_access_key=self.access_key.secret_key,
+            aws_secret_access_key=self.access_key.decrypt_secret_key(),
             endpoint_url=self.live_server_url,
         )

@@ -23,7 +23,7 @@
             {% endblocktrans %}
           </h6>
           <p class="card-text">
-            {% blocktrans with usage=volume.space_used|filesizeformat %}
+            {% blocktrans with usage=volume.space_used_bytes|filesizeformat %}
             Using {{ usage }} space.
             {% endblocktrans %}
             <hr>

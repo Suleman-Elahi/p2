@@ -6,15 +6,14 @@ from urllib.parse import quote
 
 from django.contrib.auth.models import User
 from django.http import HttpRequest, QueryDict
-from structlog import get_logger
+import logging
 
 from p2.api.models import APIKey
-from p2.lib.hash import chunked_hasher
 from p2.s3.auth.base import BaseAuth
 from p2.s3.errors import (AWSAccessDenied, AWSContentSignatureMismatch,
                           AWSSignatureMismatch)
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
 
 
@@ -159,12 +158,10 @@ class AWSV4Authentication(BaseAuth):
         ]
         return '\n'.join(canonical_request)
 
-    def _lookup_access_key(self, access_key: str) -> Optional[APIKey]:
-        """Lookup access_key in database, return secret if found otherwise None"""
-        keys = APIKey.objects.filter(access_key=access_key)
-        if keys.exists():
-            return keys.first()
-        return None
+    async def _lookup_access_key(self, access_key: str) -> Optional[APIKey]:
+        """Lookup access_key in database, return APIKey if found otherwise None.
+        Uses async ORM to avoid blocking the event loop during database I/O."""
+        return await APIKey.objects.filter(access_key=access_key).afirst()
 
     @staticmethod
     def can_handle(request: HttpRequest) -> bool:
@@ -175,7 +172,10 @@ class AWSV4Authentication(BaseAuth):
         return False
 
     def verify_content_sha256(self, auth_request: AWSv4AuthenticationRequest):
-        """Verify X-Amz-Content-Sha256 Header, if sent"""
+        """Verify X-Amz-Content-Sha256 Header, if sent.
+
+        HMAC computation is CPU-bound and completes in microseconds; no async wrapping needed.
+        request.body is pre-buffered by Django ASGI handler, so no async streaming is required."""
         # Header not set -> Empty hash, no checking
         if not auth_request.hash:
             auth_request.hash = ''
@@ -183,29 +183,33 @@ class AWSV4Authentication(BaseAuth):
         # Client has not calculated SHA256 of payload, no checking
         if auth_request.hash == UNSIGNED_PAYLOAD:
             return
-        # Read request body chunk by chunk, compute sha256 and compare.
-        request_body_hash = chunked_hasher(hashlib.sha256(), self.request)
+        # request.body is already fully buffered by Django's ASGI handler.
+        # Compute SHA256 directly over the buffered bytes — no chunked reading needed.
+        request_body_hash = hashlib.sha256(self.request.body).hexdigest()
         if auth_request.hash != request_body_hash:
             LOGGER.warning("CONTENT_SHA256 Header/param incorrect",
                            theirs=auth_request.hash,
                            ours=request_body_hash)
             raise AWSContentSignatureMismatch
 
-    def validate(self) -> Optional[User]:
+    async def validate(self) -> Optional[User]:
         """Check Authorization Header in AWS Compatible format"""
         auth_request = AWSv4AuthenticationRequest.from_header(self.request.META)
         if not auth_request:
             auth_request = AWSv4AuthenticationRequest.from_querystring(self.request.GET)
         auth_request.hash = self.request.META.get('HTTP_X_AMZ_CONTENT_SHA256')
 
-        # Verify given Hash with request body
+        # Verify given Hash with request body.
+        # HMAC computation is CPU-bound and completes in microseconds; no async wrapping needed.
         self.verify_content_sha256(auth_request)
         # Build our own signature to compare
-        secret_key = self._lookup_access_key(auth_request.access_key)
+        secret_key = await self._lookup_access_key(auth_request.access_key)
         if not secret_key:
             LOGGER.warning("No secret key found for request", access_key=auth_request.access_key)
             raise AWSAccessDenied
-        signing_key = self._get_signature_key(secret_key.secret_key, auth_request)
+        # _get_signature_key and _sign are pure HMAC computations (CPU-bound, microseconds).
+        # No async wrapping needed.
+        signing_key = self._get_signature_key(secret_key.decrypt_secret_key(), auth_request)
         canonical_request = self._get_canonical_request(auth_request)
         string_to_sign = '\n'.join([
             auth_request.algorithm,

@@ -1,16 +1,19 @@
-"""p2 Worker management command"""
+"""p2 Worker management command — runs the arq async worker."""
+import logging
 
 from django.core.management.base import BaseCommand
-from structlog import get_logger
 
-from p2.core.celery import CELERY_APP
-
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    """Run Celery Worker"""
+    """Run arq Worker"""
+
+    help = "Run the arq async task worker"
 
     def handle(self, *args, **options):
-        """celery worker"""
-        CELERY_APP.worker_main(['worker', '--autoscale=10,3', '-E', '-B'])
+        """Start arq worker"""
+        import asyncio
+        from arq import run_worker
+        from p2.core.worker import WorkerSettings
+        asyncio.run(run_worker(WorkerSettings))

@@ -6,12 +6,11 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionListMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, FormView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
-from guardian.shortcuts import get_objects_for_user
 
 from p2.grpc.protos.serve_pb2 import ServeRequest
 from p2.lib.shortcuts import get_object_for_user_or_404
@@ -19,9 +18,10 @@ from p2.lib.views import CreateAssignPermView
 from p2.serve.forms import ServeRuleDebugForm, ServeRuleForm
 from p2.serve.grpc import Serve, hijack_log
 from p2.serve.models import ServeRule
+from p2.core.models import Blob
 
 
-class ServeRuleListView(PermissionListMixin, LoginRequiredMixin, ListView):
+class ServeRuleListView(LoginRequiredMixin, ListView):
     """List all serve rules the user has access to"""
 
     model = ServeRule
@@ -114,7 +114,7 @@ class ServeRuleDebugView(PermissionRequiredMixin, FormView):
                 lookup = _mw.rule_lookup(request, self.get_object(), match_object)
         except Exception as exc:  # pylint: disable=broad-except
             log_output = StringIO(str(exc))
-        blob = get_objects_for_user(self.request.user, 'p2_core.view_blob').filter(**lookup)
+        blob = Blob.objects.filter(**lookup)
         log_output.write(f"Found object {blob}\n")
         log_output.seek(0)
         form = ServeRuleDebugForm(

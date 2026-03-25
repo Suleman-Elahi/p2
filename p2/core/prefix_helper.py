@@ -3,12 +3,11 @@ import posixpath
 import re
 from typing import List
 
-from guardian.shortcuts import get_objects_for_user
-from structlog import get_logger
+import logging
 
 from p2.core.constants import ATTR_BLOB_IS_FOLDER
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 SEPARATOR = posixpath.sep
 
 def make_absolute_path(path):
@@ -135,7 +134,8 @@ class PrefixHelper:
     def collect(self, max_levels=0):
         """Get Prefixes for user, optionally filtering out prefixes
         not starting with `base`"""
-        base_lookup = get_objects_for_user(self._user, 'p2_core.view_blob').filter(
+        from p2.core.models import Blob
+        base_lookup = Blob.objects.filter(
             volume=self._volume,
             prefix__startswith=self._base)
         file_objects = base_lookup.distinct("prefix")

@@ -1,0 +1,52 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: p2
+      POSTGRES_USER: p2
+      POSTGRES_PASSWORD: p2
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  web:
+    build: .
+    command: uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+      - media:/app/media
+    ports:
+      - "8000:8000"
+    environment:
+      DJANGO_SETTINGS_MODULE: p2.core.settings
+      DATABASE_URL: postgresql://p2:p2@db:5432/p2
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      - db
+      - redis
+
+  worker:
+    build: .
+    command: uv run python -m arq p2.core.worker.WorkerSettings
+    volumes:
+      - .:/app
+      - media:/app/media
+    environment:
+      DJANGO_SETTINGS_MODULE: p2.core.settings
+      DATABASE_URL: postgresql://p2:p2@db:5432/p2
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      - db
+      - redis
+
+volumes:
+  postgres_data:
+  media:

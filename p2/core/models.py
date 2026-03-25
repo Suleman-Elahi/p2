@@ -1,45 +1,37 @@
 """p2 Core models"""
 import posixpath
 
-from django.contrib.postgres.fields import JSONField
-from django.contrib.postgres.fields.jsonb import KeyTextTransform
+from asgiref.sync import async_to_sync
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
-from django.db.models import BigIntegerField, Sum
-from django.db.models.functions import Cast
-from django.utils.functional import cached_property
+from django.db.models import F
+from django.db.models.functions import Greatest
 from django.utils.timezone import now
 from django.utils.translation import gettext as _
-from django_prometheus.models import ExportModelOperationsMixin
-from structlog import get_logger
+import logging
 
 from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_SIZE_BYTES,
                                ATTR_BLOB_STAT_CTIME, ATTR_BLOB_STAT_MTIME)
+from p2.core.events import (STREAM_BLOB_PAYLOAD_UPDATED, STREAM_BLOB_POST_SAVE,
+                             make_event, publish_event)
 from p2.core.prefix_helper import make_absolute_path, make_absolute_prefix
-from p2.core.tasks import signal_marshall
 from p2.core.validators import validate_blob_path
 from p2.lib.models import TagModel, UUIDModel
 from p2.lib.reflection import class_to_path, path_to_class
 from p2.lib.reflection.manager import ControllerManager
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 STORAGE_MANAGER = ControllerManager('storage.controllers', lazy=True)
 COMPONENT_MANAGER = ControllerManager('component.controllers', lazy=True)
 
 
-class Volume(ExportModelOperationsMixin('volume'), UUIDModel, TagModel):
+class Volume(UUIDModel, TagModel):
     """Folder-like object, holding a collection of blobs"""
 
     name = models.SlugField(unique=True, max_length=63)
     storage = models.ForeignKey('Storage', on_delete=models.CASCADE)
-
-    @cached_property
-    def space_used(self):
-        """Return summed up size of all blobs in this volume."""
-        return self.blob_set.all().annotate(
-            size_value=Cast(KeyTextTransform(
-                ATTR_BLOB_SIZE_BYTES, 'attributes'), BigIntegerField())
-        ).aggregate(sum=Sum('size_value')).get('sum', 0)
+    space_used_bytes = models.BigIntegerField(default=0)
+    public_read = models.BooleanField(default=False)
 
     def component(self, class_or_path):
         """Get component instance for class or class path.
@@ -67,14 +59,14 @@ class Volume(ExportModelOperationsMixin('volume'), UUIDModel, TagModel):
 
 
 # pylint: disable=too-many-instance-attributes
-class Blob(ExportModelOperationsMixin('blob'), UUIDModel, TagModel):
+class Blob(UUIDModel, TagModel):
     """Binary-large object, member of a Volume and store in the volume's storage"""
 
     path = models.TextField(validators=[validate_blob_path])
     prefix = models.TextField()
 
     volume = models.ForeignKey('Volume', on_delete=models.CASCADE)
-    attributes = JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
+    attributes = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
 
     _writing_handle = None
     _reading_handle = None
@@ -175,18 +167,32 @@ class Blob(ExportModelOperationsMixin('blob'), UUIDModel, TagModel):
         self.volume.storage.controller.collect_attributes(self)
         super().save(*args, **kwargs)
         if self._writing_handle:
-            signal_marshall.delay('p2.core.signals.BLOB_PAYLOAD_UPDATED', kwargs={
-                'blob': {
-                    'class': class_to_path(self.__class__),
-                    'pk': self.uuid.hex,
-                }
-            })
+            # Atomically increment space_used_bytes after payload is committed and attributes collected
+            size = int(self.attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
+            if size > 0:
+                Volume.objects.filter(pk=self.volume_id).update(
+                    space_used_bytes=F('space_used_bytes') + size
+                )
+        # Publish post-save event asynchronously via Redis Streams
+        _publish = async_to_sync(publish_event)
+        _publish(STREAM_BLOB_POST_SAVE, make_event(
+            blob_uuid=self.uuid.hex,
+            volume_uuid=self.volume.uuid.hex,
+            event_type='blob_post_save',
+        ))
+        if self._writing_handle:
+            # Publish payload-updated event only when payload changed
+            _publish(STREAM_BLOB_PAYLOAD_UPDATED, make_event(
+                blob_uuid=self.uuid.hex,
+                volume_uuid=self.volume.uuid.hex,
+                event_type='blob_payload_updated',
+            ))
 
     def __str__(self):
         return f"{self.volume.name}:/{self.path}"
 
 
-class Storage(ExportModelOperationsMixin('storage'), UUIDModel, TagModel):
+class Storage(UUIDModel, TagModel):
     """Storage instance which stores blob instances."""
 
     name = models.TextField()
@@ -217,7 +223,7 @@ class Storage(ExportModelOperationsMixin('storage'), UUIDModel, TagModel):
         )
 
 
-class Component(ExportModelOperationsMixin('component'), UUIDModel, TagModel):
+class Component(UUIDModel, TagModel):
     """Pluggable component instance connection volume to ComponentController"""
 
     enabled = models.BooleanField(default=True)

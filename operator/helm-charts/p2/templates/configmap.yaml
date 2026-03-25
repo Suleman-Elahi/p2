@@ -8,6 +8,16 @@ data:
   s3.base_domain: {{ (index .Values.ingress.hosts 0) | quote }}
   # Set this to true if you only want to use external authentication
   external_auth_only: {{ .Values.config.external_auth_only | quote }}
+  # Redis connection URL for cache and event bus
+  REDIS_URL: "redis://{{ .Release.Name }}-redis-master:6379/0"
+  # arq task queue Redis URL
+  ARQ_REDIS_URL: "redis://{{ .Release.Name }}-redis-master:6379/1"
+  # OpenTelemetry collector endpoint (OTLP gRPC)
+  OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | default "" | quote }}
+  # OpenTelemetry service name
+  OTEL_SERVICE_NAME: {{ .Values.config.otelServiceName | default "p2" | quote }}
+  # Fernet key for encrypting secrets at rest
+  FERNET_KEY: {{ .Values.config.fernetKey | default "" | quote }}
   # Callback URL: <base url>/_/oidc/callback/
   {{- if .Values.config.oidc.enabled -}}
   oidc.enabled: 'true'

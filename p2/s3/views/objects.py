@@ -1,105 +1,103 @@
 """p2 S3 Object views"""
-from django.core.cache import cache
-from django.http.response import HttpResponse
-from guardian.shortcuts import assign_perm, get_objects_for_user
-from structlog import get_logger
+import asyncio
+import logging
+
+from asgiref.sync import sync_to_async
+from django.http.response import HttpResponse, StreamingHttpResponse
 
 from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
                                ATTR_BLOB_SIZE_BYTES)
-from p2.core.http import BlobResponse
-from p2.core.models import Blob, Volume
-from p2.core.prefix_helper import make_absolute_path, make_absolute_prefix
-from p2.s3.errors import AWSAccessDenied, AWSNoSuchBucket, AWSNoSuchKey
+from p2.core.models import Blob
+from p2.core.signals import BLOB_PRE_SAVE
+from p2.core.storages.base import AsyncStorageController
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
+
+
+async def _request_body_chunks(request):
+    """Async generator yielding the request body as a single chunk."""
+    body = request.body  # already buffered by Django ASGI handler
+    if body:
+        yield body
+
+
+async def _blob_read_stream(blob):
+    """Async generator streaming blob data from storage."""
+    controller = blob.volume.storage.controller
+    if isinstance(controller, AsyncStorageController):
+        async for chunk in controller.get_read_stream(blob):
+            yield chunk
+    else:
+        # Sync fallback: read in thread pool to avoid blocking the event loop.
+        data = await asyncio.to_thread(blob.read)
+        if data:
+            yield data
+
+
+def _fire_pre_save(blob):
+    """Send BLOB_PRE_SAVE signal synchronously (quota check)."""
+    BLOB_PRE_SAVE.send(sender=Blob, blob=blob)
 
 
 class ObjectView(S3View):
-    """Object related views"""
+    """Object related views — all handlers are async. Requirements: 2.1, 2.2, 2.3, 2.6, 4.2, 8.3"""
 
-    volume = None
-
-    def dispatch(self, request, bucket, path):
-        """Preflight checks, lookup volume, etc"""
-        # Preflight volume check - Check for use_volume permission is POST & PUT, otherwise
-        # we don't care about volume permission here
-        if request.method in ['POST', 'PUT']:
-            volumes = get_objects_for_user(request.user, 'p2_core.use_volume').filter(name=bucket)
-        else:
-            volumes = Volume.objects.filter(name=bucket)
-        if not volumes.exists():
-            raise AWSNoSuchBucket
-        self.volume = volumes.first()
-        # Make sure path is prefixed with /
-        # If path ends with /, a path to a folder has been given
-        if path.endswith('/'):
-            path = make_absolute_prefix(path)
-        else:
-            path = make_absolute_path(path)
-        return super().dispatch(request, bucket, path)
-
-    ## HTTP Method handlers
-
-    def head(self, request, bucket, path):
+    async def head(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html"""
-        # blob = self.get_blob('view_blob', path=path, volume__name=bucket)
-        # We can't use self.get_blob here, since this endpoint needs to return
-        # a blank 404 response when the key wasn't found.
-        blobs = get_objects_for_user(self.request.user, 'view_blob', Blob).filter(
-            path=path, volume__name=bucket)
-        if not blobs.exists():
+        volume = await self.get_volume(request.user, bucket, 'read')
+        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
+        if blob is None:
             return HttpResponse(status=404)
-        # We're not using BlobResponse here since we only want the attributes
         response = HttpResponse(status=200)
-        response['Content-Length'] = blobs.first().attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
-        response['Content-Type'] = blobs.first().attributes.get(ATTR_BLOB_MIME, 'text/plain')
+        response['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
+        response['Content-Type'] = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
         return response
 
-    def get(self, request, bucket, path):
+    async def get(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html"""
-        cache_key = f"{self.request.user.pk}:{bucket}/{path}"
-        cached_data = cache.get(cache_key)
-        if not cached_data:
-            cached_data = self.get_blob('view_blob', path=path, volume__name=bucket)
-            cache.set(cache_key, cached_data)
-        return BlobResponse(cached_data)
+        volume = await self.get_volume(request.user, bucket, 'read')
+        blob = await self.get_blob(volume, path)
+        content_type = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
+        response = StreamingHttpResponse(_blob_read_stream(blob), content_type=content_type)
+        response['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
+        return response
 
-    def post(self, request, bucket, path):
-        """Post handler"""
-        # POST is handled by the MultipartUploadView
-        return MultipartUploadView().dispatch(request, bucket, path)
+    async def post(self, request, bucket, path):
+        """POST is handled by MultipartUploadView."""
+        return await MultipartUploadView().dispatch(request, bucket, path)
 
-    def put(self, request, bucket, path):
+    async def put(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html"""
-        # Check if part of a multipart upload
         if 'uploadId' in request.GET:
-            return MultipartUploadView().dispatch(request, bucket, path)
-        try:
-            blob = self.get_blob('change_blob', path=path, volume=self.volume)
-            blob.write(request.body)
-            blob.save()
-        except AWSNoSuchKey:
-            if not request.user.has_perm('p2_core.add_blob'):
-                raise AWSAccessDenied
-            # Blob doesn't exist, user can create
-            blob = Blob.objects.create(
-                path=path,
-                volume=self.volume)
-            # Check if request.body is empty to correctly create folders
+            return await MultipartUploadView().dispatch(request, bucket, path)
+
+        volume = await self.get_volume(request.user, bucket, 'write')
+        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
+        if blob is None:
+            blob = await Blob.objects.acreate(path=path, volume=volume)
             if request.body == b'':
                 blob.attributes[ATTR_BLOB_IS_FOLDER] = True
-            blob.write(request.body)
-            blob.save()
-            for permission in ['view_blob', 'change_blob', 'delete_blob']:
-                assign_perm('p2_core.%s' % permission, request.user, blob)
+
+        # Sync pre-save quota check — must block the write. Req 2.6, 8.3.
+        await sync_to_async(_fire_pre_save)(blob)
+
+        controller = volume.storage.controller
+        if isinstance(controller, AsyncStorageController):
+            await controller.commit(blob, _request_body_chunks(request))
+        else:
+            body = request.body
+            await asyncio.to_thread(blob.write, body)
+
+        # blob.save() publishes BLOB_POST_SAVE and BLOB_PAYLOAD_UPDATED events internally.
+        await sync_to_async(blob.save)()
         return HttpResponse(status=200)
 
-    def delete(self, request, bucket, path):
+    async def delete(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectDELETE.html"""
-        blobs = get_objects_for_user(self.request.user, 'delete_blob', Blob).filter(
-            path=path, volume__name=bucket)
-        if blobs.exists():
-            blobs.delete()
+        volume = await self.get_volume(request.user, bucket, 'delete')
+        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
+        if blob is not None:
+            await blob.adelete()
         return HttpResponse(status=204)

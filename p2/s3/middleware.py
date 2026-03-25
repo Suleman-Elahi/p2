@@ -1,19 +1,26 @@
 """p2 s3 routing middleware"""
 from django.contrib.auth.signals import user_logged_in
 from django.http import HttpRequest
-from structlog import get_logger
+import logging
 
 from p2.lib.config import CONFIG
 from p2.s3.auth.aws_v4 import AWSV4Authentication
 from p2.s3.errors import AWSError, AWSIncompleteBody, AWSMissingContentLength
 from p2.s3.http import AWSErrorView
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 CONTENT_LENGTH_HEADER = 'CONTENT_LENGTH'
 
 # pylint: disable=too-few-public-methods
 class S3RoutingMiddleware:
-    """Handle request as S3 request if X-Amz-Date Header is set"""
+    """Handle request as S3 request if X-Amz-Date Header is set.
+
+    This middleware is async-compatible: __call__ is defined as async so that
+    the AWS v4 validate() coroutine (which performs an async ORM lookup) can be
+    awaited without blocking the event loop."""
+
+    async_capable = True
+    sync_capable = False
 
     def __init__(self, get_response):
         self.get_response = get_response
@@ -65,7 +72,7 @@ class S3RoutingMiddleware:
         if ours < theirs_int:
             raise AWSIncompleteBody
 
-    def __call__(self, request: HttpRequest):
+    async def __call__(self, request: HttpRequest):
         bucket = self.extract_host_header(request)
         if self.is_aws_request(request) or bucket:
             # Check if Host header ends with s3.base_domain, if so extract bucket from Host
@@ -76,10 +83,12 @@ class S3RoutingMiddleware:
                 request.path_info = '/' + bucket + request.path_info
             try:
                 self.check_content_length(request)
-                # Check AWS Authentication
+                # Check AWS Authentication.
+                # validate() is async: it awaits the database lookup for the APIKey.
+                # HMAC computation inside validate() is CPU-bound (microseconds) and stays sync.
                 if AWSV4Authentication.can_handle(request):
                     handler = AWSV4Authentication(request)
-                    user = handler.validate()
+                    user = await handler.validate()
                     request.user = user
                     # since we don't use django's auth.login, we
                     # send the signal ourselves
@@ -93,9 +102,5 @@ class S3RoutingMiddleware:
             if request.method in ['GET', 'HEAD']:
                 # Set SECURE_PROXY_SSL_HEADER so SecurityMiddleware doesn't return a 302
                 request.META['HTTP_X_FORWARDED_PROTO'] = 'https'
-        response = self.get_response(request)
-        # if CONFIG.y_bool('debug') and response.status_code > 300:
-        #     if response['Content-Type'] == 'text/xml':
-        #         LOGGER.debug("Request Body", body=request.body)
-        #         LOGGER.debug("Response Body", body=response.content)
+        response = await self.get_response(request)
         return response

@@ -1,5 +1,5 @@
 """p2 quota controller"""
-from structlog import get_logger
+import logging
 
 from p2.components.quota.constants import (ACTION_BLOCK, ACTION_EMAIL,
                                            ACTION_NOTHING, TAG_QUOTA_ACTION,
@@ -8,7 +8,7 @@ from p2.components.quota.exceptions import QuotaExceededException
 from p2.core.components.base import ComponentController
 from p2.core.constants import ATTR_BLOB_SIZE_BYTES
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 # pylint: disable=too-few-public-methods
 class QuotaController(ComponentController):
@@ -20,7 +20,7 @@ class QuotaController(ComponentController):
     def before_save(self, blob):
         """Check if new blob would be over threshold"""
         new_blob_size = int(blob.attributes[ATTR_BLOB_SIZE_BYTES])
-        if (self.volume.space_used + new_blob_size) > self.threshold:
+        if (self.volume.space_used_bytes + new_blob_size) > self.threshold:
             # We'd be over, so execute our action and raise an Exception to prevent saving.
             self.do_action(blob)
 
@@ -48,4 +48,4 @@ class QuotaController(ComponentController):
         threshold = int(self.instance.tags.get(TAG_QUOTA_THRESHOLD, 0))
         if threshold == 0:
             return 0
-        return self.volume.space_used / (threshold / 100)
+        return self.volume.space_used_bytes / (threshold / 100)

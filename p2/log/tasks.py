@@ -1,10 +1,5 @@
-"""p2 log tasks"""
-from p2.core.celery import CELERY_APP
-from p2.log.models import LogAdaptor
+"""p2 log tasks — DEPRECATED (Celery removed).
 
-
-@CELERY_APP.task()
-def write_log_record(record):
-    """Write log record to database/syslog/whatever"""
-    for adaptor in LogAdaptor.objects.all():
-        adaptor.controller.log(record)
+write_log_record was a Celery task. Log writing is now handled synchronously
+in p2.log.adaptor or via the async event bus.
+"""

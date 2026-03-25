@@ -3,14 +3,14 @@ import copy
 from shutil import copyfileobj
 from time import time
 
-from structlog import get_logger
+import logging
 
 from p2.components.replication.constants import (TAG_BLOB_SOURCE_UUID,
                                                  TAG_REPLICATION_TARGET)
 from p2.core.components.base import ComponentController
 from p2.core.models import Blob, Volume
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 # pylint: disable=too-few-public-methods
 class ReplicationController(ComponentController):
@@ -51,7 +51,7 @@ class ReplicationController(ComponentController):
             target_blob = self.payload_update(blob)
             target_blob.save()
         end_time = time()
-        space = self.target_volume.space_used
+        space = self.target_volume.space_used_bytes
         duration = (end_time - start_time) + 1 # +1 to make sure we don't divide by 0
         rate = space / duration
         LOGGER.debug("Initial full replication finished, %r bytes per second", rate)

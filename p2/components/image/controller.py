@@ -1,11 +1,11 @@
 """p2 import controller"""
 from PIL import ExifTags, Image
-from structlog import get_logger
+import logging
 
 from p2.components.image.constants import TAG_IMAGE_EXIF_TAGS
 from p2.core.components.base import ComponentController
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 # pylint: disable=too-few-public-methods
 class ImageController(ComponentController):

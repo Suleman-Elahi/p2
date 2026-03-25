@@ -1,4 +1,4 @@
-apiVersion: apps/v1beta2
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "p2.fullname" . }}-worker
@@ -32,9 +32,11 @@ spec:
           image: "docker.beryju.org/p2/server:{{ .Values.version }}"
           imagePullPolicy: IfNotPresent
           command:
-            - ./manage.py
+            - python
+            - -m
+            - arq
           args:
-            - worker
+            - p2.core.worker.WorkerSettings
           volumeMounts:
             - mountPath: /storage
               name: media-storage

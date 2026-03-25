@@ -1,15 +1,13 @@
 """Blob Views"""
 import posixpath
-from collections import OrderedDict
 
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, DetailView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
-from guardian.shortcuts import get_perms_for_model, get_users_with_perms
 
 from p2.core.forms import BlobForm
 from p2.core.http import BlobResponse
@@ -18,7 +16,7 @@ from p2.core.prefix_helper import PrefixHelper, make_absolute_prefix
 from p2.lib.shortcuts import get_object_for_user_or_404
 
 
-class FileBrowserView(LoginRequiredMixin, PermissionListMixin, ListView):
+class FileBrowserView(LoginRequiredMixin, ListView):
     """List all blobs a user has access to"""
 
     template_name = 'p2_core/blob_list.html'
@@ -78,14 +76,6 @@ class BlobDetailView(PermissionRequiredMixin, DetailView):
         helper = PrefixHelper(self.request.user, self.object.volume, self.object.prefix)
         helper.collect(max_levels=1)
         context['breadcrumbs'] = helper.get_breadcrumbs()
-        context['users_perms'] = OrderedDict(
-            sorted(
-                get_users_with_perms(self.object, attach_perms=True,
-                                     with_group_users=False).items(),
-                key=lambda user: user[0].username
-            )
-        )
-        context['model_perms'] = get_perms_for_model(self.object.__class__)
         return context
 
 class BlobUpdateView(SuccessMessageMixin, PermissionRequiredMixin, UpdateView):

@@ -2,8 +2,8 @@
 from xml.etree import ElementTree
 
 from django.views import View
-from guardian.shortcuts import get_objects_for_user
 
+from p2.core.models import Volume
 from p2.s3.constants import XML_NAMESPACE
 from p2.s3.http import XMLResponse
 
@@ -12,7 +12,7 @@ class ListView(View):
     """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTServiceGET.html"""
 
     def get(self, request):
-        """Return list of Buckets"""
+        """Return list of Buckets the authenticated user can access."""
         root = ElementTree.Element("{%s}ListAllMyBucketsResult" % XML_NAMESPACE)
         owner = ElementTree.Element("Owner")
 
@@ -21,7 +21,16 @@ class ListView(View):
 
         buckets = ElementTree.Element('Buckets')
 
-        for volume in get_objects_for_user(self.request.user, 'p2_core.use_volume'):
+        # Return volumes the user has an ACL entry for (or public_read volumes)
+        from p2.core.acl import VolumeACL
+        from django.db.models import Q
+        accessible_volumes = Volume.objects.filter(
+            Q(public_read=True) |
+            Q(acls__user=request.user) |
+            Q(acls__group__in=request.user.groups.all())
+        ).distinct()
+
+        for volume in accessible_volumes:
             bucket = ElementTree.Element("Bucket")
             ElementTree.SubElement(bucket, "Name").text = volume.name
             ElementTree.SubElement(bucket, "CreationDate").text = "2006-02-03T16:45:09.000Z"

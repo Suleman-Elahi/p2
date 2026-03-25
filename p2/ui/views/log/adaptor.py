@@ -3,11 +3,11 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionListMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
 
 from p2.lib.reflection import path_to_class
 from p2.lib.reflection.manager import ControllerManager
@@ -18,7 +18,7 @@ from p2.log.models import LogAdaptor
 LOG_CONTROLLER_MANAGER = ControllerManager('log.controllers', lazy=True)
 
 
-class LogAdaptorListView(PermissionListMixin, LoginRequiredMixin, ListView):
+class LogAdaptorListView(LoginRequiredMixin, ListView):
     """List all access keys the user has access to"""
 
     model = LogAdaptor

@@ -3,12 +3,11 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionRequiredMixin
+from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, DetailView, ListView, UpdateView
-from guardian.mixins import PermissionListMixin, PermissionRequiredMixin
-from guardian.shortcuts import get_objects_for_user
 
 from p2.core.forms import VolumeForm
 from p2.core.models import Component, Volume
@@ -19,7 +18,7 @@ from p2.lib.views import CreateAssignPermView
 COMPONENT_MANAGER = ControllerManager('component.controllers')
 
 
-class VolumeListView(PermissionListMixin, LoginRequiredMixin, ListView):
+class VolumeListView(LoginRequiredMixin, ListView):
     """List all volumes a user can use"""
 
     model = Volume
@@ -37,7 +36,7 @@ class VolumeDetailView(PermissionRequiredMixin, DetailView):
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         components = []
-        existing_components = get_objects_for_user(self.request.user, 'p2_core.view_component')
+        existing_components = Component.objects.filter(volume=self.object)
         for controller in COMPONENT_MANAGER.list():
             controller_path = class_to_path(controller)
             # Check if component for this volume is configure

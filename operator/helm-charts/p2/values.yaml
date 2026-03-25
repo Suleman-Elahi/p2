@@ -10,6 +10,15 @@ config:
   # Only allow single sign-on, configured below
   external_auth_only: false
 
+  # OpenTelemetry collector endpoint (OTLP gRPC, e.g. http://otel-collector:4317)
+  otelEndpoint: ""
+
+  # OpenTelemetry service name
+  otelServiceName: "p2"
+
+  # Fernet key for encrypting secrets at rest (generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+  fernetKey: ""
+
   # OIDC Configuration
   # Callback URL: <base url>/_/oidc/callback/
   oidc:

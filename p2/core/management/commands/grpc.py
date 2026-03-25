@@ -1,50 +1,39 @@
-"""p2 GRPC management command"""
+"""p2 gRPC management command (async)"""
 
-import time
-from concurrent import futures
-from contextlib import contextmanager
+import asyncio
+import logging
 
 import grpc
+import grpc.aio
 from django.core.management.base import BaseCommand
-from django.utils import autoreload
-from grpc_reflection.v1alpha import reflection
-from prometheus_client import start_http_server
-from py_grpc_prometheus.prometheus_server_interceptor import \
-    PromServerInterceptor
-from structlog import get_logger
 
 from p2.grpc.protos import serve_pb2, serve_pb2_grpc
 from p2.serve.grpc import Serve
 
-LOGGER = get_logger()
-_ONE_DAY_IN_SECONDS = 60 * 60 * 24
+LOGGER = logging.getLogger(__name__)
+
+_GRPC_PORT = '[::]:50051'
 
 
-@contextmanager
-def serve_forever():
-    """Run GRPC server, blocking"""
-    server = grpc.server(futures.ThreadPoolExecutor(
-        max_workers=10), interceptors=(PromServerInterceptor(),))
+async def serve_forever():
+    """Start the async gRPC server and run until interrupted.
+
+    Uses grpc.aio.server() for non-blocking request handling.
+    Validates: Requirements 11.1
+    """
+    server = grpc.aio.server()
     serve_pb2_grpc.add_ServeServicer_to_server(Serve(), server)
-    service_names = (
-        serve_pb2.DESCRIPTOR.services_by_name['Serve'].full_name,
-        reflection.SERVICE_NAME,
-    )
-    reflection.enable_server_reflection(service_names, server)
+    server.add_insecure_port(_GRPC_PORT)
+    await server.start()
+    LOGGER.info('gRPC server started on port 50051')
+    await server.wait_for_termination()
 
-    server.add_insecure_port('[::]:50051')
-    server.start()
-    LOGGER.debug('Successfully started grpc server on port 50051')
-
-    # Start an end point to expose metrics.
-    LOGGER.debug("Prometheus Server running on port 9102")
-    start_http_server(9102)
-    while True:
-        time.sleep(_ONE_DAY_IN_SECONDS)
 
 class Command(BaseCommand):
-    """Run GRPC Server"""
+    """Run async gRPC Server"""
+
+    help = 'Start the async gRPC serve layer'
 
     def handle(self, *args, **options):
-        """Start GRPC server and register services"""
-        autoreload.run_with_reloader(serve_forever)
+        """Start async gRPC server."""
+        asyncio.run(serve_forever())

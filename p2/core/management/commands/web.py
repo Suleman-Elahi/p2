@@ -2,12 +2,12 @@
 
 import cherrypy
 from django.core.management.base import BaseCommand
-from structlog import get_logger
+import logging
 
 from p2.lib.config import CONFIG
 from p2.root.wsgi import application
 
-LOGGER = get_logger()
+LOGGER = logging.getLogger(__name__)
 
 class Command(BaseCommand):
     """Run CherryPy webserver"""
