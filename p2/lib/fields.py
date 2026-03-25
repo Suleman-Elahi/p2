@@ -15,6 +15,11 @@ class YAMLString(str):
 class YAMLField(forms.CharField):
     """Django's JSON Field converted to YAML"""
 
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('encoder', None)
+        kwargs.pop('decoder', None)
+        super().__init__(*args, **kwargs)
+
     default_error_messages = {
         'invalid': _("'%(value)s' value must be valid YAML."),
     }

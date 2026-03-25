@@ -1,5 +1,8 @@
 """Serve gRPC functionality (async)"""
+import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from io import StringIO
 from logging import getLogger
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
@@ -17,12 +20,24 @@ from p2.serve.models import ServeRule
 LOGGER = getLogger(__name__)
 
 
+@contextmanager
+def hijack_log():
+    """Context manager that captures log output into a StringIO buffer."""
+    buffer = StringIO()
+    handler = logging.StreamHandler(buffer)
+    handler.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    try:
+        yield buffer
+    finally:
+        root_logger.removeHandler(handler)
+        handler.close()
+
+
 @dataclass
 class RequestContext:
-    """Carries user identity and trace context for a gRPC serve request.
-
-    Replaces the old MockRequest pattern. Validates: Requirements 11.5
-    """
+    """Carries user identity and trace context for a gRPC serve request."""
     user: Any
     trace_id: Optional[str] = None
     path: Optional[str] = None
@@ -30,7 +45,7 @@ class RequestContext:
 
 
 class Serve(ServeServicer):
-    """Async gRPC Service for Serve Application. Validates: Requirements 11.1, 11.2, 11.5"""
+    """Async gRPC Service for Serve Application."""
 
     def _rule_lookup(self, request: ServeRequest, rule: ServeRule, match) -> dict:
         """Build blob lookup kwargs from rule and regex match."""
@@ -45,6 +60,9 @@ class Serve(ServeServicer):
                 match=match,
             )
         return lookups
+
+    # alias used by the debug view
+    rule_lookup = _rule_lookup
 
     async def get_user(self, request: ServeRequest) -> User:
         """Get user from session cookie asynchronously."""

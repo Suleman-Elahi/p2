@@ -26,7 +26,7 @@
               {{ form|crispy }}
               <button class="btn btn-lg btn-primary btn-block text-uppercase" type="submit">{% trans "Sign In" %}</button>
               {% endif %}
-            {% config 'oidc.enabled' as oidc_enabled %}
+            {% config_bool 'oidc.enabled' as oidc_enabled %}
             {% if oidc_enabled %}
               <hr class="my-4">
               <a class="btn btn-primary btn-lg btn-block text-uppercase" href="{% url 'oidc_authentication_init' %}"">

@@ -17,7 +17,9 @@ services:
 
   web:
     build: .
+    entrypoint: []
     command: uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload
+    env_file: .env
     volumes:
       - .:/app
       - media:/app/media
@@ -34,7 +36,8 @@ services:
 
   worker:
     build: .
-    command: uv run python -m arq p2.core.worker.WorkerSettings
+    command: sh -c "uv run python manage.py migrate --noinput && uv run python -m arq p2.core.worker.WorkerSettings"
+    env_file: .env
     volumes:
       - .:/app
       - media:/app/media

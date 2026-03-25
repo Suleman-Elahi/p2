@@ -24,10 +24,12 @@ COPY pyproject.toml ./
 COPY manage.py ./
 COPY p2/ ./p2/
 
+RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-RUN useradd --no-create-home --shell /bin/false p2 \
+RUN useradd --create-home --shell /bin/false p2 \
     && chown -R p2:p2 /app
 USER p2
 

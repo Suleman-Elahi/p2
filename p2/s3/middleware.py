@@ -29,7 +29,7 @@ class S3RoutingMiddleware:
     def process_exception(self, request: HttpRequest, exception):
         """Catch AWS-specific exceptions and show them as XML response"""
         if CONFIG.y_bool('debug'):
-            LOGGER.exception("S3 Error", error=exception)
+            LOGGER.exception("S3 Error: %s", exception)
             # LOGGER.debug("Request Body ", body=request.body)
         if isinstance(exception, AWSError):
             return AWSErrorView(exception)

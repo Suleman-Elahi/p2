@@ -521,6 +521,19 @@ wheels = [
 ]
 
 [[package]]
+name = "crispy-bootstrap4"
+version = "2026.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "django" },
+    { name = "django-crispy-forms" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5b/cc/638d36595da9fbb2c9d0be98bf6007442a65a521b614cf4645d04311b061/crispy_bootstrap4-2026.2.tar.gz", hash = "sha256:66f8f14bf9c2c16ed94243236ed253a94e5a625afa1ee64022ce29db98c6cd85", size = 34645, upload-time = "2026-02-11T22:45:05.422Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/6d/b90d601ea2449cc6b35b4b08be90fb1f6ca1baf2be383ed195f7bfa91a32/crispy_bootstrap4-2026.2-py3-none-any.whl", hash = "sha256:4b2b99dfe3e3cacb548702159462110901bd38792b650b770e50c62284ac2227", size = 23178, upload-time = "2026-02-11T22:45:04.108Z" },
+]
+
+[[package]]
 name = "cryptography"
 version = "46.0.5"
 source = { registry = "https://pypi.org/simple" }
@@ -646,31 +659,6 @@ wheels = [
 ]
 
 [[package]]
-name = "django-guardian"
-version = "3.3.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "django" },
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d5/eb/bbeb4efd10d6cca8993697f571f17574e9fa7a912cead3ab39ce1d3793cd/django_guardian-3.3.0.tar.gz", hash = "sha256:abf1487399212cffdce7b3c909182a26fbe7e89746007299a8cab99f3d5ff009", size = 107443, upload-time = "2026-02-24T19:43:28.819Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7c/3c/6517c5e27c6f9c165f989a5884f8798d66d25ce86fe44bf8c19aa4120351/django_guardian-3.3.0-py3-none-any.whl", hash = "sha256:4dca4fce104c7306e41b947a57d1cd6be46d9982548bef194ac8a6ad61d83686", size = 144003, upload-time = "2026-02-24T19:43:27Z" },
-]
-
-[[package]]
-name = "django-prometheus"
-version = "2.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "prometheus-client" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e8/b9/c758675671d71a1800feaad5c5fbcdecbd8d34296b63f9dc5662db39abda/django_prometheus-2.4.0.tar.gz", hash = "sha256:67da5c73d8e859aa73f6e11f52341c482691b17f8bd9844157cff6cdf51ce9bc", size = 24393, upload-time = "2025-06-18T18:06:28.673Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/38/05/d980950fb8c3f6f96c644599b1a025fb50e827477b1acf36daef72aa7e76/django_prometheus-2.4.0-py2.py3-none-any.whl", hash = "sha256:5b46b5f07b02ba8dd7abdb03a3c39073e8fd9120e2293a1ecb949bbb865378ac", size = 29528, upload-time = "2025-06-18T18:06:27.079Z" },
-]
-
-[[package]]
 name = "djangorestframework"
 version = "3.17.1"
 source = { registry = "https://pypi.org/simple" }
@@ -680,20 +668,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ca/d7/c016e69fac19ff8afdc89db9d31d9ae43ae031e4d1993b20aca179b8301a/djangorestframework-3.17.1.tar.gz", hash = "sha256:a6def5f447fe78ff853bff1d47a3c59bf38f5434b031780b351b0c73a62db1a5", size = 905742, upload-time = "2026-03-24T16:58:33.705Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/5a/e1/2c516bdc83652b1a60c6119366ac2c0607b479ed05cd6093f916ca8928f8/djangorestframework-3.17.1-py3-none-any.whl", hash = "sha256:c3c74dd3e83a5a3efc37b3c18d92bd6f86a6791c7b7d4dff62bb068500e76457", size = 898844, upload-time = "2026-03-24T16:58:31.845Z" },
-]
-
-[[package]]
-name = "djangorestframework-guardian"
-version = "0.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "django" },
-    { name = "django-guardian" },
-    { name = "djangorestframework" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c1/c4/67df9963395e9dddd4e16cbf75098953798e5135f73fb8f4855895505e39/djangorestframework_guardian-0.4.0.tar.gz", hash = "sha256:a8113659e062f65b74cc31af6982420c382642e782d38581b3fdc748a179756c", size = 8239, upload-time = "2025-07-01T07:22:10.809Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/81/3d62f7ff71f7c45ec6664ebf03a4c736bf77f49481604361d40f8f4471e4/djangorestframework_guardian-0.4.0-py3-none-any.whl", hash = "sha256:30c2a349318c1cd603d6953d50d58159f9a0c833f5f8f5a811407d5984a39e14", size = 6064, upload-time = "2025-07-01T07:22:09.661Z" },
 ]
 
 [[package]]
@@ -1562,6 +1536,19 @@ wheels = [
 ]
 
 [[package]]
+name = "opentelemetry-instrumentation-logging"
+version = "0.61b0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-instrumentation" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ae/e0/69473f925acfe2d4edf5c23bcced36906ac3627aa7c5722a8e3f60825f3b/opentelemetry_instrumentation_logging-0.61b0.tar.gz", hash = "sha256:feaa30b700acd2a37cc81db5f562ab0c3a5b6cc2453595e98b72c01dcf649584", size = 17906, upload-time = "2026-03-04T14:20:37.398Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/0e/2137db5239cc5e564495549a4d11488a7af9b48fc76520a0eea20e69ddae/opentelemetry_instrumentation_logging-0.61b0-py3-none-any.whl", hash = "sha256:6d87e5ded6a0128d775d41511f8380910a1b610671081d16efb05ac3711c0074", size = 17076, upload-time = "2026-03-04T14:19:36.765Z" },
+]
+
+[[package]]
 name = "opentelemetry-instrumentation-wsgi"
 version = "0.61b0"
 source = { registry = "https://pypi.org/simple" }
@@ -1634,33 +1621,30 @@ dependencies = [
     { name = "arq" },
     { name = "authlib" },
     { name = "boto3" },
+    { name = "crispy-bootstrap4" },
     { name = "cryptography" },
     { name = "django" },
     { name = "django-crispy-forms" },
     { name = "django-debug-toolbar" },
     { name = "django-extensions" },
     { name = "django-filter" },
-    { name = "django-guardian" },
-    { name = "django-prometheus" },
     { name = "djangorestframework" },
-    { name = "djangorestframework-guardian" },
     { name = "djangorestframework-simplejwt" },
     { name = "drf-spectacular" },
     { name = "grpcio" },
     { name = "grpcio-reflection" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-instrumentation-django" },
+    { name = "opentelemetry-instrumentation-logging" },
     { name = "opentelemetry-sdk" },
     { name = "pillow" },
     { name = "protobuf" },
     { name = "psycopg", extra = ["binary"] },
-    { name = "py-grpc-prometheus" },
     { name = "python-magic" },
+    { name = "pytz" },
     { name = "pyyaml" },
     { name = "redis", extra = ["hiredis"] },
     { name = "ruamel-yaml" },
-    { name = "sentry-sdk" },
-    { name = "structlog" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "uvloop" },
 ]
@@ -1717,6 +1701,7 @@ requires-dist = [
     { name = "bumpversion", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "colorama", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "crispy-bootstrap4", specifier = ">=2022.1" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "django", specifier = ">=5.0" },
     { name = "django-crispy-forms", specifier = ">=2.0" },
@@ -1724,10 +1709,7 @@ requires-dist = [
     { name = "django-extensions", specifier = ">=3.2" },
     { name = "django-extensions", marker = "extra == 'dev'", specifier = ">=3.2" },
     { name = "django-filter", specifier = ">=23.0" },
-    { name = "django-guardian", specifier = ">=2.4" },
-    { name = "django-prometheus", specifier = ">=2.3" },
     { name = "djangorestframework", specifier = ">=3.15" },
-    { name = "djangorestframework-guardian", specifier = ">=0.3" },
     { name = "djangorestframework-simplejwt", specifier = ">=5.3" },
     { name = "drf-spectacular", specifier = ">=0.27" },
     { name = "fakeredis", extras = ["aioredis"], marker = "extra == 'dev'", specifier = ">=2.21" },
@@ -1739,23 +1721,22 @@ requires-dist = [
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "opentelemetry-exporter-otlp", specifier = ">=1.22" },
     { name = "opentelemetry-instrumentation-django", specifier = ">=0.43b0" },
+    { name = "opentelemetry-instrumentation-logging", specifier = ">=0.43b0" },
     { name = "opentelemetry-sdk", specifier = ">=1.22" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "prospector", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "protobuf", specifier = ">=5.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.1" },
-    { name = "py-grpc-prometheus", specifier = ">=0.7" },
     { name = "pylint", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "pylint-django", marker = "extra == 'dev'", specifier = ">=2.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-django", marker = "extra == 'dev'", specifier = ">=4.8" },
     { name = "python-magic", specifier = ">=0.4" },
+    { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", extras = ["hiredis"], specifier = ">=5.0" },
     { name = "ruamel-yaml", specifier = ">=0.18" },
-    { name = "sentry-sdk", specifier = ">=1.40" },
-    { name = "structlog", specifier = ">=24.0" },
     { name = "unittest-xml-reporting", marker = "extra == 'dev'", specifier = ">=3.2" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.27" },
     { name = "uvloop", specifier = ">=0.19" },
@@ -1888,15 +1869,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
-]
-
-[[package]]
-name = "prometheus-client"
-version = "0.24.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f0/58/a794d23feb6b00fc0c72787d7e87d872a6730dd9ed7c7b3e954637d8f280/prometheus_client-0.24.1.tar.gz", hash = "sha256:7e0ced7fbbd40f7b84962d5d2ab6f17ef88a72504dcf7c0b40737b43b2a461f9", size = 85616, upload-time = "2026-01-14T15:26:26.965Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/74/c3/24a2f845e3917201628ecaba4f18bab4d18a337834c1df2a159ee9d22a42/prometheus_client-0.24.1-py3-none-any.whl", hash = "sha256:150db128af71a5c2482b36e588fc8a6b95e498750da4b17065947c16070f4055", size = 64057, upload-time = "2026-01-14T15:26:24.42Z" },
 ]
 
 [[package]]
@@ -2079,20 +2051,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/2c/a4981bf42cf30ebba0424971d7ce70a222ae9b82594c42fc3f2105d7b525/psycopg_binary-3.3.3-cp314-cp314-musllinux_1_2_riscv64.whl", hash = "sha256:47f06fcbe8542b4d96d7392c476a74ada521c5aebdb41c3c0155f6595fc14c8d", size = 3944542, upload-time = "2026-02-18T16:52:04.266Z" },
     { url = "https://files.pythonhosted.org/packages/60/e9/b7c29b56aa0b85a4e0c4d89db691c1ceef08f46a356369144430c155a2f5/psycopg_binary-3.3.3-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:e7800e6c6b5dc4b0ca7cc7370f770f53ac83886b76afda0848065a674231e856", size = 4254339, upload-time = "2026-02-18T16:52:10.444Z" },
     { url = "https://files.pythonhosted.org/packages/98/5a/291d89f44d3820fffb7a04ebc8f3ef5dda4f542f44a5daea0c55a84abf45/psycopg_binary-3.3.3-cp314-cp314-win_amd64.whl", hash = "sha256:165f22ab5a9513a3d7425ffb7fcc7955ed8ccaeef6d37e369d6cc1dff1582383", size = 3652796, upload-time = "2026-02-18T16:52:14.02Z" },
-]
-
-[[package]]
-name = "py-grpc-prometheus"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "grpcio" },
-    { name = "prometheus-client" },
-    { name = "setuptools" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/33/d8/038f4774d761380663c6755dcd01ae983d93944bd4916af27bd009a2aadc/py_grpc_prometheus-0.8.0.tar.gz", hash = "sha256:364311dc88aaf4e74f8664e7f2bb8471f1822fd082e0aac174f72d35213bba6a", size = 11468, upload-time = "2024-02-29T06:40:19.902Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/e6/73d00f9553db1447c95a5b589b73e8efde891ef4c314536dcca4c4c747eb/py_grpc_prometheus-0.8.0-py3-none-any.whl", hash = "sha256:358d3418e85a1967cccca51090ef6c204bc3fcc0ace7bf7704cbc0d9a2b4edc7", size = 12229, upload-time = "2024-02-29T06:40:18.09Z" },
 ]
 
 [[package]]
@@ -2283,6 +2241,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/da/db/0b3e28ac047452d079d375ec6798bf76a036a08182dbb39ed38116a49130/python-magic-0.4.27.tar.gz", hash = "sha256:c1ba14b08e4a5f5c31a302b7721239695b2f0f058d125bd5ce1ee36b9d9d3c3b", size = 14677, upload-time = "2022-06-07T20:16:59.508Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6c/73/9f872cb81fc5c3bb48f7227872c28975f998f3e7c2b1c16e95e6432bbb90/python_magic-0.4.27-py2.py3-none-any.whl", hash = "sha256:c212960ad306f700aa0d01e5d7a325d20548ff97eb9920dcd29513174f0294d3", size = 13840, upload-time = "2022-06-07T20:16:57.763Z" },
+]
+
+[[package]]
+name = "pytz"
+version = "2026.1.post1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/56/db/b8721d71d945e6a8ac63c0fc900b2067181dbb50805958d4d4661cf7d277/pytz-2026.1.post1.tar.gz", hash = "sha256:3378dde6a0c3d26719182142c56e60c7f9af7e968076f31aae569d72a0358ee1", size = 321088, upload-time = "2026-03-03T07:47:50.683Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/99/781fe0c827be2742bcc775efefccb3b048a3a9c6ce9aec0cbf4a101677e5/pytz-2026.1.post1-py2.py3-none-any.whl", hash = "sha256:f2fd16142fda348286a75e1a524be810bb05d444e5a081f37f7affc635035f7a", size = 510489, upload-time = "2026-03-03T07:47:49.167Z" },
 ]
 
 [[package]]
@@ -2517,19 +2484,6 @@ wheels = [
 ]
 
 [[package]]
-name = "sentry-sdk"
-version = "2.56.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "certifi" },
-    { name = "urllib3" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/de/df/5008954f5466085966468612a7d1638487596ee6d2fd7fb51783a85351bf/sentry_sdk-2.56.0.tar.gz", hash = "sha256:fdab72030b69625665b2eeb9738bdde748ad254e8073085a0ce95382678e8168", size = 426820, upload-time = "2026-03-24T09:56:36.575Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/1a/b3a3e9f6520493fed7997af4d2de7965d71549c62f994a8fd15f2ecd519e/sentry_sdk-2.56.0-py2.py3-none-any.whl", hash = "sha256:5afafb744ceb91d22f4cc650c6bd048ac6af5f7412dcc6c59305a2e36f4dbc02", size = 451568, upload-time = "2026-03-24T09:56:34.807Z" },
-]
-
-[[package]]
 name = "setoptconf-tmp"
 version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2581,15 +2535,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/90/76/437d71068094df0726366574cf3432a4ed754217b436eb7429415cf2d480/sqlparse-0.5.5.tar.gz", hash = "sha256:e20d4a9b0b8585fdf63b10d30066c7c94c5d7a7ec47c889a2d83a3caa93ff28e", size = 120815, upload-time = "2025-12-19T07:17:45.073Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/4b/359f28a903c13438ef59ebeee215fb25da53066db67b305c125f1c6d2a25/sqlparse-0.5.5-py3-none-any.whl", hash = "sha256:12a08b3bf3eec877c519589833aed092e2444e68240a3577e8e26148acc7b1ba", size = 46138, upload-time = "2025-12-19T07:17:46.573Z" },
-]
-
-[[package]]
-name = "structlog"
-version = "25.5.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
 ]
 
 [[package]]

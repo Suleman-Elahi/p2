@@ -9,6 +9,10 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        migrations.AlterUniqueTogether(
+            name='apikey',
+            unique_together=set(),
+        ),
         migrations.AddField(
             model_name='apikey',
             name='secret_key_encrypted',
@@ -22,9 +26,5 @@ class Migration(migrations.Migration):
             model_name='apikey',
             name='access_key',
             field=models.CharField(default='', max_length=20, unique=True),
-        ),
-        migrations.AlterUniqueTogether(
-            name='apikey',
-            unique_together=set(),
         ),
     ]

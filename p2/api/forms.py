@@ -10,7 +10,7 @@ class APIKeyForm(forms.ModelForm):
     class Meta:
 
         model = APIKey
-        fields = ['name', 'user', 'access_key', 'secret_key']
+        fields = ['name', 'user', 'access_key']
         widgets = {
             'name': forms.TextInput
         }

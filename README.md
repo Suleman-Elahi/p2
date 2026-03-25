@@ -30,6 +30,14 @@ docker compose up
 
 The web service runs migrations automatically on startup, then listens on `http://localhost:8000`.
 
+Default login credentials (created by the initial migration):
+
+| Username | Password |
+|---|---|
+| `admin` | `admin` |
+
+> Change the password immediately after first login.
+
 ## Running locally with uv
 
 ```bash

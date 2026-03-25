@@ -6,9 +6,9 @@ from p2.s3.views import buckets, objects
 
 
 class S3BucketConverter(StringConverter):
-    """Match S3 bucket regex"""
+    """Match S3 bucket regex — excludes '_' which is reserved for internal p2 routes"""
 
-    regex = r'([a-zA-Z0-9\.\-\_]+)'
+    regex = r'(?!_(?:/|$))([a-zA-Z0-9\.\-\_]+)'
 
 
 class EverythingConverter(StringConverter):

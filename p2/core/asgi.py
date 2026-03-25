@@ -6,6 +6,7 @@ OpenTelemetry is initialised before Django's ASGI app so DjangoInstrumentor
 can wrap the middleware stack at import time.
 """
 import os
+import sys
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "p2.core.settings")
 

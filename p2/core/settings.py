@@ -20,6 +20,16 @@ import sys
 from p2 import __version__
 from p2.lib.config import CONFIG
 
+# Compat shim: old migrations reference django.contrib.postgres.fields.jsonb
+# which was removed in Django 4+. Redirect to django.db.models.JSONField.
+import django.contrib.postgres.fields as _pg_fields
+import django.db.models as _djmodels
+import types
+_jsonb_mod = types.ModuleType("django.contrib.postgres.fields.jsonb")
+_jsonb_mod.JSONField = _djmodels.JSONField
+sys.modules["django.contrib.postgres.fields.jsonb"] = _jsonb_mod
+_pg_fields.jsonb = _jsonb_mod
+
 # ---------------------------------------------------------------------------
 # Base paths
 # ---------------------------------------------------------------------------
@@ -41,7 +51,7 @@ DEBUG = CONFIG.y_bool('debug')
 TEST = any('test' in arg for arg in sys.argv)
 
 CORS_ORIGIN_ALLOW_ALL = DEBUG
-SECURE_SSL_REDIRECT = not DEBUG and not TEST
+SECURE_SSL_REDIRECT = False
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ALLOWED_HOSTS = ['*']
@@ -66,6 +76,7 @@ INSTALLED_APPS = [
     'drf_spectacular',
     'django_filters',
     'crispy_forms',
+    'crispy_bootstrap4',
     # p2 - Core Components
     'p2.core.apps.P2CoreConfig',
     'p2.api.apps.P2APIConfig',
@@ -146,9 +157,11 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 # Cache — Django 5.x built-in Redis backend (replaces django-redis)
 # ---------------------------------------------------------------------------
 
+_redis_password = CONFIG.y('redis.password', '')
+_redis_auth = f':{_redis_password}@' if _redis_password else ''
 REDIS_URL = CONFIG.y(
     'redis.url',
-    f"redis://:{CONFIG.y('redis.password', '')}@{CONFIG.y('redis.host', 'localhost')}:6379"
+    f"redis://{_redis_auth}{CONFIG.y('redis.host', 'localhost')}:6379"
     f"/{CONFIG.y('redis.cache_db', '0')}"
 )
 
@@ -168,7 +181,7 @@ SESSION_CACHE_ALIAS = 'default'
 
 ARQ_REDIS_URL = CONFIG.y(
     'redis.arq_url',
-    f"redis://:{CONFIG.y('redis.password', '')}@{CONFIG.y('redis.host', 'localhost')}:6379"
+    f"redis://{_redis_auth}{CONFIG.y('redis.host', 'localhost')}:6379"
     f"/{CONFIG.y('redis.message_queue_db', '1')}"
 )
 
@@ -284,6 +297,7 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static/')
 # ---------------------------------------------------------------------------
 
 CRISPY_TEMPLATE_PACK = 'bootstrap4'
+CRISPY_ALLOWED_TEMPLATE_PACKS = 'bootstrap4'
 
 VERSION = __version__
 
