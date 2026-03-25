@@ -32,9 +32,9 @@ class ReplicationController(ComponentController):
             'attributes__%s' % TAG_BLOB_SOURCE_UUID: source_blob.uuid.hex})
         if possible_targets.exists():
             target_blob = possible_targets.first()
-            LOGGER.debug("Found existing target blob", target=target_blob.uuid.hex)
+            LOGGER.debug("Found existing target blob: %s", target_blob.uuid.hex)
         else:
-            LOGGER.debug("Creating new replicated blob", source=source_blob.uuid.hex)
+            LOGGER.debug("Creating new replicated blob, source=%s", source_blob.uuid.hex)
             target_blob = Blob.objects.create(
                 path=source_blob.path,
                 volume=target_volume,
@@ -58,7 +58,7 @@ class ReplicationController(ComponentController):
 
     def metadata_update(self, blob):
         """Replicate metadata save"""
-        LOGGER.debug('Replicating::UpdateMetadata', blob=blob)
+        LOGGER.debug('Replicating::UpdateMetadata blob=%s', blob)
         target_blob = self._get_target_blob(blob)
         target_blob.path = blob.path
         for attr in ['path', 'prefix', 'attributes', 'tags']:
@@ -70,13 +70,13 @@ class ReplicationController(ComponentController):
 
     def payload_update(self, blob):
         """Replicate payload update"""
-        LOGGER.debug('Replicating::UpdatePayload', blob=blob)
+        LOGGER.debug('Replicating::UpdatePayload blob=%s', blob)
         target_blob = self._get_target_blob(blob)
         copyfileobj(blob, target_blob)
         return target_blob
 
     def delete(self, blob):
         """Delete remote blob"""
-        LOGGER.debug('Replicating::Delete', blob=blob)
+        LOGGER.debug('Replicating::Delete blob=%s', blob)
         target_blob = self._get_target_blob(blob)
         target_blob.delete()

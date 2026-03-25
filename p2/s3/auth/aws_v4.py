@@ -161,7 +161,7 @@ class AWSV4Authentication(BaseAuth):
     async def _lookup_access_key(self, access_key: str) -> Optional[APIKey]:
         """Lookup access_key in database, return APIKey if found otherwise None.
         Uses async ORM to avoid blocking the event loop during database I/O."""
-        return await APIKey.objects.filter(access_key=access_key).afirst()
+        return await APIKey.objects.select_related('user').filter(access_key=access_key).afirst()
 
     @staticmethod
     def can_handle(request: HttpRequest) -> bool:
@@ -205,7 +205,7 @@ class AWSV4Authentication(BaseAuth):
         # Build our own signature to compare
         secret_key = await self._lookup_access_key(auth_request.access_key)
         if not secret_key:
-            LOGGER.warning("No secret key found for request", access_key=auth_request.access_key)
+            LOGGER.warning("No secret key found for request, access_key=%s", auth_request.access_key)
             raise AWSAccessDenied
         # _get_signature_key and _sign are pure HMAC computations (CPU-bound, microseconds).
         # No async wrapping needed.
@@ -219,8 +219,7 @@ class AWSV4Authentication(BaseAuth):
         ])
         our_signature = self._sign(signing_key, string_to_sign).hexdigest()
         if auth_request.signature != our_signature:
-            LOGGER.warning("Canonical Request", canonical_request=canonical_request)
-            LOGGER.warning("Signatures", theirs=auth_request.signature,
-                           ours=our_signature)
+            LOGGER.warning("Canonical Request: %s", canonical_request)
+            LOGGER.warning("Signatures theirs=%s ours=%s", auth_request.signature, our_signature)
             raise AWSSignatureMismatch
         return secret_key.user

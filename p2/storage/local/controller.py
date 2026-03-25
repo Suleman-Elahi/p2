@@ -65,20 +65,20 @@ class LocalStorageController(StorageController):
             blob.attributes[ATTR_BLOB_MIME] = mime_type
             blob.attributes[ATTR_BLOB_IS_TEXT] = self.is_text(self._build_path(blob))
             blob.attributes[ATTR_BLOB_SIZE_BYTES] = str(size)
-            LOGGER.debug('Updated size to Blob', size=size, blob=blob)
+            LOGGER.debug('Updated size to Blob: %s bytes for %s', size, blob)
 
     def get_read_handle(self, blob: Blob) -> RawIOBase:
         fs_path = self._build_path(blob)
-        LOGGER.debug('LocalStorageController::Retrieve', blob=blob, file=fs_path)
+        LOGGER.debug('LocalStorageController::Retrieve blob=%s file=%s', blob, fs_path)
         if os.path.exists(fs_path) and os.path.isfile(fs_path):
             return open(fs_path, 'rb')
-        LOGGER.warning("File does not exist or is not a file.", file=fs_path)
+        LOGGER.warning("File does not exist or is not a file: %s", fs_path)
         return None
 
     def commit(self, blob: Blob, handle: RawIOBase):
         fs_path = self._build_path(blob)
         os.makedirs(os.path.dirname(fs_path), exist_ok=True)
-        LOGGER.debug('LocalStorageController::Commit', blob=blob, file=fs_path)
+        LOGGER.debug('LocalStorageController::Commit blob=%s file=%s', blob, fs_path)
         with open(fs_path, 'wb') as _dest:
             return copyfileobj(handle, _dest)
 
@@ -88,9 +88,9 @@ class LocalStorageController(StorageController):
         # Not file_like, delete file if it exists
         if os.path.exists(fs_path) and os.path.isfile(fs_path):
             os.unlink(fs_path)
-            LOGGER.debug("LocalStorageController::Delete", file=fs_path)
+            LOGGER.debug("LocalStorageController::Delete %s", fs_path)
         else:
-            LOGGER.warning("File does not exist during deletion attempt.", file=fs_path)
+            LOGGER.warning("File does not exist during deletion attempt: %s", fs_path)
 
 
 CHUNK_SIZE = 64 * 1024  # 64 KB
@@ -144,4 +144,4 @@ class AsyncLocalStorageController(AsyncStorageController):
         try:
             await aiofiles.os.remove(fs_path)
         except FileNotFoundError:
-            LOGGER.warning("File does not exist during async deletion attempt.", file=fs_path)
+            LOGGER.warning("File does not exist during async deletion attempt: %s", fs_path)

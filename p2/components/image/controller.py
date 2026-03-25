@@ -36,7 +36,7 @@ class ImageController(ComponentController):
             blob.save()
         except IOError as exc:
             LOGGER.debug(exc)
-            LOGGER.debug("Blob is not an image, skipping EXIF.", blob=blob)
+            LOGGER.debug("Blob is not an image, skipping EXIF: %s", blob)
 
     def get_attributes(self, raw_exif):
         """Convert raw exif data into usable tags"""

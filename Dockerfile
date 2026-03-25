@@ -30,7 +30,8 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 RUN useradd --create-home --shell /bin/false p2 \
-    && chown -R p2:p2 /app
+    && mkdir -p /storage \
+    && chown -R p2:p2 /app /storage
 USER p2
 
 ENV HOST=0.0.0.0

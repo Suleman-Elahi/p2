@@ -77,7 +77,7 @@ class ConfigLoader:
             with open(path) as file:
                 try:
                     self.update(self.__config, yaml.safe_load(file))
-                    LOGGER.debug("Loaded config", file=path)
+                    LOGGER.debug("Loaded config: %s", path)
                     self.loaded_file.append(path)
                 except yaml.YAMLError as exc:
                     raise ImproperlyConfigured from exc
@@ -106,7 +106,7 @@ class ConfigLoader:
             current_obj[dot_parts[-1]] = value
             idx += 1
         if idx > 0:
-            LOGGER.debug("Loaded environment variables", count=idx)
+            LOGGER.debug("Loaded environment variables: %d", idx)
             self.update(self.__config, outer)
 
     @contextmanager

@@ -28,5 +28,5 @@ class Command(BaseCommand):
         cherrypy.engine.start()
         for file in CONFIG.loaded_file:
             cherrypy.engine.autoreload.files.add(file)
-            LOGGER.info("Added file to autoreload triggers", file=file)
+            LOGGER.info("Added file to autoreload triggers: %s", file)
         cherrypy.engine.block()

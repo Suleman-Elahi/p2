@@ -19,6 +19,7 @@ handler500 = ServerErrorView.as_view()
 # S3 URLs get routed via middleware
 urlpatterns = [
     path('', RedirectView.as_view(pattern_name='p2_ui:index')),
+    path('favicon.ico', RedirectView.as_view(url='/_/static/p2/img/icon.png', permanent=True)),
     path('_/admin/', admin.site.urls),
     path('_/api/', include('p2.api.urls', namespace='p2_api')),
     path('_/ui/', include('p2.ui.urls', namespace='p2_ui')),

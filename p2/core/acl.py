@@ -30,22 +30,16 @@ class VolumeACL(models.Model):
         return f"VolumeACL({self.volume.name}, {subject}, {self.permissions})"
 
 
-async def has_volume_permission(user: User, volume: Volume, permission: str) -> bool:
-    """Check if a user has a given permission on a volume.
-
-    Returns True if:
-    - The volume has public_read=True and permission is "read", OR
-    - There is a VolumeACL entry granting the permission to the user directly
-      or via one of the user's groups.
-
-    Returns False (default-deny) if no matching ACL entry exists.
-
-    Validates: Requirements 5.1, 5.2, 5.3, 5.4, 5.6
-    """
+async def has_volume_permission(user, volume: Volume, permission: str) -> bool:
+    """Check if a user has a given permission on a volume."""
     if volume.public_read and permission == "read":
         return True
+    # AnonymousUser has no groups and can never have ACL entries
+    if not user or not user.is_authenticated:
+        return False
+    group_ids = [gid async for gid in Group.objects.filter(user=user).values_list('pk', flat=True).aiterator()]
     return await VolumeACL.objects.filter(
-        Q(user=user) | Q(group__in=await user.agroups.all()),
+        Q(user=user) | Q(group__in=group_ids),
         volume=volume,
         permissions__contains=[permission],
     ).aexists()

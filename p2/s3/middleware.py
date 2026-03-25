@@ -94,6 +94,16 @@ class S3RoutingMiddleware:
         if self.is_aws_request(request) or bucket:
             try:
                 self._prepare_s3_request(request, bucket)
+                # Sync path: AWS auth requires async validate(), run via async_to_sync
+                if AWSV4Authentication.can_handle(request):
+                    from asgiref.sync import async_to_sync
+                    handler = AWSV4Authentication(request)
+                    try:
+                        user = async_to_sync(handler.validate)()
+                        request.user = user
+                        user_logged_in.send(sender=self, request=request, user=user)
+                    except AWSError as exc:
+                        return self.process_exception(request, exc)
             except AWSError as exc:
                 return self.process_exception(request, exc)
         return self.get_response(request)

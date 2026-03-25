@@ -37,6 +37,15 @@ class APIKeyCreateView(SuccessMessageMixin, DjangoPermissionListMixin, CreateAss
         'p2_api.delete_apikey',
     ]
 
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        secret = self.object.decrypt_secret_key()
+        messages.warning(
+            self.request,
+            f'Secret Key (shown once): {secret}'
+        )
+        return response
+
     def get_success_url(self):
         return reverse('p2_ui:api-key-list')
 

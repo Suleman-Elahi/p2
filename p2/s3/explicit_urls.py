@@ -5,8 +5,14 @@ from django.urls import include, path, register_converter
 from p2.s3.urls import EverythingConverter, S3BucketConverter
 from p2.s3.views import buckets, get, objects
 
-register_converter(S3BucketConverter, 's3')
-register_converter(EverythingConverter, 'everything')
+try:
+    register_converter(S3BucketConverter, 's3')
+except ValueError:
+    pass
+try:
+    register_converter(EverythingConverter, 'everything')
+except ValueError:
+    pass
 
 app_name = 'p2_s3'
 

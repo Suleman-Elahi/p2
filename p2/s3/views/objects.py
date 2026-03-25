@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 from asgiref.sync import sync_to_async
+from django.db import IntegrityError
 from django.http.response import HttpResponse, StreamingHttpResponse
 
 from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
@@ -74,11 +75,14 @@ class ObjectView(S3View):
             return await MultipartUploadView().dispatch(request, bucket, path)
 
         volume = await self.get_volume(request.user, bucket, 'write')
-        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
-        if blob is None:
-            blob = await Blob.objects.acreate(path=path, volume=volume)
-            if request.body == b'':
-                blob.attributes[ATTR_BLOB_IS_FOLDER] = True
+        created = False
+        try:
+            blob, created = await Blob.objects.aget_or_create(path=path, volume=volume)
+        except IntegrityError:
+            # Race condition: another request created the blob between the GET and INSERT.
+            blob = await Blob.objects.aget(path=path, volume=volume)
+        if created and request.body == b'':
+            blob.attributes[ATTR_BLOB_IS_FOLDER] = True
 
         # Sync pre-save quota check — must block the write. Req 2.6, 8.3.
         await sync_to_async(_fire_pre_save)(blob)

@@ -144,21 +144,21 @@ class PrefixHelper:
 
         # Make max_level relative to base
         _max_level = self._base.count(SEPARATOR) + max_levels
-        LOGGER.debug("Finding prefixes with base", base=self._base)
+        LOGGER.debug("Finding prefixes with base: %s", self._base)
         for blob in objects:
             v_prefix = self._prefix_for_blob(blob)
             if ATTR_BLOB_IS_FOLDER in blob.attributes and blob.prefix == self._base:
                 if v_prefix not in self._prefixes:
-                    LOGGER.debug('Adding v_prefix', v_prefix=v_prefix)
+                    LOGGER.debug('Adding v_prefix: %s', v_prefix)
                     self._prefixes.append(v_prefix)
             else:
                 if blob.prefix == self._base:
-                    LOGGER.debug("Prefix equals base, ignoring it", prefix=blob.prefix)
+                    LOGGER.debug("Prefix equals base, ignoring it: %s", blob.prefix)
                     continue
                 if max_levels and blob.prefix.count(SEPARATOR) > _max_level:
                     # Max levels is set, so ignore prefixes that have more separators than we want
-                    LOGGER.debug("Making intermediate prefix", v_prefix=v_prefix)
+                    LOGGER.debug("Making intermediate prefix: %s", v_prefix)
                     v_prefix = self._get_intermediate_prefix(blob)
                 if v_prefix not in self._prefixes:
-                    LOGGER.debug('Adding v_prefix', v_prefix=v_prefix)
+                    LOGGER.debug('Adding v_prefix: %s', v_prefix)
                     self._prefixes.append(v_prefix)

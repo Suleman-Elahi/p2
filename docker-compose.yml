@@ -23,6 +23,7 @@ services:
     volumes:
       - .:/app
       - media:/app/media
+      - storage:/storage
     ports:
       - "8000:8000"
     environment:
@@ -41,6 +42,7 @@ services:
     volumes:
       - .:/app
       - media:/app/media
+      - storage:/storage
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
       DATABASE_URL: postgresql://p2:p2@db:5432/p2
@@ -53,3 +55,4 @@ services:
 volumes:
   postgres_data:
   media:
+  storage:
