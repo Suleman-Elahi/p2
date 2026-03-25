@@ -40,30 +40,16 @@ class FileBrowserView(LoginRequiredMixin, ListView):
             self.request.user, 'p2_core.use_volume', pk=self.kwargs.get('pk'))
         kwargs['breadcrumbs'] = []
         current_total = []
-        # Remove first slash so we don't get an empty leading breadcrumb
         for path_part in self.prefix[1:].split(posixpath.sep):
             current_total.append(path_part)
             kwargs['breadcrumbs'].append({
                 'part': path_part,
                 'full': '/'.join(current_total)
             })
+        helper = PrefixHelper(self.request.user, kwargs['volume'], self.prefix)
+        helper.collect(max_levels=1)
+        kwargs['prefixes'] = helper.prefixes
         return super().get_context_data(**kwargs)
-
-
-    #     helper = PrefixHelper(self.request.user, context['volume'], prefix)
-    #     if prefix != '/':
-    #         helper.add_up_prefix()
-    #     helper.collect(max_levels=1)
-    #     context['prefixes'] = helper.prefixes
-    #     context['breadcrumbs'] = helper.get_breadcrumbs()
-
-    #     page = self.request.GET.get('page', 1)
-    #     objects_per_page = 20
-
-    #     paginator = Paginator(blobs, objects_per_page)
-    #     context['objects'] = paginator.get_page(page)
-
-        # return context
 
 class BlobDetailView(PermissionRequiredMixin, DetailView):
     """View Blob Details"""

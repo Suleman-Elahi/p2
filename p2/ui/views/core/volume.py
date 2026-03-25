@@ -9,6 +9,7 @@ from django.shortcuts import reverse
 from django.utils.translation import gettext as _
 from django.views.generic import DeleteView, DetailView, ListView, UpdateView
 
+from p2.core.acl import VolumeACL
 from p2.core.forms import VolumeForm
 from p2.core.models import Component, Volume
 from p2.lib.reflection import class_to_path
@@ -76,6 +77,15 @@ class VolumeCreateView(SuccessMessageMixin, DjangoPermissionRequiredMixin, Creat
 
     def get_success_url(self):
         return reverse('p2_ui:core-volume-list')
+
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        VolumeACL.objects.get_or_create(
+            volume=self.object,
+            user=self.request.user,
+            defaults={'permissions': ['read', 'write', 'delete', 'list', 'admin']}
+        )
+        return response
 
 class VolumeUpdateView(SuccessMessageMixin, PermissionRequiredMixin, UpdateView):
     """Update existing volume"""

@@ -76,6 +76,9 @@ class Blob(UUIDModel, TagModel):
         verbose_name = _('Blob')
         verbose_name_plural = _('Blobs')
         unique_together = (('path', 'volume',),)
+        indexes = [
+            models.Index(fields=['volume', 'prefix']),
+        ]
 
     @staticmethod
     def from_uploaded_file(file, volume, prefix=posixpath.sep):

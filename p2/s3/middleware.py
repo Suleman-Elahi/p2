@@ -32,11 +32,11 @@ class S3RoutingMiddleware:
 
     def process_exception(self, request: HttpRequest, exception):
         """Catch AWS-specific exceptions and show them as XML response"""
-        if CONFIG.y_bool('debug'):
-            LOGGER.exception("S3 Error: %s", exception)
-            # LOGGER.debug("Request Body ", body=request.body)
         if isinstance(exception, AWSError):
+            if CONFIG.y_bool('debug'):
+                LOGGER.debug("S3 Error: %s", exception)
             return AWSErrorView(exception)
+        LOGGER.exception("S3 Error: %s", exception)
         return None
 
     def extract_host_header(self, request: HttpRequest):
@@ -55,7 +55,9 @@ class S3RoutingMiddleware:
         if 'HTTP_X_AMZ_DATE' in request.META:
             return True
         if 'HTTP_AUTHORIZATION' in request.META:
-            return request.META['HTTP_AUTHORIZATION'].startswith('AWS')
+            auth = request.META['HTTP_AUTHORIZATION']
+            if auth.startswith('AWS') or auth.startswith('Bearer'):
+                return True
         if 'X-Amz-Signature' in request.GET:
             return True
         return False
@@ -118,6 +120,10 @@ class S3RoutingMiddleware:
                     user = await handler.validate()
                     request.user = user
                     user_logged_in.send(sender=self, request=request, user=user)
+            except AWSError as exc:
+                return self.process_exception(request, exc)
+            try:
+                return await self.get_response(request)
             except AWSError as exc:
                 return self.process_exception(request, exc)
         return await self.get_response(request)

@@ -135,30 +135,36 @@ class PrefixHelper:
         """Get Prefixes for user, optionally filtering out prefixes
         not starting with `base`"""
         from p2.core.models import Blob
-        base_lookup = Blob.objects.filter(
-            volume=self._volume,
-            prefix__startswith=self._base)
-        file_objects = base_lookup.distinct("prefix")
-        folder_objects = base_lookup.filter(attributes__has_key=ATTR_BLOB_IS_FOLDER)
-        objects = file_objects.union(folder_objects)
+        # Get distinct prefixes that are children of base in a single query
+        child_prefixes = (
+            Blob.objects.filter(volume=self._volume, prefix__startswith=self._base)
+            .values_list('prefix', flat=True)
+            .distinct()
+        )
 
-        # Make max_level relative to base
         _max_level = self._base.count(SEPARATOR) + max_levels
         LOGGER.debug("Finding prefixes with base: %s", self._base)
-        for blob in objects:
-            v_prefix = self._prefix_for_blob(blob)
-            if ATTR_BLOB_IS_FOLDER in blob.attributes and blob.prefix == self._base:
-                if v_prefix not in self._prefixes:
-                    LOGGER.debug('Adding v_prefix: %s', v_prefix)
-                    self._prefixes.append(v_prefix)
+
+        seen = set()
+        for prefix in child_prefixes:
+            if prefix == self._base:
+                LOGGER.debug("Prefix equals base, ignoring it: %s", prefix)
+                continue
+
+            if max_levels and prefix.count(SEPARATOR) > _max_level:
+                # Collapse deep paths to the next intermediate level
+                next_part = posixpath.relpath(prefix, self._base).split(SEPARATOR)[0]
+                abs_path = make_absolute_prefix(posixpath.join(self._base, next_part))
             else:
-                if blob.prefix == self._base:
-                    LOGGER.debug("Prefix equals base, ignoring it: %s", blob.prefix)
-                    continue
-                if max_levels and blob.prefix.count(SEPARATOR) > _max_level:
-                    # Max levels is set, so ignore prefixes that have more separators than we want
-                    LOGGER.debug("Making intermediate prefix: %s", v_prefix)
-                    v_prefix = self._get_intermediate_prefix(blob)
-                if v_prefix not in self._prefixes:
-                    LOGGER.debug('Adding v_prefix: %s', v_prefix)
-                    self._prefixes.append(v_prefix)
+                abs_path = prefix
+
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+
+            v_prefix = VirtualPrefix()
+            v_prefix.volume = self._volume
+            v_prefix.absolute_path = abs_path
+            v_prefix.relative_path = posixpath.relpath(abs_path, self._base)
+            LOGGER.debug('Adding v_prefix: %s', abs_path)
+            self._prefixes.append(v_prefix)

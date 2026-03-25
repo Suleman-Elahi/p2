@@ -36,6 +36,18 @@
             </tr>
           </thead>
           <tbody id="blob-table-body">
+            {% for prefix in prefixes %}
+            <tr>
+              <td>
+                <a href="?prefix={{ prefix.absolute_path }}">
+                  <i class="fa fa-folder" aria-hidden="true"></i>
+                  {{ prefix.relative_path }}
+                </a>
+              </td>
+              <td>—</td>
+              <td>—</td>
+            </tr>
+            {% endfor %}
             {% for object in object_list %}
             <tr>
               <td>
