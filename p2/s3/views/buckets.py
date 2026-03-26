@@ -64,23 +64,55 @@ class BucketView(S3View):
         if 'versioning' in request.GET:
             return self._handler_versioning()
         if 'uploads' in request.GET:
-            return self._handler_uploads()
+            return await self._list_multipart_uploads(request, bucket)
         if 'cors' in request.GET:
             return await self._get_cors(request, bucket)
         if 'acl' in request.GET:
             return await self._get_acl(request, bucket)
+        if 'location' in request.GET:
+            return await self._get_location(request, bucket)
+        if 'tagging' in request.GET:
+            return await self._get_bucket_tagging(request, bucket)
+        if 'lifecycle' in request.GET:
+            return await self._get_lifecycle(request, bucket)
+        if 'notification' in request.GET:
+            return self._get_notification()
+        if 'encryption' in request.GET:
+            return self._get_encryption()
+        if 'policy' in request.GET:
+            return await self._get_bucket_policy(request, bucket)
         return await self.handler_list(request, bucket)
+
+    async def head(self, request, bucket):
+        """HeadBucket — check if bucket exists and caller has access."""
+        try:
+            await self.get_volume(request.user, bucket, 'read')
+            return HttpResponse(status=200)
+        except Exception:
+            return HttpResponse(status=404)
 
     async def put(self, request, bucket):
         if 'cors' in request.GET:
             return await self._put_cors(request, bucket)
         if 'acl' in request.GET:
             return await self._put_acl(request, bucket)
+        if 'tagging' in request.GET:
+            return await self._put_bucket_tagging(request, bucket)
+        if 'lifecycle' in request.GET:
+            return await self._put_lifecycle(request, bucket)
+        if 'policy' in request.GET:
+            return await self._put_bucket_policy(request, bucket)
         return await self._create_bucket(request, bucket)
 
     async def delete(self, request, bucket):
         if 'cors' in request.GET:
             return await self._delete_cors(request, bucket)
+        if 'tagging' in request.GET:
+            return await self._delete_bucket_tagging(request, bucket)
+        if 'lifecycle' in request.GET:
+            return await self._delete_lifecycle(request, bucket)
+        if 'policy' in request.GET:
+            return await self._delete_bucket_policy(request, bucket)
         volume = await self.get_volume(request.user, bucket, 'delete')
         await volume.adelete()
         return HttpResponse(status=204)
@@ -188,8 +220,126 @@ class BucketView(S3View):
         ElementTree.SubElement(root, "Status").text = "Disabled"
         return XMLResponse(root)
 
-    def _handler_uploads(self):
+    # -------------------------------------------------------------------------
+    # Lifecycle (exposes existing Expiry component via S3 API)
+    # -------------------------------------------------------------------------
+
+    TAG_LIFECYCLE = 's3.p2.io/lifecycle/rules'
+
+    async def _get_lifecycle(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'read')
+        rules_json = volume.tags.get(self.TAG_LIFECYCLE)
+        if not rules_json:
+            response = HttpResponse(status=404)
+            response['Content-Type'] = 'application/xml'
+            root = ElementTree.Element("Error")
+            ElementTree.SubElement(root, "Code").text = "NoSuchLifecycleConfiguration"
+            ElementTree.SubElement(root, "Message").text = "The lifecycle configuration does not exist"
+            response.content = ElementTree.tostring(root, encoding='utf-8', method='xml')
+            return response
+        rules = json.loads(rules_json)
+        root = ElementTree.Element("{%s}LifecycleConfiguration" % XML_NAMESPACE)
+        for rule in rules:
+            rule_el = ElementTree.SubElement(root, "Rule")
+            ElementTree.SubElement(rule_el, "ID").text = rule.get('ID', '')
+            ElementTree.SubElement(rule_el, "Status").text = rule.get('Status', 'Enabled')
+            if 'Prefix' in rule:
+                filt = ElementTree.SubElement(rule_el, "Filter")
+                ElementTree.SubElement(filt, "Prefix").text = rule['Prefix']
+            if 'Expiration' in rule:
+                exp = ElementTree.SubElement(rule_el, "Expiration")
+                if 'Days' in rule['Expiration']:
+                    ElementTree.SubElement(exp, "Days").text = str(rule['Expiration']['Days'])
+        return XMLResponse(root)
+
+    async def _put_lifecycle(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'write')
+        root = ElementTree.fromstring(request.body)
+        rules = []
+        for rule_el in root.iter('Rule'):
+            rule = {}
+            id_el = rule_el.find('ID')
+            if id_el is not None and id_el.text:
+                rule['ID'] = id_el.text
+            status_el = rule_el.find('Status')
+            rule['Status'] = status_el.text if status_el is not None else 'Enabled'
+            filt = rule_el.find('Filter')
+            if filt is not None:
+                prefix_el = filt.find('Prefix')
+                if prefix_el is not None:
+                    rule['Prefix'] = prefix_el.text or ''
+            exp_el = rule_el.find('Expiration')
+            if exp_el is not None:
+                exp = {}
+                days_el = exp_el.find('Days')
+                if days_el is not None:
+                    exp['Days'] = int(days_el.text)
+                rule['Expiration'] = exp
+            rules.append(rule)
+        volume.tags[self.TAG_LIFECYCLE] = json.dumps(rules)
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=200)
+
+    async def _delete_lifecycle(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'write')
+        volume.tags.pop(self.TAG_LIFECYCLE, None)
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=204)
+
+    def _get_notification(self):
+        """GetBucketNotification — stub returning empty config.
+        SDKs probe this on startup; an empty response prevents errors."""
+        root = ElementTree.Element("{%s}NotificationConfiguration" % XML_NAMESPACE)
+        return XMLResponse(root)
+
+    def _get_encryption(self):
+        """GetBucketEncryption — stub returning no encryption configured.
+        Satisfies SDK startup probes that call this before any object ops."""
+        from django.http import HttpResponse
+        # S3 returns 404 ServerSideEncryptionConfigurationNotFoundError when
+        # no encryption is configured — SDKs treat this as "no SSE, proceed normally"
+        response = HttpResponse(status=404)
+        response['Content-Type'] = 'application/xml'
+        root = ElementTree.Element("Error")
+        ElementTree.SubElement(root, "Code").text = "ServerSideEncryptionConfigurationNotFoundError"
+        ElementTree.SubElement(root, "Message").text = "The server side encryption configuration was not found"
+        response.content = ElementTree.tostring(root, encoding='utf-8', method='xml')
+        return response
+
+    async def _list_multipart_uploads(self, request, bucket):
+        """ListMultipartUploads — returns active (incomplete) multipart uploads."""
+        from p2.s3.constants import (TAG_S3_MULTIPART_BLOB_TARGET_BLOB,
+                                     TAG_S3_MULTIPART_BLOB_UPLOAD_ID)
+        volume = await self.get_volume(request.user, bucket, 'read')
+        prefix = request.GET.get('prefix', '')
+        max_uploads = min(int(request.GET.get('max-uploads', 1000)), 1000)
+
         root = ElementTree.Element("{%s}ListMultipartUploadsResult" % XML_NAMESPACE)
+        ElementTree.SubElement(root, "Bucket").text = bucket
+        ElementTree.SubElement(root, "Prefix").text = prefix
+        ElementTree.SubElement(root, "MaxUploads").text = str(max_uploads)
+        ElementTree.SubElement(root, "IsTruncated").text = "false"
+
+        seen_upload_ids = set()
+        async for blob in Blob.objects.filter(
+            volume=volume,
+            **{f'tags__{TAG_S3_MULTIPART_BLOB_UPLOAD_ID}__isnull': False},
+        ).order_by('path').aiterator():
+            upload_id = blob.tags.get(TAG_S3_MULTIPART_BLOB_UPLOAD_ID)
+            target = blob.tags.get(TAG_S3_MULTIPART_BLOB_TARGET_BLOB, '')
+            if not upload_id or upload_id in seen_upload_ids:
+                continue
+            if prefix and not target.lstrip('/').startswith(prefix):
+                continue
+            seen_upload_ids.add(upload_id)
+            upload_el = ElementTree.SubElement(root, "Upload")
+            ElementTree.SubElement(upload_el, "Key").text = target.lstrip('/')
+            ElementTree.SubElement(upload_el, "UploadId").text = upload_id
+            initiator = ElementTree.SubElement(upload_el, "Initiator")
+            ElementTree.SubElement(initiator, "ID").text = str(request.user.pk)
+            ElementTree.SubElement(initiator, "DisplayName").text = request.user.username
+            ElementTree.SubElement(upload_el, "StorageClass").text = "STANDARD"
+
         return XMLResponse(root)
 
     # -------------------------------------------------------------------------
@@ -313,3 +463,94 @@ class BucketView(S3View):
         volume.public_read = 'public-read' in canned
         await volume.asave(update_fields=['tags', 'public_read'])
         return HttpResponse(status=200)
+
+    # -------------------------------------------------------------------------
+    # Bucket location
+    # -------------------------------------------------------------------------
+
+    async def _get_location(self, request, bucket):
+        """GetBucketLocation — SDKs call this on startup to discover the region."""
+        await self.get_volume(request.user, bucket, 'read')
+        root = ElementTree.Element("{%s}LocationConstraint" % XML_NAMESPACE)
+        root.text = 'us-east-1'
+        return XMLResponse(root)
+
+    # -------------------------------------------------------------------------
+    # Bucket tagging
+    # -------------------------------------------------------------------------
+
+    async def _get_bucket_tagging(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'read')
+        from p2.s3.constants import TAG_S3_USER_TAG_PREFIX
+        tags = {k[len(TAG_S3_USER_TAG_PREFIX):]: v
+                for k, v in volume.tags.items()
+                if k.startswith(TAG_S3_USER_TAG_PREFIX)}
+        root = ElementTree.Element("{%s}Tagging" % XML_NAMESPACE)
+        tag_set = ElementTree.SubElement(root, "TagSet")
+        for k, v in tags.items():
+            tag_el = ElementTree.SubElement(tag_set, "Tag")
+            ElementTree.SubElement(tag_el, "Key").text = k
+            ElementTree.SubElement(tag_el, "Value").text = str(v)
+        return XMLResponse(root)
+
+    async def _put_bucket_tagging(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'write')
+        from p2.s3.constants import TAG_S3_USER_TAG_PREFIX
+        from p2.s3.views.objects import _parse_tagging_xml
+        new_tags = _parse_tagging_xml(request.body)
+        volume.tags = {k: v for k, v in volume.tags.items()
+                       if not k.startswith(TAG_S3_USER_TAG_PREFIX)}
+        for k, v in new_tags.items():
+            volume.tags[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=200)
+
+    async def _delete_bucket_tagging(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'write')
+        from p2.s3.constants import TAG_S3_USER_TAG_PREFIX
+        volume.tags = {k: v for k, v in volume.tags.items()
+                       if not k.startswith(TAG_S3_USER_TAG_PREFIX)}
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=204)
+
+    # -------------------------------------------------------------------------
+    # Bucket policy
+    # -------------------------------------------------------------------------
+
+    TAG_BUCKET_POLICY = 's3.p2.io/bucket-policy'
+
+    async def _get_bucket_policy(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'admin')
+        policy_json = volume.tags.get(self.TAG_BUCKET_POLICY)
+        if not policy_json:
+            response = HttpResponse(status=404)
+            response['Content-Type'] = 'application/xml'
+            root = ElementTree.Element("Error")
+            ElementTree.SubElement(root, "Code").text = "NoSuchBucketPolicy"
+            ElementTree.SubElement(root, "Message").text = "The bucket policy does not exist"
+            response.content = ElementTree.tostring(root, encoding='utf-8', method='xml')
+            return response
+        return HttpResponse(policy_json, content_type='application/json')
+
+    async def _put_bucket_policy(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'admin')
+        from p2.s3.policy import parse_policy
+        try:
+            parse_policy(request.body.decode('utf-8'))  # validate
+        except (ValueError, json.JSONDecodeError) as exc:
+            response = HttpResponse(status=400)
+            response['Content-Type'] = 'application/xml'
+            root = ElementTree.Element("Error")
+            ElementTree.SubElement(root, "Code").text = "MalformedPolicy"
+            ElementTree.SubElement(root, "Message").text = str(exc)
+            response.content = ElementTree.tostring(root, encoding='utf-8', method='xml')
+            return response
+        volume.tags[self.TAG_BUCKET_POLICY] = request.body.decode('utf-8')
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=204)
+
+    async def _delete_bucket_policy(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'admin')
+        volume.tags.pop(self.TAG_BUCKET_POLICY, None)
+        await volume.asave(update_fields=['tags'])
+        return HttpResponse(status=204)

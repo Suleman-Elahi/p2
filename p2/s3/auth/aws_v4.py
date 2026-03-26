@@ -16,6 +16,30 @@ from p2.s3.errors import (AWSAccessDenied, AWSContentSignatureMismatch,
 LOGGER = logging.getLogger(__name__)
 UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
 
+# Use Rust HMAC extension when available — ~10x faster key derivation.
+try:
+    from p2.s3 import p2_s3_crypto as _rust_crypto
+    _RUST_AVAILABLE = True
+    LOGGER.debug("p2_s3_crypto Rust extension loaded")
+except ImportError:
+    _rust_crypto = None
+    _RUST_AVAILABLE = False
+
+
+def _hmac_sign(key: bytes, msg: str) -> bytes:
+    if _RUST_AVAILABLE:
+        return bytes(_rust_crypto.hmac_sha256_bytes(key, msg))
+    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+
+def _derive_signing_key(secret_key: str, date: str, region: str, service: str) -> bytes:
+    if _RUST_AVAILABLE:
+        return bytes(_rust_crypto.derive_signing_key(secret_key, date, region, service))
+    k_date = _hmac_sign(('AWS4' + secret_key).encode('utf-8'), date)
+    k_region = _hmac_sign(k_date, region)
+    k_service = _hmac_sign(k_region, service)
+    return _hmac_sign(k_service, 'aws4_request')
+
 
 class SignatureMismatch(Exception):
     """Exception raised when given Hash does not match request body's hash"""
@@ -93,22 +117,13 @@ class AWSv4AuthenticationRequest:
         return auth_request
 
 class AWSV4Authentication(BaseAuth):
-    """AWS v4 Signer"""
+    """AWS v4 Signer — uses Rust HMAC extension when available."""
 
-    # Key derivation functions. See:
-    # http://docs.aws.amazon.com/general/latest/gr/signature-v4-examples.html#signature-v4-examples-python
-    def _sign(self, key: str, msg: str) -> hmac.HMAC:
-        """Simple HMAC wrapper"""
-        return hmac.new(key, msg.encode('utf-8'), hashlib.sha256)
+    def _sign(self, key: bytes, msg: str) -> bytes:
+        return _hmac_sign(key, msg)
 
-    def _get_signature_key(self, key: str, auth_request: AWSv4AuthenticationRequest) -> str:
-        """Create signature like
-        https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html"""
-        k_date = self._sign(('AWS4' + key).encode('utf-8'), auth_request.date).digest()
-        k_region = self._sign(k_date, auth_request.region).digest()
-        k_service = self._sign(k_region, auth_request.service).digest()
-        k_signing = self._sign(k_service, auth_request.request).digest()
-        return k_signing
+    def _get_signature_key(self, key: str, auth_request: 'AWSv4AuthenticationRequest') -> bytes:
+        return _derive_signing_key(key, auth_request.date, auth_request.region, auth_request.service)
 
     def _make_query_string(self) -> str:
         """Parse existing Querystring, URI-encode them and sort them and put them back together"""
@@ -217,7 +232,7 @@ class AWSV4Authentication(BaseAuth):
             auth_request.credentials,
             self._get_sha256(canonical_request.encode('utf-8')),
         ])
-        our_signature = self._sign(signing_key, string_to_sign).hexdigest()
+        our_signature = self._sign(signing_key, string_to_sign).hex()
         if auth_request.signature != our_signature:
             LOGGER.warning("Canonical Request: %s", canonical_request)
             LOGGER.warning("Signatures theirs=%s ours=%s", auth_request.signature, our_signature)

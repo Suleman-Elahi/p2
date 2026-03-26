@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1
 
-# ── Builder stage ──────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
@@ -11,7 +10,6 @@ COPY pyproject.toml ./
 
 RUN uv sync --no-install-project --no-dev
 
-# ── Final stage ────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS final
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv

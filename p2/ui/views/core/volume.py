@@ -5,9 +5,10 @@ from django.contrib.auth.mixins import \
     PermissionRequiredMixin as DjangoPermissionRequiredMixin
 from django.contrib.auth.mixins import PermissionRequiredMixin
 from django.contrib.messages.views import SuccessMessageMixin
+from django.http import HttpResponseRedirect
 from django.shortcuts import reverse
 from django.utils.translation import gettext as _
-from django.views.generic import DeleteView, DetailView, ListView, UpdateView
+from django.views.generic import DeleteView, DetailView, ListView, UpdateView, View
 
 from p2.core.acl import VolumeACL
 from p2.core.forms import VolumeForm
@@ -57,6 +58,8 @@ class VolumeDetailView(PermissionRequiredMixin, DetailView):
                 components.append(_component)
 
         context['components'] = components
+        context['bucket_policy'] = self.object.tags.get('s3.p2.io/bucket-policy', '')
+        context['volume'] = self.object
         return context
 
 
@@ -114,3 +117,34 @@ class VolumeDeleteView(SuccessMessageMixin, PermissionRequiredMixin, DeleteView)
         obj = self.get_object()
         messages.success(self.request, self.success_message % obj.__dict__)
         return super().delete(request, *args, **kwargs)
+
+
+class VolumePolicyView(PermissionRequiredMixin, View):
+    """Save or delete bucket policy for a volume."""
+
+    permission_required = 'p2_core.change_volume'
+
+    def post(self, request, pk):
+        volume = Volume.objects.get(pk=pk)
+        action = request.POST.get('action', 'save')
+        if action == 'delete':
+            volume.tags.pop('s3.p2.io/bucket-policy', None)
+            volume.save(update_fields=['tags'])
+            messages.success(request, _('Bucket policy removed.'))
+        else:
+            policy_json = request.POST.get('bucket_policy', '').strip()
+            if policy_json:
+                from p2.s3.policy import parse_policy
+                try:
+                    parse_policy(policy_json)
+                except (ValueError, Exception) as exc:
+                    messages.error(request, _('Invalid policy: %s') % exc)
+                    return HttpResponseRedirect(
+                        reverse('p2_ui:core-volume-detail', kwargs={'pk': pk}))
+                volume.tags['s3.p2.io/bucket-policy'] = policy_json
+            else:
+                volume.tags.pop('s3.p2.io/bucket-policy', None)
+            volume.save(update_fields=['tags'])
+            messages.success(request, _('Bucket policy saved.'))
+        return HttpResponseRedirect(
+            reverse('p2_ui:core-volume-detail', kwargs={'pk': pk}))

@@ -115,9 +115,9 @@ class S3RoutingMiddleware:
         if self.is_aws_request(request) or bucket:
             try:
                 self._prepare_s3_request(request, bucket)
-                # Presigned p2 tokens bypass AWS v4 auth — validated in the view
-                is_presigned = 'X-P2-Signature' in request.GET
-                if not is_presigned and AWSV4Authentication.can_handle(request):
+                # p2-native presigned tokens bypass AWS v4 auth — validated in the view
+                is_p2_presigned = 'X-P2-Signature' in request.GET
+                if not is_p2_presigned and AWSV4Authentication.can_handle(request):
                     handler = AWSV4Authentication(request)
                     user = await handler.validate()
                     request.user = user

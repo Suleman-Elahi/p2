@@ -15,8 +15,9 @@ from p2.core.signals import BLOB_PRE_SAVE
 from p2.core.storages.base import AsyncStorageController
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX,
                              XML_NAMESPACE)
+from p2.s3.checksum import verify_request_checksum
 from p2.s3.cors import apply_cors_headers, find_matching_rule, get_cors_rules
-from p2.s3.errors import AWSAccessDenied, AWSNoSuchKey
+from p2.s3.errors import AWSAccessDenied, AWSBadDigest, AWSNoSuchKey
 from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
@@ -54,6 +55,44 @@ async def _blob_read_stream(blob):
 
 def _fire_pre_save(blob):
     BLOB_PRE_SAVE.send(sender=Blob, blob=blob)
+
+
+def _check_conditional_headers(request, blob) -> HttpResponse | None:
+    """Check If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since.
+    Returns an error HttpResponse if condition fails, None if OK."""
+    if blob is None:
+        if request.META.get('HTTP_IF_NONE_MATCH') == '*':
+            return None
+        if request.META.get('HTTP_IF_MATCH'):
+            return HttpResponse(status=412)
+        return None
+    etag = blob.attributes.get('blob.p2.io/hash/md5', '')
+    if_match = request.META.get('HTTP_IF_MATCH')
+    if if_match:
+        tags = [t.strip().strip('"') for t in if_match.split(',')]
+        if etag.strip('"') not in tags and '*' not in tags:
+            return HttpResponse(status=412)
+    if_none_match = request.META.get('HTTP_IF_NONE_MATCH')
+    if if_none_match:
+        if if_none_match == '*':
+            return HttpResponse(status=412)
+        tags = [t.strip().strip('"') for t in if_none_match.split(',')]
+        if etag.strip('"') in tags:
+            return HttpResponse(status=412)
+    if_unmod = request.META.get('HTTP_IF_UNMODIFIED_SINCE')
+    if if_unmod:
+        from email.utils import parsedate_to_datetime
+        try:
+            threshold = parsedate_to_datetime(if_unmod)
+            mtime = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
+            if mtime:
+                from django.utils.dateparse import parse_datetime
+                blob_dt = parse_datetime(str(mtime))
+                if blob_dt and blob_dt > threshold:
+                    return HttpResponse(status=412)
+        except (ValueError, TypeError):
+            pass
+    return None
 
 
 def _user_tags_from_blob(blob: Blob) -> dict:
@@ -158,6 +197,8 @@ class ObjectView(S3View):
         response['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
         response['Content-Type'] = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
         response['Last-Modified'] = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
+        response['ETag'] = blob.attributes.get('blob.p2.io/hash/md5', '')
+        response['Accept-Ranges'] = 'bytes'
         return await self._apply_cors(request, response, volume)
 
     async def get(self, request, bucket, path):
@@ -170,13 +211,49 @@ class ObjectView(S3View):
         # Object ACL
         if 'acl' in request.GET:
             return await self._get_acl(request, bucket, path)
+        # List parts
+        if 'uploadId' in request.GET:
+            return await MultipartUploadView().dispatch(request, bucket, path)
 
         volume = await self.get_volume(request.user, bucket, 'read')
         blob = await self.get_blob(volume, path)
         content_type = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
+        total_size = int(blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
+
+        # Range request support
+        range_header = request.META.get('HTTP_RANGE', '')
+        if range_header:
+            return await self._range_response(request, blob, content_type, total_size, range_header, volume)
+
+        etag = blob.attributes.get('blob.p2.io/hash/md5', '')
+        # If-None-Match → 304 Not Modified
+        if_none_match = request.META.get('HTTP_IF_NONE_MATCH')
+        if if_none_match and etag:
+            tags = [t.strip().strip('"') for t in if_none_match.split(',')]
+            if etag.strip('"') in tags:
+                resp = HttpResponse(status=304)
+                resp['ETag'] = etag
+                return await self._apply_cors(request, resp, volume)
+        # If-Modified-Since → 304 Not Modified
+        if_mod_since = request.META.get('HTTP_IF_MODIFIED_SINCE')
+        if if_mod_since:
+            from email.utils import parsedate_to_datetime
+            from django.utils.dateparse import parse_datetime
+            try:
+                threshold = parsedate_to_datetime(if_mod_since)
+                mtime = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
+                if mtime:
+                    blob_dt = parse_datetime(str(mtime))
+                    if blob_dt and blob_dt <= threshold:
+                        resp = HttpResponse(status=304)
+                        return await self._apply_cors(request, resp, volume)
+            except (ValueError, TypeError):
+                pass
         response = StreamingHttpResponse(_blob_read_stream(blob), content_type=content_type)
-        response['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
+        response['Content-Length'] = total_size
         response['Last-Modified'] = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
+        response['ETag'] = etag
+        response['Accept-Ranges'] = 'bytes'
         return await self._apply_cors(request, response, volume)
 
     async def post(self, request, bucket, path):
@@ -199,6 +276,11 @@ class ObjectView(S3View):
             return await self._copy_object(request, bucket, path, copy_source)
 
         volume = await self.get_volume(request.user, bucket, 'write')
+        # Check conditional headers against existing object
+        existing = await Blob.objects.filter(path=path, volume=volume).afirst()
+        cond_resp = _check_conditional_headers(request, existing)
+        if cond_resp is not None:
+            return cond_resp
         created = False
         try:
             blob, created = await Blob.objects.aget_or_create(path=path, volume=volume)
@@ -217,6 +299,11 @@ class ObjectView(S3View):
 
         await sync_to_async(_fire_pre_save)(blob)
 
+        # Verify payload checksum if x-amz-checksum-* header present
+        checksum_err = verify_request_checksum(request, request.body)
+        if checksum_err:
+            raise AWSBadDigest
+
         controller = volume.storage.controller
         if isinstance(controller, AsyncStorageController):
             await controller.commit(blob, _request_body_chunks(request))
@@ -226,17 +313,80 @@ class ObjectView(S3View):
 
         await sync_to_async(blob.save)()
         response = HttpResponse(status=200)
+        response['ETag'] = blob.attributes.get('blob.p2.io/hash/md5', '')
         return await self._apply_cors(request, response, volume)
 
     async def delete(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectDELETE.html"""
         if 'tagging' in request.GET:
             return await self._delete_tagging(request, bucket, path)
+        # Abort multipart
+        if 'uploadId' in request.GET:
+            return await MultipartUploadView().dispatch(request, bucket, path)
         volume = await self.get_volume(request.user, bucket, 'delete')
         blob = await Blob.objects.filter(path=path, volume=volume).afirst()
         if blob is not None:
             await blob.adelete()
         return HttpResponse(status=204)
+
+    # -------------------------------------------------------------------------
+    # Range requests
+    # -------------------------------------------------------------------------
+
+    async def _range_response(self, request, blob, content_type, total_size, range_header, volume):
+        """Handle Range: bytes=X-Y requests (RFC 7233)."""
+        try:
+            # Parse "bytes=start-end"
+            unit, ranges = range_header.split('=', 1)
+            if unit.strip() != 'bytes':
+                raise ValueError
+            start_str, end_str = ranges.strip().split('-', 1)
+            start = int(start_str) if start_str else None
+            end = int(end_str) if end_str else None
+        except (ValueError, AttributeError):
+            return HttpResponse(status=416)  # Range Not Satisfiable
+
+        # Suffix range: bytes=-500 means last 500 bytes
+        if start is None:
+            start = max(0, total_size - end)
+            end = total_size - 1
+        if end is None or end >= total_size:
+            end = total_size - 1
+        if start > end or start >= total_size:
+            response = HttpResponse(status=416)
+            response['Content-Range'] = f'bytes */{total_size}'
+            return response
+
+        length = end - start + 1
+
+        async def _ranged_stream():
+            controller = blob.volume.storage.controller
+            if isinstance(controller, AsyncStorageController):
+                # Stream and skip/slice
+                consumed = 0
+                async for chunk in controller.get_read_stream(blob):
+                    chunk_start = consumed
+                    chunk_end = consumed + len(chunk)
+                    if chunk_end <= start:
+                        consumed = chunk_end
+                        continue
+                    if chunk_start >= end + 1:
+                        break
+                    # Slice the chunk to the requested range
+                    slice_start = max(0, start - chunk_start)
+                    slice_end = min(len(chunk), end + 1 - chunk_start)
+                    yield memoryview(chunk)[slice_start:slice_end].tobytes()
+                    consumed = chunk_end
+            else:
+                import asyncio
+                data = await asyncio.to_thread(blob.read)
+                yield data[start:end + 1]
+
+        response = StreamingHttpResponse(_ranged_stream(), content_type=content_type, status=206)
+        response['Content-Length'] = length
+        response['Content-Range'] = f'bytes {start}-{end}/{total_size}'
+        response['Accept-Ranges'] = 'bytes'
+        return await self._apply_cors(request, response, volume)
 
     # -------------------------------------------------------------------------
     # Copy object
@@ -257,6 +407,11 @@ class ObjectView(S3View):
             raise AWSNoSuchKey
 
         dest_volume = await self.get_volume(request.user, dest_bucket, 'write')
+        # Check conditional headers against existing destination object
+        existing_dest = await Blob.objects.filter(path=dest_path, volume=dest_volume).afirst()
+        cond_resp = _check_conditional_headers(request, existing_dest)
+        if cond_resp is not None:
+            return cond_resp
 
         # Read source data
         src_controller = src_volume.storage.controller

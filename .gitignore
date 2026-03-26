@@ -5,6 +5,8 @@ __pycache__/
 
 # C extensions
 *.so
+# Exception: pre-built Rust extension (compiled via scripts/build_rust_ext.sh)
+!p2/s3/p2_s3_crypto.so
 
 # Distribution / packaging
 .Python
@@ -115,6 +117,10 @@ vendor/**
 debian/p2/**
 debian/files
 debian/*.substvars
+
+# Rust build artifacts (extension compiled via scripts/build_rust_ext.sh)
+p2/s3/rust_ext/target/
+p2/s3/rust_ext/dist/
 
 p2.crt
 p2.key

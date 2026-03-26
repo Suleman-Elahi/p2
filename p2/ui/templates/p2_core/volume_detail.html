@@ -1,6 +1,15 @@
 {% extends 'base/base.html' %}
 
 {% load i18n %}
+{% load static %}
+
+{% block head %}
+{{ block.super }}
+<script src="{% static 'codemirror/codemirror.js' %}"></script>
+<link rel="stylesheet" href="{% static 'codemirror/codemirror.css' %}">
+<link rel="stylesheet" href="{% static 'codemirror/theme/monokai.css' %}">
+<script src="{% static 'codemirror/mode/javascript/javascript.js' %}"></script>
+{% endblock %}
 
 {% block content %}
 <h2>
@@ -39,4 +48,50 @@
   </div>
   {% endfor %}
 </div>
+
+<hr>
+
+<div class="row">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">{% trans 'Bucket Policy' %}</h5>
+        <p class="card-text text-muted">
+          {% trans 'IAM-style JSON policy for this volume. Controls S3 API access with Allow/Deny statements.' %}
+        </p>
+        <form method="post" action="{% url 'p2_ui:core-volume-policy' pk=volume.pk %}">
+          {% csrf_token %}
+          <textarea id="bucket-policy-editor" name="bucket_policy" rows="12" class="form-control" placeholder='{% trans "No bucket policy configured. Paste an IAM policy JSON document here." %}'>{{ bucket_policy }}</textarea>
+          <div class="mt-2">
+            <button type="submit" name="action" value="save" class="btn btn-success btn-sm">
+              <i class="fa fa-save" aria-hidden="true"></i> {% trans 'Save Policy' %}
+            </button>
+            {% if bucket_policy %}
+            <button type="submit" name="action" value="delete" class="btn btn-danger btn-sm"
+                    onclick="return confirm('{% trans "Remove bucket policy?" %}');">
+              <i class="fa fa-trash" aria-hidden="true"></i> {% trans 'Remove Policy' %}
+            </button>
+            {% endif %}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  var ta = document.getElementById('bucket-policy-editor');
+  if (ta) {
+    var cm = CodeMirror.fromTextArea(ta, {
+      mode: {name: 'javascript', json: true},
+      theme: 'monokai',
+      lineNumbers: true,
+      matchBrackets: true,
+      tabSize: 2
+    });
+    cm.setSize(null, 300);
+  }
+})();
+</script>
 {% endblock %}

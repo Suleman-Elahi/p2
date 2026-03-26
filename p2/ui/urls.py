@@ -23,6 +23,8 @@ urlpatterns = [
          volume.VolumeUpdateView.as_view(), name='core-volume-update'),
     path('core/volume/<uuid:pk>/delete/',
          volume.VolumeDeleteView.as_view(), name='core-volume-delete'),
+    path('core/volume/<uuid:pk>/policy/',
+         volume.VolumePolicyView.as_view(), name='core-volume-policy'),
     path('core/volume/<uuid:pk>/blobs/',
          blob.FileBrowserView.as_view(), name='core-blob-list'),
     # Core - Blobs

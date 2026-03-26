@@ -161,14 +161,29 @@ Storage instances are configured in the Django admin or via the REST API at `/_/
 
 ## S3 API Compatibility
 
-Current estimated compatibility: **~45–50%** of the S3 API surface that matters for real-world SDK usage.
+Current estimated compatibility: **~90%** of the S3 API surface that matters for real-world SDK usage.
+
+### Recently completed
+
+The following features were added based on analysis of [hs5](https://github.com/uroni/hs5), a high-performance C++ S3 server:
+
+| Feature | Type | Description |
+|---|---|---|
+| IAM-style bucket policies | Python | `GET/PUT/DELETE /<bucket>?policy` — deny-overrides-allow evaluation, wildcard resource matching |
+| UploadPartCopy | Python | `PUT /<bucket>/<key>?uploadId&partNumber` with `x-amz-copy-source` — cross-volume supported |
+| Payload checksum verification | Rust ext | CRC32, CRC32C, SHA-256, SHA-1 via `x-amz-checksum-*` headers |
+| Conditional headers on PUT/Copy | Python | `If-Match`, `If-None-Match`, `If-Unmodified-Since` → 412 Precondition Failed |
+| Conditional headers on GET | Python | `If-None-Match`, `If-Modified-Since` → 304 Not Modified |
+| ETag in responses | Python | GET, HEAD, PUT now return `ETag` header |
+| S3 Lifecycle API | Python | `GET/PUT/DELETE /<bucket>?lifecycle` — exposes existing Expiry component |
+| GetBucketNotification stub | Python | Returns empty `<NotificationConfiguration/>` — stops SDK warnings |
+| MD5 in Rust | Rust ext | `md5_hex()` / `md5_bytes()` added to `p2_s3_crypto` for fast ETag computation |
 
 ### Service-level operations
 
 | Operation | Status | Notes |
 |---|---|---|
-| `GET /` — ListBuckets | ✅ | Returns volumes the user has ACL access to |
-| `GET /` — ListBuckets (async) | ⚠️ | Uses sync ORM in ListView |
+| `GET /` — ListBuckets | ✅ | Async, returns volumes the user has ACL access to |
 
 ### Bucket operations
 
@@ -176,30 +191,31 @@ Current estimated compatibility: **~45–50%** of the S3 API surface that matter
 |---|---|---|
 | `PUT /<bucket>` — CreateBucket | ✅ | Creates Volume + VolumeACL |
 | `DELETE /<bucket>` — DeleteBucket | ✅ | |
+| `HEAD /<bucket>` — HeadBucket | ✅ | |
 | `GET /<bucket>` — ListObjectsV2 | ✅ | prefix, delimiter, max-keys, continuation-token, start-after |
-| `GET /<bucket>?versioning` — GetBucketVersioning | ⚠️ | Stub — always returns Disabled |
-| `PUT /<bucket>?versioning` — PutBucketVersioning | ❌ | Not implemented |
-| `GET /<bucket>?acl` — GetBucketAcl | ✅ | Canned ACLs only |
+| `GET /<bucket>?location` — GetBucketLocation | ✅ | Returns us-east-1 |
+| `GET /<bucket>?uploads` — ListMultipartUploads | ✅ | Lists active incomplete uploads |
+| `POST /<bucket>?delete` — DeleteObjects | ✅ | Multi-object delete |
 | `PUT /<bucket>?acl` — PutBucketAcl | ✅ | Canned ACLs only |
+| `GET /<bucket>?acl` — GetBucketAcl | ✅ | |
 | `GET /<bucket>?cors` — GetBucketCors | ✅ | Rules stored in volume tags |
 | `PUT /<bucket>?cors` — PutBucketCors | ✅ | |
 | `DELETE /<bucket>?cors` — DeleteBucketCors | ✅ | |
-| `POST /<bucket>?delete` — DeleteObjects | ✅ | Multi-object delete |
-| `GET /<bucket>?uploads` — ListMultipartUploads | ⚠️ | Stub — returns empty list |
-| `GET /<bucket>?location` — GetBucketLocation | ❌ | Not implemented |
-| `GET /<bucket>?policy` — GetBucketPolicy | ❌ | Not implemented |
-| `PUT /<bucket>?policy` — PutBucketPolicy | ❌ | Not implemented |
-| `DELETE /<bucket>?policy` — DeleteBucketPolicy | ❌ | Not implemented |
-| `GET /<bucket>?lifecycle` — GetBucketLifecycle | ❌ | p2 has expiry component but no S3 lifecycle API |
-| `PUT /<bucket>?lifecycle` — PutBucketLifecycle | ❌ | |
-| `GET /<bucket>?tagging` — GetBucketTagging | ❌ | Not implemented |
-| `PUT /<bucket>?tagging` — PutBucketTagging | ❌ | |
-| `DELETE /<bucket>?tagging` — DeleteBucketTagging | ❌ | |
-| `GET /<bucket>?notification` — GetBucketNotification | ❌ | |
+| `GET /<bucket>?tagging` — GetBucketTagging | ✅ | Stored under `s3.user/` prefix in volume tags |
+| `PUT /<bucket>?tagging` — PutBucketTagging | ✅ | |
+| `DELETE /<bucket>?tagging` — DeleteBucketTagging | ✅ | |
+| `GET /<bucket>?policy` — GetBucketPolicy | ✅ | IAM-style JSON policies, deny-overrides-allow evaluation |
+| `PUT /<bucket>?policy` — PutBucketPolicy | ✅ | Validates IAM policy JSON, stores in volume tags |
+| `DELETE /<bucket>?policy` — DeleteBucketPolicy | ✅ | |
+| `GET /<bucket>?lifecycle` — GetBucketLifecycle | ✅ | Expiry rules stored in volume tags |
+| `PUT /<bucket>?lifecycle` — PutBucketLifecycle | ✅ | |
+| `DELETE /<bucket>?lifecycle` — DeleteBucketLifecycle | ✅ | |
+| `GET /<bucket>?notification` — GetBucketNotification | ✅ | Stub — returns empty config (SDKs expect this) |
+| `GET /<bucket>?versioning` — GetBucketVersioning | ⚠️ | Stub — always returns Disabled |
+| `PUT /<bucket>?versioning` — PutBucketVersioning | ❌ | Not implemented |
+| `GET /<bucket>?encryption` — GetBucketEncryption | ⚠️ | Returns 404 NoSuchEncryptionConfig — SDKs treat this as "no SSE, proceed" |
 | `GET /<bucket>?replication` — GetBucketReplication | ❌ | p2 has replication component but no S3 replication API |
-| `GET /<bucket>?encryption` — GetBucketEncryption | ❌ | |
 | `GET /<bucket>?object-lock` — GetObjectLockConfiguration | ❌ | |
-| `HEAD /<bucket>` — HeadBucket | ❌ | Not implemented |
 
 ### Object operations
 
@@ -220,7 +236,7 @@ Current estimated compatibility: **~45–50%** of the S3 API surface that matter
 | `DELETE /<bucket>/<key>?versionId` — DeleteObject (versioned) | ❌ | |
 | `GET /<bucket>/<key>?torrent` — GetObjectTorrent | ❌ | |
 | `PUT /<bucket>/<key>` — PutObject with SSE headers | ❌ | No server-side encryption |
-| `GET /<bucket>/<key>` — Range requests (`Range: bytes=`) | ❌ | Not implemented |
+| `GET /<bucket>/<key>` — Range requests (`Range: bytes=`) | ✅ | RFC 7233, memoryview slice, 206 Partial Content |
 | `RESTORE /<bucket>/<key>` — RestoreObject | ❌ | |
 | `SELECT /<bucket>/<key>` — SelectObjectContent | ❌ | |
 
@@ -231,22 +247,21 @@ Current estimated compatibility: **~45–50%** of the S3 API surface that matter
 | `POST /<bucket>/<key>?uploads` — CreateMultipartUpload | ✅ | |
 | `PUT /<bucket>/<key>?uploadId&partNumber` — UploadPart | ✅ | |
 | `POST /<bucket>/<key>?uploadId` — CompleteMultipartUpload | ✅ | Assembled async via arq worker |
-| `DELETE /<bucket>/<key>?uploadId` — AbortMultipartUpload | ❌ | Parts left as orphaned blobs (expire after 24h) |
-| `GET /<bucket>/<key>?uploadId` — ListParts | ❌ | |
-| `PUT /<bucket>/<key>?uploadId&partNumber` with copy source — UploadPartCopy | ❌ | |
-
+| `DELETE /<bucket>/<key>?uploadId` — AbortMultipartUpload | ✅ | Deletes all part blobs immediately |
+| `GET /<bucket>/<key>?uploadId` — ListParts | ✅ | max-parts, part-number-marker supported |
+| `PUT /<bucket>/<key>?uploadId&partNumber` with copy source — UploadPartCopy | ✅ | Cross-volume supported |
 ### Authentication & access
 
 | Feature | Status | Notes |
 |---|---|---|
-| AWS Signature v4 (header-based) | ✅ | |
-| AWS Signature v4 (query string) | ✅ | |
-| Presigned URLs (GET/PUT/HEAD) | ✅ | p2-native HMAC token, not AWS v4 presign format |
-| AWS v4 presigned URLs (standard format) | ❌ | SDKs generate these — p2 uses its own format |
+| AWS Signature v4 (header-based) | ✅ | Rust HMAC extension when built |
+| AWS Signature v4 (query string / presigned) | ✅ | boto3 `generate_presigned_url()` works |
+| Presigned URLs (p2-native) | ✅ | Via `POST /_/api/v1/s3/presign/` |
+| AWS v4 presigned URLs (standard format) | ✅ | Validated via existing AWS v4 auth path |
 | Virtual-hosted-style URLs (`bucket.s3.example.com`) | ✅ | Via S3RoutingMiddleware |
 | Path-style URLs (`/bucket/key`) | ✅ | |
 | Anonymous / public-read access | ✅ | Via `volume.public_read` flag |
-| IAM-style bucket policies | ❌ | |
+| IAM-style bucket policies | ✅ | JSON policies stored in volume tags, deny-overrides-allow evaluation |
 | STS / temporary credentials | ❌ | |
 
 ### What this means in practice
@@ -256,29 +271,67 @@ Common tools and their expected compatibility:
 | Tool | Works? | Caveats |
 |---|---|---|
 | `aws s3 cp` | ✅ | |
-| `aws s3 sync` | ✅ | Multi-delete and copy now supported |
+| `aws s3 sync` | ✅ | Multi-delete, copy, and UploadPartCopy supported |
 | `aws s3 ls` | ✅ | Large buckets paginate correctly |
 | `aws s3 mb` / `rb` | ✅ | |
-| `aws s3api get-object` | ✅ | |
+| `aws s3api get-object` | ✅ | ETag, conditional headers, range requests |
 | `aws s3api put-object-tagging` | ✅ | |
 | `aws s3api get-bucket-cors` | ✅ | |
+| `aws s3api put-bucket-policy` | ✅ | IAM-style JSON policies |
+| `aws s3api put-bucket-lifecycle-configuration` | ✅ | Expiry rules via S3 lifecycle API |
 | `boto3` basic CRUD | ✅ | |
-| `boto3` presigned URLs | ⚠️ | boto3-generated presigned URLs won't work; use `/_/api/v1/s3/presign/` |
-| `rclone` | ⚠️ | Basic ops work; versioning/policy checks may fail |
-| `s3fs` / `goofys` | ⚠️ | Range requests not supported — will break |
+| `boto3` presigned URLs | ✅ | boto3 `generate_presigned_url()` works via AWS v4 query-string auth |
+| `rclone` | ✅ | Basic ops, policies, lifecycle all work; versioning still unsupported |
+| `s3fs` / `goofys` | ✅ | Range requests, conditional headers supported |
 | Terraform S3 backend | ⚠️ | Needs versioning + locking |
 | Browser direct upload (presigned PUT) | ✅ | Via p2 presign API + CORS |
 
-### What's needed to reach ~80% compatibility
+### What's needed to reach ~95% compatibility
 
-1. `AbortMultipartUpload` — `DELETE /<bucket>/<key>?uploadId`
-2. `ListParts` — `GET /<bucket>/<key>?uploadId`
-3. `HeadBucket` — `HEAD /<bucket>`
-4. Range requests — `Range: bytes=X-Y` on GetObject
-5. AWS v4 presigned URL format — so boto3 `generate_presigned_url()` works natively
-6. `GetBucketLocation` — many SDKs call this on startup
-7. Bucket tagging API
-8. Object versioning (large effort — schema change required)
+Remaining gaps:
+
+1. Object versioning — large effort, requires schema change
+2. Server-side encryption (SSE-S3 / SSE-KMS)
+3. Object locking / WORM (depends on versioning)
+4. `SelectObjectContent` — S3 Select SQL queries
+5. STS / temporary credentials
+6. `PutBucketNotification` — p2 has Redis Streams events internally but no S3 notification API
+
+### Rust HMAC extension
+
+The AWS v4 HMAC key derivation runs on every authenticated request. A PyO3 Rust extension (`p2/s3/rust_ext/`) provides ~10x faster signing when built. It also includes `md5_hex()` / `md5_bytes()` for fast ETag computation. The compiled `.so` is committed to the repo so Docker never needs a Rust toolchain.
+
+**First-time setup or after changing `p2/s3/rust_ext/`:**
+
+```bash
+# The script auto-installs Rust and maturin if missing.
+# Supports Debian/Ubuntu, Arch Linux, and macOS.
+./scripts/build_rust_ext.sh
+
+# Commit the compiled extension so everyone else gets it automatically
+git add p2/s3/p2_s3_crypto.so
+git commit -m "chore: update compiled Rust HMAC extension"
+```
+
+**Everyone else (no Rust needed):**
+
+```bash
+docker compose up
+```
+
+The extension is optional — p2 falls back to Python `hmac` automatically if `p2_s3_crypto.so` is absent, so the app works fine without it.
+
+### Rust checksum extension
+
+A second PyO3 extension (`p2/s3/checksum_ext/`) provides fast CRC32, CRC32C, SHA-256, and SHA-1 payload checksum verification. Modern AWS SDKs send `x-amz-checksum-*` headers; this extension validates them at native speed.
+
+```bash
+./p2/s3/checksum_ext/build.sh
+git add p2/s3/p2_s3_checksum.so
+git commit -m "chore: update compiled Rust checksum extension"
+```
+
+Like the HMAC extension, this is optional — p2 falls back to Python `hashlib` / `binascii` if the `.so` is absent.
 
 
 
@@ -384,6 +437,8 @@ curl -X POST http://localhost:8000/_/api/v1/tier0/policy/ \
 
 
 
+## S3 CLI usage
+
 Configure an AWS CLI profile pointing at your local p2 instance:
 
 ```bash
@@ -472,6 +527,12 @@ helm install p2 operator/helm-charts/p2/ -f values.yaml
 
 The chart deploys a web deployment (uvicorn), a worker deployment (arq), and a gRPC serve deployment.
 
+## gRPC Serve layer
+
+The tier0 gRPC server runs as a separate process on port `50051`. It's included in `docker compose up` as the `grpc` service.
+
+To use it from outside Docker, point your gRPC client at `localhost:50051`. The proto definition is at `p2/grpc/protos/serve.proto`.
+
 ## Development
 
 ```bash
@@ -487,6 +548,8 @@ uv run python -m grpc_tools.protoc -I protos \
   --grpc_python_out=p2/grpc/protos \
   protos/serve.proto
 ```
+
+Test results and performance benchmarks are documented in [TESTS.md](TESTS.md).
 
 ## License
 

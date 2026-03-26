@@ -52,6 +52,25 @@ services:
       - db
       - redis
 
+  grpc:
+    build: .
+    command: uv run python manage.py grpc
+    env_file: .env
+    volumes:
+      - .:/app
+      - media:/app/media
+      - storage:/storage
+    ports:
+      - "50051:50051"
+    environment:
+      DJANGO_SETTINGS_MODULE: p2.core.settings
+      DATABASE_URL: postgresql://p2:p2@db:5432/p2
+      REDIS_URL: redis://redis:6379/0
+      ARQ_REDIS_URL: redis://redis:6379/1
+    depends_on:
+      - db
+      - redis
+
 volumes:
   postgres_data:
   media:
