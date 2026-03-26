@@ -18,7 +18,7 @@ services:
   web:
     build: .
     entrypoint: []
-    command: sh -c "uv run python manage.py collectstatic --noinput && uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload"
+    command: sh -c "uv run python manage.py collectstatic --noinput --clear && uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload"
     env_file: .env
     volumes:
       - .:/app

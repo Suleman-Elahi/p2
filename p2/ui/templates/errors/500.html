@@ -11,13 +11,15 @@
 {% block scripts %}
 {% if sentry_event_id %}
 <script>
-  Sentry.showReportDialog({
-    eventId: '{{ sentry_event_id }}',
-    user: {
-      email: "{{ user.email }}",
-      name: "{{ user.username }}",
-    },
-  });
+  if (typeof Sentry !== 'undefined') {
+    Sentry.showReportDialog({
+      eventId: '{{ sentry_event_id }}',
+      user: {
+        email: "{{ user.email }}",
+        name: "{{ user.username }}",
+      },
+    });
+  }
 </script>
 {% endif %}
 {% endblock %}

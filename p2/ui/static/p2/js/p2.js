@@ -16,12 +16,100 @@ function getCookie(name) {
     return cookieValue;
 }
 
+// Upload a single File object with a given prefix (folder path) to the volume upload endpoint
+function uploadFileWithPrefix(file, uploadUrl, prefix) {
+    var url = uploadUrl.split('?')[0];
+    var basePrefix = new URLSearchParams(uploadUrl.split('?')[1] || '').get('prefix') || '';
+    var fullPrefix = prefix ? (basePrefix.replace(/\/$/, '') + '/' + prefix).replace(/\/+/g, '/') : basePrefix;
+    var formData = new FormData();
+    formData.append('file', file, file.name);
+    formData.append('csrfmiddlewaretoken', getCookie('csrftoken'));
+    return fetch(url + '?prefix=' + encodeURIComponent(fullPrefix), {
+        method: 'POST',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') },
+        body: formData
+    }).then(function(r) { return r.json(); }).then(function(response) {
+        var blobs = Array.isArray(response) ? response : [];
+        dzPostUploadToast(file.name, true);
+        blobs.forEach(function(blob) { dzAppendFileRow(file, blob); });
+    }).catch(function(err) {
+        dzPostUploadToast(file.name + ': ' + err, false);
+    });
+}
+
+// Recursively read a FileSystemDirectoryEntry and collect all files with their relative paths
+function readDirectoryEntries(dirEntry, pathPrefix) {
+    return new Promise(function(resolve) {
+        var results = [];
+        var reader = dirEntry.createReader();
+        function readBatch() {
+            reader.readEntries(function(entries) {
+                if (!entries.length) { resolve(results); return; }
+                var pending = entries.length;
+                entries.forEach(function(entry) {
+                    var entryPath = pathPrefix ? pathPrefix + '/' + entry.name : entry.name;
+                    if (entry.isFile) {
+                        entry.file(function(file) {
+                            results.push({ file: file, prefix: pathPrefix || '' });
+                            if (--pending === 0) readBatch();
+                        });
+                    } else if (entry.isDirectory) {
+                        readDirectoryEntries(entry, entryPath).then(function(subResults) {
+                            results = results.concat(subResults);
+                            if (--pending === 0) readBatch();
+                        });
+                    } else {
+                        if (--pending === 0) readBatch();
+                    }
+                });
+            });
+        }
+        readBatch();
+    });
+}
+
 $(document).ready(function () {
     if ($('.dz').length === 0) return;
+
+    var uploadUrl = $('.dz').attr('action');
+
+    // Folder upload via button
+    $('#folder-upload-input').on('change', function() {
+        var files = Array.from(this.files);
+        files.forEach(function(file) {
+            // webkitRelativePath is "folderName/sub/file.txt" — use dirname as prefix
+            var rel = file.webkitRelativePath || file.name;
+            var prefix = rel.includes('/') ? rel.substring(0, rel.lastIndexOf('/')) : '';
+            uploadFileWithPrefix(file, uploadUrl, prefix);
+        });
+        this.value = '';
+    });
 
     $('.dz').dropzone({
         previewTemplate: '<div style="display:none"></div>',
         maxFilesize: null,
+        // Intercept drop to handle folders via FileSystem API
+        drop: function(e) {
+            var items = e.dataTransfer && e.dataTransfer.items;
+            if (!items) return;
+            var self = this;
+            var hasFolder = false;
+            Array.from(items).forEach(function(item) {
+                var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+                if (entry && entry.isDirectory) {
+                    hasFolder = true;
+                    readDirectoryEntries(entry, entry.name).then(function(fileEntries) {
+                        fileEntries.forEach(function(fe) {
+                            uploadFileWithPrefix(fe.file, uploadUrl, fe.prefix);
+                        });
+                    });
+                }
+            });
+            // If no folders, let Dropzone handle it normally
+            if (!hasFolder) {
+                Dropzone.prototype.drop.call(self, e);
+            }
+        },
         init: function () {
             this.on('error', function (file, errorMessage) {
                 dzPostUploadToast(errorMessage.detail || errorMessage, false);

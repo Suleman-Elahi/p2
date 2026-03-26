@@ -24,29 +24,33 @@
     {% if user.is_authenticated %}
     <script src="{% static 'sentry/bundle.min.js' %}"></script>
     <script>
-      Sentry.init({
-        dsn: 'https://9041d56f69bd496ea4edfa6420eac665@sentry.services.beryju.org/9',
-        beforeSend(event, hint) {
-          // Check if it is an exception, and if so, show the report dialog
-          if (event.exception) {
-            Sentry.showReportDialog({
-              eventId: event.event_id,
-              user: {
-                email: "{{ user.email }}",
-                name: "{{ user.username }}",
-              },
-              title: "Found a bug, want to request a feature or need help?"
-            });
+      if (typeof Sentry !== 'undefined') {
+        Sentry.init({
+          dsn: 'https://9041d56f69bd496ea4edfa6420eac665@sentry.services.beryju.org/9',
+          beforeSend(event, hint) {
+            // Check if it is an exception, and if so, show the report dialog
+            if (event.exception) {
+              Sentry.showReportDialog({
+                eventId: event.event_id,
+                user: {
+                  email: "{{ user.email }}",
+                  name: "{{ user.username }}",
+                },
+                title: "Found a bug, want to request a feature or need help?"
+              });
+            }
+            return event;
           }
-          return event;
+        });
+        Sentry.configureScope((scope) => {
+          scope.setUser({ "email": "{{ user.email }}" });
+          scope.setTag("version", "{{ p2_version }}");
+        });
+        window.feedbackMessage = function() {
+          Sentry.captureException(new Error("Feedback"));
         }
-      });
-      Sentry.configureScope((scope) => {
-        scope.setUser({ "email": "{{ user.email }}" });
-        scope.setTag("version", "{{ p2_version }}");
-      });
-      window.feedbackMessage = function() {
-        Sentry.captureException(new Error("Feedback"));
+      } else {
+        window.feedbackMessage = function() {};
       }
     </script>
     {% endif %}

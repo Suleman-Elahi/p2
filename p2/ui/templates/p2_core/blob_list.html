@@ -27,6 +27,12 @@
           <i class="fa fa-upload fa-2x mb-2" aria-hidden="true"></i>
           <p class="mb-0">{% trans 'Drop files here or click to upload' %}</p>
         </div>
+        <div class="mb-2">
+          <label class="btn btn-sm btn-outline-secondary mb-0">
+            <i class="fa fa-folder-open" aria-hidden="true"></i> {% trans 'Upload Folder' %}
+            <input type="file" id="folder-upload-input" webkitdirectory multiple style="display:none">
+          </label>
+        </div>
         <table class="table table-striped table-bordered table-hover table-sm">
           <thead class="thead-dark">
             <tr>
