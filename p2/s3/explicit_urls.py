@@ -1,4 +1,4 @@
-"""p2 S3 URLs"""
+"""p2 S3 URLs — loaded only when an AWS request is detected."""
 from django.conf import settings
 from django.urls import include, path, register_converter
 
@@ -16,8 +16,6 @@ except ValueError:
 
 app_name = 'p2_s3'
 
-# These patterns are only loaded when a X-AWS-* Header is detected
-# as these paths can interfere with p2.serve
 urlpatterns = [
     path('<s3:bucket>', buckets.BucketView.as_view(), name='bucket'),
     path('<s3:bucket>/', buckets.BucketView.as_view(), name='bucket'),
@@ -26,7 +24,8 @@ urlpatterns = [
 ]
 
 if settings.DEBUG:
-    import debug_toolbar
-    urlpatterns = [
-        path('_/debug/', include(debug_toolbar.urls)),
-    ] + urlpatterns
+    try:
+        import debug_toolbar
+        urlpatterns = [path('_/debug/', include(debug_toolbar.urls))] + urlpatterns
+    except ImportError:
+        pass

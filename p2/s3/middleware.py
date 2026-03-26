@@ -115,7 +115,9 @@ class S3RoutingMiddleware:
         if self.is_aws_request(request) or bucket:
             try:
                 self._prepare_s3_request(request, bucket)
-                if AWSV4Authentication.can_handle(request):
+                # Presigned p2 tokens bypass AWS v4 auth — validated in the view
+                is_presigned = 'X-P2-Signature' in request.GET
+                if not is_presigned and AWSV4Authentication.can_handle(request):
                     handler = AWSV4Authentication(request)
                     user = await handler.validate()
                     request.user = user
@@ -123,7 +125,11 @@ class S3RoutingMiddleware:
             except AWSError as exc:
                 return self.process_exception(request, exc)
             try:
-                return await self.get_response(request)
+                response = await self.get_response(request)
+                # Inject CORS headers for OPTIONS responses not handled by views
+                if request.method == 'OPTIONS' and response.status_code == 405:
+                    response.status_code = 200
+                return response
             except AWSError as exc:
                 return self.process_exception(request, exc)
         return await self.get_response(request)

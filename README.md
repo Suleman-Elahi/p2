@@ -159,7 +159,128 @@ Stores blobs in any S3-compatible object store — AWS S3, MinIO, Ceph, etc. The
 
 Storage instances are configured in the Django admin or via the REST API at `/_/api/v1/core/storage/`.
 
-## tier0 / Serve Rules
+## S3 API Compatibility
+
+Current estimated compatibility: **~45–50%** of the S3 API surface that matters for real-world SDK usage.
+
+### Service-level operations
+
+| Operation | Status | Notes |
+|---|---|---|
+| `GET /` — ListBuckets | ✅ | Returns volumes the user has ACL access to |
+| `GET /` — ListBuckets (async) | ⚠️ | Uses sync ORM in ListView |
+
+### Bucket operations
+
+| Operation | Status | Notes |
+|---|---|---|
+| `PUT /<bucket>` — CreateBucket | ✅ | Creates Volume + VolumeACL |
+| `DELETE /<bucket>` — DeleteBucket | ✅ | |
+| `GET /<bucket>` — ListObjectsV2 | ✅ | prefix, delimiter, max-keys, continuation-token, start-after |
+| `GET /<bucket>?versioning` — GetBucketVersioning | ⚠️ | Stub — always returns Disabled |
+| `PUT /<bucket>?versioning` — PutBucketVersioning | ❌ | Not implemented |
+| `GET /<bucket>?acl` — GetBucketAcl | ✅ | Canned ACLs only |
+| `PUT /<bucket>?acl` — PutBucketAcl | ✅ | Canned ACLs only |
+| `GET /<bucket>?cors` — GetBucketCors | ✅ | Rules stored in volume tags |
+| `PUT /<bucket>?cors` — PutBucketCors | ✅ | |
+| `DELETE /<bucket>?cors` — DeleteBucketCors | ✅ | |
+| `POST /<bucket>?delete` — DeleteObjects | ✅ | Multi-object delete |
+| `GET /<bucket>?uploads` — ListMultipartUploads | ⚠️ | Stub — returns empty list |
+| `GET /<bucket>?location` — GetBucketLocation | ❌ | Not implemented |
+| `GET /<bucket>?policy` — GetBucketPolicy | ❌ | Not implemented |
+| `PUT /<bucket>?policy` — PutBucketPolicy | ❌ | Not implemented |
+| `DELETE /<bucket>?policy` — DeleteBucketPolicy | ❌ | Not implemented |
+| `GET /<bucket>?lifecycle` — GetBucketLifecycle | ❌ | p2 has expiry component but no S3 lifecycle API |
+| `PUT /<bucket>?lifecycle` — PutBucketLifecycle | ❌ | |
+| `GET /<bucket>?tagging` — GetBucketTagging | ❌ | Not implemented |
+| `PUT /<bucket>?tagging` — PutBucketTagging | ❌ | |
+| `DELETE /<bucket>?tagging` — DeleteBucketTagging | ❌ | |
+| `GET /<bucket>?notification` — GetBucketNotification | ❌ | |
+| `GET /<bucket>?replication` — GetBucketReplication | ❌ | p2 has replication component but no S3 replication API |
+| `GET /<bucket>?encryption` — GetBucketEncryption | ❌ | |
+| `GET /<bucket>?object-lock` — GetObjectLockConfiguration | ❌ | |
+| `HEAD /<bucket>` — HeadBucket | ❌ | Not implemented |
+
+### Object operations
+
+| Operation | Status | Notes |
+|---|---|---|
+| `GET /<bucket>/<key>` — GetObject | ✅ | Streaming, async |
+| `PUT /<bucket>/<key>` — PutObject | ✅ | Async, quota check via signal |
+| `DELETE /<bucket>/<key>` — DeleteObject | ✅ | |
+| `HEAD /<bucket>/<key>` — HeadObject | ✅ | |
+| `PUT /<bucket>/<key>` with `x-amz-copy-source` — CopyObject | ✅ | Cross-volume supported |
+| `GET /<bucket>/<key>?tagging` — GetObjectTagging | ✅ | Stored under `s3.user/` prefix in blob tags |
+| `PUT /<bucket>/<key>?tagging` — PutObjectTagging | ✅ | |
+| `DELETE /<bucket>/<key>?tagging` — DeleteObjectTagging | ✅ | |
+| `GET /<bucket>/<key>?acl` — GetObjectAcl | ✅ | Canned ACLs only |
+| `PUT /<bucket>/<key>?acl` — PutObjectAcl | ✅ | Canned ACLs only |
+| `OPTIONS /<bucket>/<key>` — CORS preflight | ✅ | |
+| `GET /<bucket>/<key>?versionId` — GetObject (versioned) | ❌ | No versioning |
+| `DELETE /<bucket>/<key>?versionId` — DeleteObject (versioned) | ❌ | |
+| `GET /<bucket>/<key>?torrent` — GetObjectTorrent | ❌ | |
+| `PUT /<bucket>/<key>` — PutObject with SSE headers | ❌ | No server-side encryption |
+| `GET /<bucket>/<key>` — Range requests (`Range: bytes=`) | ❌ | Not implemented |
+| `RESTORE /<bucket>/<key>` — RestoreObject | ❌ | |
+| `SELECT /<bucket>/<key>` — SelectObjectContent | ❌ | |
+
+### Multipart upload
+
+| Operation | Status | Notes |
+|---|---|---|
+| `POST /<bucket>/<key>?uploads` — CreateMultipartUpload | ✅ | |
+| `PUT /<bucket>/<key>?uploadId&partNumber` — UploadPart | ✅ | |
+| `POST /<bucket>/<key>?uploadId` — CompleteMultipartUpload | ✅ | Assembled async via arq worker |
+| `DELETE /<bucket>/<key>?uploadId` — AbortMultipartUpload | ❌ | Parts left as orphaned blobs (expire after 24h) |
+| `GET /<bucket>/<key>?uploadId` — ListParts | ❌ | |
+| `PUT /<bucket>/<key>?uploadId&partNumber` with copy source — UploadPartCopy | ❌ | |
+
+### Authentication & access
+
+| Feature | Status | Notes |
+|---|---|---|
+| AWS Signature v4 (header-based) | ✅ | |
+| AWS Signature v4 (query string) | ✅ | |
+| Presigned URLs (GET/PUT/HEAD) | ✅ | p2-native HMAC token, not AWS v4 presign format |
+| AWS v4 presigned URLs (standard format) | ❌ | SDKs generate these — p2 uses its own format |
+| Virtual-hosted-style URLs (`bucket.s3.example.com`) | ✅ | Via S3RoutingMiddleware |
+| Path-style URLs (`/bucket/key`) | ✅ | |
+| Anonymous / public-read access | ✅ | Via `volume.public_read` flag |
+| IAM-style bucket policies | ❌ | |
+| STS / temporary credentials | ❌ | |
+
+### What this means in practice
+
+Common tools and their expected compatibility:
+
+| Tool | Works? | Caveats |
+|---|---|---|
+| `aws s3 cp` | ✅ | |
+| `aws s3 sync` | ✅ | Multi-delete and copy now supported |
+| `aws s3 ls` | ✅ | Large buckets paginate correctly |
+| `aws s3 mb` / `rb` | ✅ | |
+| `aws s3api get-object` | ✅ | |
+| `aws s3api put-object-tagging` | ✅ | |
+| `aws s3api get-bucket-cors` | ✅ | |
+| `boto3` basic CRUD | ✅ | |
+| `boto3` presigned URLs | ⚠️ | boto3-generated presigned URLs won't work; use `/_/api/v1/s3/presign/` |
+| `rclone` | ⚠️ | Basic ops work; versioning/policy checks may fail |
+| `s3fs` / `goofys` | ⚠️ | Range requests not supported — will break |
+| Terraform S3 backend | ⚠️ | Needs versioning + locking |
+| Browser direct upload (presigned PUT) | ✅ | Via p2 presign API + CORS |
+
+### What's needed to reach ~80% compatibility
+
+1. `AbortMultipartUpload` — `DELETE /<bucket>/<key>?uploadId`
+2. `ListParts` — `GET /<bucket>/<key>?uploadId`
+3. `HeadBucket` — `HEAD /<bucket>`
+4. Range requests — `Range: bytes=X-Y` on GetObject
+5. AWS v4 presigned URL format — so boto3 `generate_presigned_url()` works natively
+6. `GetBucketLocation` — many SDKs call this on startup
+7. Bucket tagging API
+8. Object versioning (large effort — schema change required)
+
+
 
 tier0 is p2's URL-routing layer. A **ServeRule** maps an incoming request (matched by regex against the URL path, hostname, or any HTTP header) to a blob lookup query. The gRPC `Serve` service iterates all rules in order, finds the first match, resolves the blob, checks read permissions, and returns the file data.
 

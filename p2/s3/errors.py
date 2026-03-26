@@ -82,3 +82,23 @@ class AWSMissingContentLength(AWSError):
 
     code = 'MissingContentLength'
     status = 411
+
+
+class AWSNoSuchUpload(AWSError):
+    code = 'NoSuchUpload'
+    status = 404
+
+
+class AWSInvalidArgument(AWSError):
+    code = 'InvalidArgument'
+    status = 400
+
+
+class AWSExpiredToken(AWSError):
+    code = 'ExpiredToken'
+    status = 403
+
+
+class AWSPresignedInvalid(AWSError):
+    code = 'AuthorizationQueryParametersError'
+    status = 403
