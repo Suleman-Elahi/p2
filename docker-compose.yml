@@ -18,10 +18,11 @@ services:
   web:
     build: .
     entrypoint: []
-    command: sh -c "uv run python manage.py collectstatic --noinput --clear && uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload"
+    command: sh -c "uv run python manage.py collectstatic --noinput --clear && uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload --reload-dir p2"
     env_file: .env
     volumes:
       - .:/app
+      - web_venv:/app/.venv
       - media:/app/media
       - storage:/storage
     ports:
@@ -37,10 +38,12 @@ services:
 
   worker:
     build: .
+    entrypoint: []
     command: sh -c "uv run python manage.py migrate --noinput && uv run python -m arq p2.core.worker.WorkerSettings"
     env_file: .env
     volumes:
       - .:/app
+      - worker_venv:/app/.venv
       - media:/app/media
       - storage:/storage
     environment:
@@ -54,10 +57,12 @@ services:
 
   grpc:
     build: .
+    entrypoint: []
     command: uv run python manage.py grpc
     env_file: .env
     volumes:
       - .:/app
+      - grpc_venv:/app/.venv
       - media:/app/media
       - storage:/storage
     ports:
@@ -75,3 +80,6 @@ volumes:
   postgres_data:
   media:
   storage:
+  web_venv:
+  worker_venv:
+  grpc_venv:

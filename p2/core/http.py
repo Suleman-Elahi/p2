@@ -22,8 +22,11 @@ async def _blob_chunks(blob, chunk_size):
 class BlobResponse(StreamingHttpResponse):
     """Directly return blob's content. Optionally return as attachment if as_download is True"""
 
-    def __init__(self, blob: Blob, chunk_size=8192):
+    def __init__(self, blob: Blob, chunk_size=8192, as_download=True):
         super().__init__(_blob_chunks(blob, chunk_size))
         self['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
         self['Content-Type'] = blob.attributes.get(ATTR_BLOB_MIME, 'text/plain')
-        self['Content-Disposition'] = f'attachment; filename="{blob.filename}"'
+        if as_download:
+            self['Content-Disposition'] = f'attachment; filename="{blob.filename}"'
+        else:
+            self['Content-Disposition'] = 'inline'

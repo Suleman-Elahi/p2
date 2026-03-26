@@ -137,6 +137,8 @@ async def run_expire(ctx):
 
 async def on_startup(ctx):
     """Start Redis Stream event consumers and OTel when the worker process starts."""
+    import django
+    django.setup()
     from p2.core.consumers import start_consumers
     from p2.core.telemetry import setup_telemetry
     setup_telemetry()

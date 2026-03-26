@@ -5,4 +5,4 @@
     max-width: 100%;
   }
 </style>
-<img class="blob-payload" src="{{ object|blob_url }}" alt="">
+<img class="blob-payload" src="{% url 'p2_ui:core-blob-inline' pk=object.pk %}" alt="">

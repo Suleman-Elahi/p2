@@ -34,7 +34,7 @@ def add_ServeServicer_to_server(servicer, server):
                     response_serializer=serve__pb2.ServeReply.SerializeToString,
             ),
     }
-    generic_handler = grpc.method_service_handler(
+    generic_handler = grpc.method_handlers_generic_handler(
             'p2.Serve', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
 

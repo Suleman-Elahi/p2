@@ -15,10 +15,9 @@
 {% block scripts %}
 <script>
   $('button.show-iframe').on('click', (e) => {
-    // debugger;
     $('button.show-iframe').parent().empty();
     $('<iframe>', {
-      src: '{{ object|blob_url }}',
+      src: '{% url "p2_ui:core-blob-inline" pk=object.pk %}',
       class: "blob-payload",
     }).appendTo('.blob-detail-container');
   });

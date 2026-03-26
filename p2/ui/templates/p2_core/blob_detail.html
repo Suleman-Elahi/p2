@@ -38,6 +38,12 @@
         {% include 'p2_core/blob_detail_text.html' with object=object only %}
       {% elif mime|startswith:'image/' %}
         {% include 'p2_core/blob_detail_image.html' with object=object only %}
+      {% elif mime|startswith:'audio/' %}
+        {% include 'p2_core/blob_detail_audio.html' with object=object only %}
+      {% elif mime|startswith:'video/' %}
+        {% include 'p2_core/blob_detail_video.html' with object=object only %}
+      {% elif mime == 'application/pdf' %}
+        {% include 'p2_core/blob_detail_pdf.html' with object=object only %}
       {% else %}
         {% include 'p2_core/blob_detail_fallback.html' with object=object only %}
       {% endif %}

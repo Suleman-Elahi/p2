@@ -254,6 +254,13 @@ class ObjectView(S3View):
         response['Last-Modified'] = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
         response['ETag'] = etag
         response['Accept-Ranges'] = 'bytes'
+        # S3 response override query params
+        if 'response-content-type' in request.GET:
+            response['Content-Type'] = request.GET['response-content-type']
+        if 'response-content-disposition' in request.GET:
+            response['Content-Disposition'] = request.GET['response-content-disposition']
+        elif content_type != 'application/octet-stream':
+            response['Content-Disposition'] = 'inline'
         return await self._apply_cors(request, response, volume)
 
     async def post(self, request, bucket, path):
@@ -298,6 +305,11 @@ class ObjectView(S3View):
                 await blob.volume.asave(update_fields=['public_read'])
 
         await sync_to_async(_fire_pre_save)(blob)
+
+        # Honour Content-Type from the client (SDKs send the correct MIME type)
+        client_ct = request.META.get('CONTENT_TYPE', '')
+        if client_ct and client_ct != 'application/octet-stream':
+            blob.attributes[ATTR_BLOB_MIME] = client_ct
 
         # Verify payload checksum if x-amz-checksum-* header present
         checksum_err = verify_request_checksum(request, request.body)

@@ -103,3 +103,14 @@ class BlobDownloadView(PermissionRequiredMixin, DetailView):
     def get(self, *args, **kwargs):
         super().get(*args, **kwargs)
         return BlobResponse(self.object)
+
+
+class BlobInlineView(PermissionRequiredMixin, DetailView):
+    """Serve blob's payload inline (for preview in browser)"""
+
+    model = Blob
+    permission_required = 'p2_core.view_blob'
+
+    def get(self, *args, **kwargs):
+        super().get(*args, **kwargs)
+        return BlobResponse(self.object, as_download=False)

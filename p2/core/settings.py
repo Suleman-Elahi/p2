@@ -305,6 +305,9 @@ VERSION = __version__
 # Logging (stdlib — OTel LoggingInstrumentor will correlate with traces)
 # ---------------------------------------------------------------------------
 
+import warnings
+warnings.filterwarnings("ignore", message="StreamingHttpResponse must consume synchronous iterators")
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

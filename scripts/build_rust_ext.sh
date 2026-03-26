@@ -9,8 +9,6 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EXT_DIR="$REPO_ROOT/p2/s3/rust_ext"
-OUT_DIR="$EXT_DIR/dist"
 DEST="$REPO_ROOT/p2/s3"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
@@ -119,38 +117,79 @@ ensure_maturin() {
 
     info "Installing maturin..."
 
-    # Try pip / pip3 in order
-    if command -v pip &>/dev/null; then
+    if command -v uv &>/dev/null; then
+        uv tool install maturin
+    elif command -v pip &>/dev/null; then
         pip install maturin --no-cache-dir
     elif command -v pip3 &>/dev/null; then
         pip3 install maturin --no-cache-dir
+    elif command -v cargo &>/dev/null; then
+        cargo install maturin
     else
-        die "pip not found. Install Python pip first."
+        die "No package manager found to install maturin. Install uv, pip, or cargo."
     fi
 
+    # uv tool install puts it in ~/.local/bin; cargo install puts it in ~/.cargo/bin
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
     command -v maturin &>/dev/null || die "maturin still not found after install."
     info "maturin ready: $(maturin --version)"
 }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
+# Target Python 3.12 (Docker) by default. Override with: PYTHON_TARGET=python3.13 ./scripts/build_rust_ext.sh
+PYTHON_TARGET="${PYTHON_TARGET:-python3.12}"
+
+ensure_target_python() {
+    if command -v "$PYTHON_TARGET" &>/dev/null; then
+        info "Target Python: $($PYTHON_TARGET --version)"
+        return
+    fi
+
+    # Use uv to fetch the target Python version
+    local ver="${PYTHON_TARGET#python}"
+    if command -v uv &>/dev/null; then
+        info "Installing Python $ver via uv..."
+        uv python install "$ver"
+        PYTHON_TARGET="$(uv python find "$ver")"
+        info "Target Python: $($PYTHON_TARGET --version)"
+        return
+    fi
+
+    die "Python $ver not found and uv not available to install it."
+}
+
 build_extension() {
-    info "Building p2_s3_crypto (release)..."
-    mkdir -p "$OUT_DIR"
-    cd "$EXT_DIR"
-    maturin build --release --out "$OUT_DIR"
+    local name="$1"
+    local ext_dir="$2"
+    local out_dir="$ext_dir/dist"
 
-    SO=$(find "$OUT_DIR" -name "p2_s3_crypto*.so" | head -1)
-    [[ -z "$SO" ]] && die "No .so found in $OUT_DIR after build."
+    info "Building $name (release) for $($PYTHON_TARGET --version)..."
+    rm -rf "$out_dir"
+    mkdir -p "$out_dir"
+    cd "$ext_dir"
+    maturin build --release --interpreter "$PYTHON_TARGET" --out "$out_dir"
 
-    cp "$SO" "$DEST/p2_s3_crypto.so"
-    info "Installed: $DEST/p2_s3_crypto.so"
+    # maturin outputs a .whl — extract the .so from it
+    WHL=$(find "$out_dir" -name "${name}*.whl" | head -1)
+    if [[ -n "$WHL" ]]; then
+        unzip -o -j "$WHL" "*.so" -d "$out_dir" 2>/dev/null || true
+    fi
+
+    SO=$(find "$out_dir" -name "${name}*.so" | head -1)
+    [[ -z "$SO" ]] && die "No .so found in $out_dir after build."
+
+    cp "$SO" "$DEST/${name}.so"
+    info "Installed: $DEST/${name}.so"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 install_build_deps
 ensure_rust
 ensure_maturin
-build_extension
+ensure_target_python
+build_extension "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext"
+build_extension "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"
 
 echo ""
-echo -e "${GREEN}Done.${NC} Commit p2/s3/p2_s3_crypto.so and run: docker compose up"
+echo -e "${GREEN}Done.${NC} Commit the .so files and run: docker compose up"
+echo "  git add p2/s3/p2_s3_crypto.so p2/s3/p2_s3_checksum.so"

@@ -11,7 +11,16 @@ from opentelemetry.sdk.trace import TracerProvider
 
 def setup_telemetry() -> None:
     """Initialise OpenTelemetry SDK: traces, metrics, and log correlation."""
+    import os
     from django.conf import settings
+
+    # Skip if OTel is disabled or no endpoint configured
+    if os.getenv('OTEL_SDK_DISABLED', '').lower() in ('true', '1', 'yes'):
+        return
+    endpoint = settings.OTEL_ENDPOINT
+    if not endpoint or endpoint == 'http://localhost:4317':
+        return
+
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.instrumentation.django import DjangoInstrumentor

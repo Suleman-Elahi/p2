@@ -39,6 +39,8 @@ urlpatterns = [
          blob.BlobDeleteView.as_view(), name='core-blob-delete'),
     path('core/blob/<uuid:pk>/download/',
          blob.BlobDownloadView.as_view(), name='core-blob-download'),
+    path('core/blob/<uuid:pk>/inline/',
+         blob.BlobInlineView.as_view(), name='core-blob-inline'),
     # Core - Components
     path('core/volume/<uuid:pk>/component/create/',
          component.ComponentCreateView.as_view(), name='core-component-create'),
