@@ -346,5 +346,10 @@ if TEST:
 # ---------------------------------------------------------------------------
 
 if DEBUG:
-    INSTALLED_APPS += ['debug_toolbar', 'django_extensions']
-    MIDDLEWARE.append('debug_toolbar.middleware.DebugToolbarMiddleware')
+    try:
+        import debug_toolbar  # noqa: F401
+        import django_extensions  # noqa: F401
+        INSTALLED_APPS += ['debug_toolbar', 'django_extensions']
+        MIDDLEWARE.append('debug_toolbar.middleware.DebugToolbarMiddleware')
+    except ImportError:
+        pass

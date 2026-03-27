@@ -15,9 +15,13 @@ def get_access_key():
     return ''.join(random.SystemRandom().choice(letters) for i in range(20))
 
 def get_secret_key():
-    """Generate random string to use as secret key"""
-    letters = string.ascii_lowercase + string.ascii_uppercase + \
-        string.digits + string.punctuation
+    """Generate random string to use as secret key.
+    
+    Uses alphanumeric + safe punctuation only to avoid copy/paste issues
+    with shell-sensitive characters like quotes, backslashes, backticks, etc.
+    """
+    # Safe chars that won't cause issues in shells, HTML, or config files
+    letters = string.ascii_lowercase + string.ascii_uppercase + string.digits + '+/='
     return ''.join(random.SystemRandom().choice(letters) for i in range(40))
 
 def _get_fernet():

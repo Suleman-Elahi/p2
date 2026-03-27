@@ -5,24 +5,20 @@ FROM python:3.12-slim AS builder
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-
 COPY pyproject.toml ./
-
 RUN uv sync --no-install-project --no-dev
 
-FROM python:3.12-slim AS final
-
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+FROM python:3.12-slim
 
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
 
-COPY pyproject.toml ./
-COPY manage.py ./
+COPY pyproject.toml manage.py ./
 COPY p2/ ./p2/
 
-RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -32,10 +28,7 @@ RUN useradd --create-home --shell /bin/false p2 \
     && chown -R p2:p2 /app /storage
 USER p2
 
-ENV HOST=0.0.0.0
-ENV PORT=8000
 ENV PATH="/app/.venv/bin:$PATH"
-
-EXPOSE ${PORT}
+EXPOSE 8000
 
 ENTRYPOINT ["/entrypoint.sh"]

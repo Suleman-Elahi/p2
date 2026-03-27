@@ -31,7 +31,10 @@ urlpatterns = [
 ] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 
 if settings.DEBUG:
-    import debug_toolbar
-    urlpatterns = [
-        path('_/debug/', include(debug_toolbar.urls)),
-    ] + urlpatterns
+    try:
+        import debug_toolbar
+        urlpatterns = [
+            path('_/debug/', include(debug_toolbar.urls)),
+        ] + urlpatterns
+    except ImportError:
+        pass

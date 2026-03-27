@@ -15,14 +15,26 @@ services:
     ports:
       - "6379:6379"
 
-  web:
+  migrate:
     build: .
-    entrypoint: []
-    command: sh -c "uv run python manage.py collectstatic --noinput --clear && uvicorn p2.core.asgi:application --host 0.0.0.0 --port 8000 --reload --reload-dir p2"
+    command: ["python", "manage.py", "migrate", "--noinput"]
     env_file: .env
     volumes:
       - .:/app
-      - web_venv:/app/.venv
+      - venv:/app/.venv
+    environment:
+      DJANGO_SETTINGS_MODULE: p2.core.settings
+      DATABASE_URL: postgresql://p2:p2@db:5432/p2
+    depends_on:
+      - db
+
+  web:
+    build: .
+    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "p2"]
+    env_file: .env
+    volumes:
+      - .:/app
+      - venv:/app/.venv
       - media:/app/media
       - storage:/storage
     ports:
@@ -33,17 +45,18 @@ services:
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
-      - db
-      - redis
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
   worker:
     build: .
-    entrypoint: []
-    command: sh -c "uv run python manage.py migrate --noinput && uv run python -m arq p2.core.worker.WorkerSettings"
+    command: ["python", "-m", "arq", "p2.core.worker.WorkerSettings"]
     env_file: .env
     volumes:
       - .:/app
-      - worker_venv:/app/.venv
+      - venv:/app/.venv
       - media:/app/media
       - storage:/storage
     environment:
@@ -52,17 +65,18 @@ services:
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
-      - db
-      - redis
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
   grpc:
     build: .
-    entrypoint: []
-    command: uv run python manage.py grpc
+    command: ["python", "manage.py", "grpc"]
     env_file: .env
     volumes:
       - .:/app
-      - grpc_venv:/app/.venv
+      - venv:/app/.venv
       - media:/app/media
       - storage:/storage
     ports:
@@ -73,13 +87,13 @@ services:
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
-      - db
-      - redis
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
 
 volumes:
   postgres_data:
   media:
   storage:
-  web_venv:
-  worker_venv:
-  grpc_venv:
+  venv:

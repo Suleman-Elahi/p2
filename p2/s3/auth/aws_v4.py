@@ -107,10 +107,10 @@ class AWSv4AuthenticationRequest:
         auth_request.algorithm, credential_container = \
             headers.get('HTTP_AUTHORIZATION').split(' ', 1)
         credential, signed_headers, signature = credential_container.split(',')
-        # Remove "Credential=" from string
-        _, auth_request.credentials = credential.split("=")
-        _, auth_request.signed_headers = signed_headers.split("=")
-        _, auth_request.signature = signature.split("=")
+        # Remove "Credential=" from string, strip whitespace
+        _, auth_request.credentials = credential.strip().split("=", 1)
+        _, auth_request.signed_headers = signed_headers.strip().split("=", 1)
+        _, auth_request.signature = signature.strip().split("=", 1)
         auth_request.date_long = headers.get('HTTP_X_AMZ_DATE')
         if not auth_request.date_long:
             auth_request.date_long = auth_request.date
@@ -149,7 +149,8 @@ class AWSV4Authentication(BaseAuth):
         for header_key, header_value in sorted(self.request.META.items(), key=sorter):
             fixed_key = header_key.replace('HTTP_', '', 1).replace('_', '-').lower()
             if fixed_key in only:
-                canonical_headers += f"{fixed_key}:{header_value}\n"
+                # AWS spec: trim leading/trailing whitespace from header values
+                canonical_headers += f"{fixed_key}:{str(header_value).strip()}\n"
         return canonical_headers
 
     def _get_sha256(self, data: Any) -> str:
@@ -234,7 +235,6 @@ class AWSV4Authentication(BaseAuth):
         ])
         our_signature = self._sign(signing_key, string_to_sign).hex()
         if auth_request.signature != our_signature:
-            LOGGER.warning("Canonical Request: %s", canonical_request)
-            LOGGER.warning("Signatures theirs=%s ours=%s", auth_request.signature, our_signature)
+            LOGGER.warning("Signature mismatch for access_key=%s", auth_request.access_key)
             raise AWSSignatureMismatch
         return secret_key.user

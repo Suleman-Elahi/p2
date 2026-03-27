@@ -6,3 +6,11 @@ tier0/
 protos/
 static/
 local*
+.venv/
+.git/
+__pycache__/
+*.pyc
+media/
+node_modules/
+.env
+*.egg-info/

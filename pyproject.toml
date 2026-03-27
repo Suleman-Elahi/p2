@@ -14,8 +14,6 @@ dependencies = [
     "django-filter>=23.0",
     "django-crispy-forms>=2.0",
     "crispy-bootstrap4>=2022.1",
-    "django-extensions>=3.2",
-    "django-debug-toolbar>=4.0",
 
     # Database
     "psycopg[binary]>=3.1",
@@ -89,6 +87,7 @@ dev = [
 
     # Dev tools
     "django-extensions>=3.2",
+    "django-debug-toolbar>=4.0",
     "bumpversion>=0.6",
     "grpcio-tools>=1.60",
     "unittest-xml-reporting>=3.2",
@@ -112,6 +111,8 @@ dev = [
     "bumpversion>=0.6",
     "grpcio-tools>=1.60",
     "unittest-xml-reporting>=3.2",
+    "django-extensions>=3.2",
+    "django-debug-toolbar>=4.0",
 ]
 
 [tool.pytest.ini_options]
