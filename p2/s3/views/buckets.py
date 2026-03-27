@@ -10,7 +10,6 @@ from p2.core.acl import VolumeACL
 from p2.core.constants import (ATTR_BLOB_HASH_MD5, ATTR_BLOB_IS_FOLDER,
                                ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME)
 from p2.core.models import Blob, Storage, Volume
-from p2.core.prefix_helper import make_absolute_prefix
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_DEFAULT_STORAGE,
                              TAG_S3_STORAGE_CLASS, XML_NAMESPACE)
 from p2.s3.cors import (apply_cors_headers, build_cors_xml,
@@ -146,7 +145,7 @@ class BucketView(S3View):
         requested_prefix = request.GET.get('prefix', '')
         max_keys = min(int(request.GET.get('max-keys', 1000)), 1000)
         encoding_type = request.GET.get('encoding-type', 'url')
-        delimiter = request.GET.get('delimiter', '/')
+        delimiter = request.GET.get('delimiter', '')
         continuation_token = request.GET.get('continuation-token', '')
         start_after = request.GET.get('start-after', '')
 
@@ -155,20 +154,41 @@ class BucketView(S3View):
         if after_path and not after_path.startswith('/'):
             after_path = '/' + after_path
 
+        # Build absolute prefix for querying (internal paths start with /)
+        abs_prefix = '/' + requested_prefix if requested_prefix else '/'
+
         base_qs = Blob.objects.filter(
-            prefix=make_absolute_prefix(requested_prefix),
+            path__startswith=abs_prefix,
             volume=volume,
+        ).exclude(
+            attributes__has_key=ATTR_BLOB_IS_FOLDER
         ).order_by('path').select_related('volume__storage')
 
         if after_path:
             base_qs = base_qs.filter(path__gt=after_path)
 
-        blobs_qs = base_qs.exclude(attributes__has_key=ATTR_BLOB_IS_FOLDER)
-        folders_qs = base_qs.filter(attributes__has_key=ATTR_BLOB_IS_FOLDER)
-
+        # Collect blobs and compute common prefixes if delimiter is set
         blobs = []
-        async for blob in blobs_qs[:max_keys + 1].aiterator():
+        common_prefixes = set()
+        prefix_len = len(abs_prefix)
+
+        async for blob in base_qs[:max_keys * 2].aiterator():
+            # Key without leading slash
+            key = blob.path[1:]
+            
+            if delimiter:
+                # Check if there's a delimiter after the prefix
+                suffix = blob.path[prefix_len:]
+                delim_pos = suffix.find(delimiter)
+                if delim_pos >= 0:
+                    # This blob is "inside" a common prefix
+                    common_prefix = requested_prefix + suffix[:delim_pos + 1]
+                    common_prefixes.add(common_prefix)
+                    continue
+            
             blobs.append(blob)
+            if len(blobs) > max_keys:
+                break
 
         is_truncated = len(blobs) > max_keys
         if is_truncated:
@@ -176,9 +196,10 @@ class BucketView(S3View):
 
         ElementTree.SubElement(root, "Name").text = volume.name
         ElementTree.SubElement(root, "Prefix").text = requested_prefix
-        ElementTree.SubElement(root, "KeyCount").text = str(len(blobs))
+        ElementTree.SubElement(root, "KeyCount").text = str(len(blobs) + len(common_prefixes))
         ElementTree.SubElement(root, "MaxKeys").text = str(max_keys)
-        ElementTree.SubElement(root, "Delimiter").text = delimiter
+        if delimiter:
+            ElementTree.SubElement(root, "Delimiter").text = delimiter
         ElementTree.SubElement(root, "EncodingType").text = encoding_type
         ElementTree.SubElement(root, "IsTruncated").text = str(is_truncated).lower()
 
@@ -189,21 +210,13 @@ class BucketView(S3View):
         if continuation_token:
             ElementTree.SubElement(root, "ContinuationToken").text = continuation_token
 
-        if blobs:
-            for blob in blobs:
-                root.append(self._etree_for_blob(blob))
-        elif requested_prefix:
-            try:
-                directory_blob = await self.get_blob(volume, make_absolute_prefix(requested_prefix))
-                root.append(self._etree_for_blob(directory_blob))
-            except AWSNoSuchKey:
-                pass
+        for blob in blobs:
+            root.append(self._etree_for_blob(blob))
 
-        common_prefixes = ElementTree.Element("CommonPrefixes")
-        async for blob in folders_qs.aiterator():
-            ElementTree.SubElement(common_prefixes, 'Prefix').text = blob.filename
-        if len(common_prefixes):
-            root.append(common_prefixes)
+        # Add CommonPrefixes for each unique prefix
+        for prefix in sorted(common_prefixes):
+            cp_elem = ElementTree.SubElement(root, "CommonPrefixes")
+            ElementTree.SubElement(cp_elem, "Prefix").text = prefix
 
         response = XMLResponse(root)
         # Apply CORS if applicable
