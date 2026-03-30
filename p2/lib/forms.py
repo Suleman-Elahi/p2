@@ -17,16 +17,19 @@ class TagModelForm(forms.ModelForm):
             if key not in tags:
                 tags[key] = value
         # Format JSON
+        if 'initial' not in kwargs:
+            kwargs['initial'] = {}
         kwargs['initial']['tags'] = tags
         super().__init__(*args, **kwargs)
 
     def clean_tags(self):
         """Make sure all required tags are set"""
+        tags = self.cleaned_data.get('tags') or {}
         if hasattr(self.instance, 'get_required_keys') and hasattr(self.instance, 'tags'):
             for key in self.instance.get_required_keys():
-                if key not in self.cleaned_data.get('tags'):
+                if key not in tags:
                     raise forms.ValidationError("Tag %s missing." % key)
-        return self.cleaned_data.get('tags')
+        return tags
 
 # pylint: disable=too-few-public-methods
 class TagModelFormMeta:

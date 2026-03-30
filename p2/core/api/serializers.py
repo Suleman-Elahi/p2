@@ -2,16 +2,7 @@
 from rest_framework.serializers import ReadOnlyField, Serializer
 
 from p2.api.serializers import TagModelSerializer
-from p2.core.models import Blob, Storage, Volume
-
-
-class BlobSerializer(TagModelSerializer):
-    """Blob Serializer"""
-
-    class Meta:
-
-        model = Blob
-        fields = ['uuid', 'path', 'volume', 'tags', 'attributes', 'predefined_keys']
+from p2.core.models import Storage, Volume
 
 
 class BlobPayloadSerializer(Serializer):

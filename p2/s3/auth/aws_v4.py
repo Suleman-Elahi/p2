@@ -199,13 +199,16 @@ class AWSV4Authentication(BaseAuth):
         # Client has not calculated SHA256 of payload, no checking
         if auth_request.hash == UNSIGNED_PAYLOAD:
             return
-        # request.body is already fully buffered by Django's ASGI handler.
-        # Compute SHA256 directly over the buffered bytes — no chunked reading needed.
+        # For streaming ASGI requests (PUT/POST with body), skip SHA256 body
+        # verification — the body hasn't been buffered yet and reading it here
+        # would consume the stream before the view can process it.
+        if self.request.method in ('PUT', 'POST'):
+            return
+        # For small requests (GET params, HEAD, etc.) verify the hash
         request_body_hash = hashlib.sha256(self.request.body).hexdigest()
         if auth_request.hash != request_body_hash:
-            LOGGER.warning("CONTENT_SHA256 Header/param incorrect",
-                           theirs=auth_request.hash,
-                           ours=request_body_hash)
+            LOGGER.warning("CONTENT_SHA256 Header/param incorrect: theirs=%s ours=%s",
+                           auth_request.hash, request_body_hash)
             raise AWSContentSignatureMismatch
 
     async def validate(self) -> Optional[User]:

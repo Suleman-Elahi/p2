@@ -60,6 +60,8 @@ class S3RoutingMiddleware:
                 return True
         if 'X-Amz-Signature' in request.GET:
             return True
+        if 'X-P2-Signature' in request.GET:
+            return True
         return False
 
     def check_content_length(self, request):
@@ -72,9 +74,12 @@ class S3RoutingMiddleware:
         if theirs == '':
             raise AWSError
         theirs_int = int(theirs)
-        ours = len(request.body)
         if theirs_int < 0:
             raise AWSError
+        # Skip body read for presigned requests — body is streamed by the async view
+        if 'X-P2-Signature' in request.GET:
+            return
+        ours = len(request.body)
         if ours < theirs_int:
             raise AWSIncompleteBody
 

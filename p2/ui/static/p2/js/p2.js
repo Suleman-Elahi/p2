@@ -1,4 +1,3 @@
-// Prevent Dropzone from auto-discovering forms before we configure it
 Dropzone.autoDiscover = false;
 
 function getCookie(name) {
@@ -16,28 +15,99 @@ function getCookie(name) {
     return cookieValue;
 }
 
-// Upload a single File object with a given prefix (folder path) to the volume upload endpoint
-function uploadFileWithPrefix(file, uploadUrl, prefix) {
-    var url = uploadUrl.split('?')[0];
-    var basePrefix = new URLSearchParams(uploadUrl.split('?')[1] || '').get('prefix') || '';
-    var fullPrefix = prefix ? (basePrefix.replace(/\/$/, '') + '/' + prefix).replace(/\/+/g, '/') : basePrefix;
+// ─── AJAX table refresh ───────────────────────────────────────────────────────
+
+function refreshBlobTable() {
+    var listUrl = document.querySelector('.dz') && document.querySelector('.dz').dataset.listUrl;
+    if (!listUrl) { return; }
+    fetch(listUrl, { headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+        .then(function(r) { return r.text(); })
+        .then(function(html) {
+            var parser = new DOMParser();
+            var doc = parser.parseFromString(html, 'text/html');
+            var newBody = doc.getElementById('blob-table-body');
+            var curBody = document.getElementById('blob-table-body');
+            if (newBody && curBody) {
+                curBody.innerHTML = newBody.innerHTML;
+            }
+        })
+        .catch(function(e) { console.warn('Table refresh failed:', e); });
+}
+
+// ─── Single-file upload ───────────────────────────────────────────────────────
+
+async function uploadFile(file, uploadUrl, relativePath) {
     var formData = new FormData();
-    formData.append('file', file, file.name);
-    formData.append('csrfmiddlewaretoken', getCookie('csrftoken'));
-    return fetch(url + '?prefix=' + encodeURIComponent(fullPrefix), {
+    formData.append('file', file);
+    formData.append('relativePath', relativePath);
+
+    var response = await fetch(uploadUrl, {
         method: 'POST',
         headers: { 'X-CSRFToken': getCookie('csrftoken') },
         body: formData
-    }).then(function(r) { return r.json(); }).then(function(response) {
-        var blobs = Array.isArray(response) ? response : [];
-        dzPostUploadToast(file.name, true);
-        blobs.forEach(function(blob) { dzAppendFileRow(file, blob); });
-    }).catch(function(err) {
-        dzPostUploadToast(file.name + ': ' + err, false);
     });
+
+    if (!response.ok) {
+        var text = '';
+        try { text = await response.text(); } catch (_) {}
+        throw new Error('HTTP ' + response.status + (text ? ': ' + text.slice(0, 120) : ''));
+    }
+    return await response.json();
 }
 
-// Recursively read a FileSystemDirectoryEntry and collect all files with their relative paths
+// ─── Folder upload with single progress toast ─────────────────────────────────
+
+async function uploadFolder(files, uploadUrl) {
+    var total = files.length;
+    var done = 0;
+    var failed = 0;
+    var toastId = 'folder-toast-' + Date.now();
+
+    // Show a single progress toast
+    var toastHtml =
+        '<div class="toast ml-auto" id="' + toastId + '" role="status" data-autohide="false">' +
+          '<div class="toast-header">' +
+            '<strong class="mr-auto text-primary"><i class="fa fa-folder-open"></i> Uploading folder</strong>' +
+            '<button type="button" class="ml-2 mb-1 close" data-dismiss="toast"><span>&times;</span></button>' +
+          '</div>' +
+          '<div class="toast-body">' +
+            '<div class="progress mb-1"><div class="progress-bar" id="' + toastId + '-bar" style="width:0%"></div></div>' +
+            '<small id="' + toastId + '-label">0 / ' + total + '</small>' +
+          '</div>' +
+        '</div>';
+    document.querySelector('.alert-container').insertAdjacentHTML('beforeend', toastHtml);
+    $('#' + toastId).toast('show');
+
+    for (var i = 0; i < files.length; i++) {
+        var fe = files[i];
+        try {
+            await uploadFile(fe.file, uploadUrl, fe.relativePath);
+        } catch (e) {
+            console.error('Upload failed for', fe.relativePath, e);
+            failed++;
+        }
+        done++;
+        var pct = Math.round((done / total) * 100);
+        document.getElementById(toastId + '-bar').style.width = pct + '%';
+        document.getElementById(toastId + '-label').textContent =
+            done + ' / ' + total + (failed ? ' (' + failed + ' failed)' : '');
+    }
+
+    // Update toast to final state
+    var bar = document.getElementById(toastId + '-bar');
+    bar.classList.add(failed ? 'bg-warning' : 'bg-success');
+    document.getElementById(toastId + '-label').textContent =
+        failed
+            ? (done - failed) + ' uploaded, ' + failed + ' failed'
+            : total + ' files uploaded';
+
+    // Auto-hide after 3s and refresh table
+    setTimeout(function() { $('#' + toastId).toast('hide'); }, 3000);
+    refreshBlobTable();
+}
+
+// ─── Directory reader ─────────────────────────────────────────────────────────
+
 function readDirectoryEntries(dirEntry, pathPrefix) {
     return new Promise(function(resolve) {
         var results = [];
@@ -50,12 +120,12 @@ function readDirectoryEntries(dirEntry, pathPrefix) {
                     var entryPath = pathPrefix ? pathPrefix + '/' + entry.name : entry.name;
                     if (entry.isFile) {
                         entry.file(function(file) {
-                            results.push({ file: file, prefix: pathPrefix || '' });
+                            results.push({ file: file, relativePath: entryPath });
                             if (--pending === 0) readBatch();
                         });
                     } else if (entry.isDirectory) {
-                        readDirectoryEntries(entry, entryPath).then(function(subResults) {
-                            results = results.concat(subResults);
+                        readDirectoryEntries(entry, entryPath).then(function(sub) {
+                            results = results.concat(sub);
                             if (--pending === 0) readBatch();
                         });
                     } else {
@@ -68,111 +138,98 @@ function readDirectoryEntries(dirEntry, pathPrefix) {
     });
 }
 
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
 $(document).ready(function () {
     if ($('.dz').length === 0) return;
 
-    var uploadUrl = $('.dz').attr('action');
+    var uploadUrl = $('.dz').data('upload-url');
 
-    // Folder upload via button
+    // Folder button
     $('#folder-upload-input').on('change', function() {
-        var files = Array.from(this.files);
-        files.forEach(function(file) {
-            // webkitRelativePath is "folderName/sub/file.txt" — use dirname as prefix
-            var rel = file.webkitRelativePath || file.name;
-            var prefix = rel.includes('/') ? rel.substring(0, rel.lastIndexOf('/')) : '';
-            uploadFileWithPrefix(file, uploadUrl, prefix);
+        var fileList = Array.from(this.files);
+        var files = fileList.map(function(f) {
+            return { file: f, relativePath: f.webkitRelativePath || f.name };
         });
         this.value = '';
+        uploadFolder(files, uploadUrl);
     });
 
     $('.dz').dropzone({
         previewTemplate: '<div style="display:none"></div>',
         maxFilesize: null,
-        // Intercept drop to handle folders via FileSystem API
         drop: function(e) {
             var items = e.dataTransfer && e.dataTransfer.items;
             if (!items) return;
             var self = this;
-            var hasFolder = false;
+            var folderFiles = [];
+            var plainFiles = [];
+            var pending = items.length;
+
+            function checkDone() {
+                if (--pending > 0) return;
+                if (folderFiles.length) {
+                    uploadFolder(folderFiles, uploadUrl);
+                }
+                // plain files handled by addedfile below
+            }
+
             Array.from(items).forEach(function(item) {
                 var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
                 if (entry && entry.isDirectory) {
-                    hasFolder = true;
-                    readDirectoryEntries(entry, entry.name).then(function(fileEntries) {
-                        fileEntries.forEach(function(fe) {
-                            uploadFileWithPrefix(fe.file, uploadUrl, fe.prefix);
-                        });
+                    readDirectoryEntries(entry, entry.name).then(function(sub) {
+                        folderFiles = folderFiles.concat(sub);
+                        checkDone();
                     });
+                } else {
+                    checkDone();
                 }
             });
-            // If no folders, let Dropzone handle it normally
-            if (!hasFolder) {
-                Dropzone.prototype.drop.call(self, e);
-            }
+
+            // Let Dropzone handle plain files via addedfile
+            Dropzone.prototype.drop.call(self, e);
         },
         init: function () {
-            this.on('error', function (file, errorMessage) {
-                dzPostUploadToast(errorMessage.detail || errorMessage, false);
-            });
-            this.on('success', function (file, response) {
-                dzPostUploadToast(file.name, true);
-                var blobs = Array.isArray(response) ? response : [];
-                if (blobs.length > 0) {
-                    blobs.forEach(function (blob) { dzAppendFileRow(file, blob); });
-                } else {
-                    dzAppendFileRow(file, null);
-                }
+            var self = this;
+            this.on('addedfile', function(file) {
+                self.removeFile(file);
+                // Single file — upload and refresh
+                uploadFile(file, uploadUrl, file.name)
+                    .then(function(data) {
+                        dzToast(file.name, true);
+                        refreshBlobTable();
+                    })
+                    .catch(function(err) {
+                        dzToast(file.name + ': ' + err.message, false);
+                    });
             });
         }
     });
 });
 
-$('[data-api-url]').on('click', (e) => {
-    $(e.currentTarget).prepend(`<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>`);
-    let headers = new Headers();
-    headers.append('X-CSRFToken', getCookie('csrftoken'));
-    let request = new Request($(e.currentTarget).data('api-url'));
-    fetch(request, {
+// ─── API action buttons ───────────────────────────────────────────────────────
+
+$('[data-api-url]').on('click', function(e) {
+    var btn = $(e.currentTarget);
+    btn.prepend('<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span>');
+    fetch(btn.data('api-url'), {
         method: 'POST',
-        headers: headers
-    }).then(response => {
-        $(e.currentTarget).find('span.spinner-border').remove();
-    });
+        headers: { 'X-CSRFToken': getCookie('csrftoken') }
+    }).then(function() { btn.find('span.spinner-border').remove(); });
 });
 
-function dzAppendFileRow(file, blob) {
-    const size = file.size > 0 ? (file.size / 1024).toFixed(1) + ' KB' : '—';
-    var nameCell, actionsCell;
-    if (blob && blob.uuid) {
-        var uid = blob.uuid.replace(/-/g, '');
-        var base = '/_/ui/core/blob/';
-        nameCell = `<a href="${base}${blob.uuid}/"><i class="fa fa-file" aria-hidden="true"></i> ${file.name}</a>`;
-        actionsCell = `
-            <a class="btn btn-sm btn-primary" href="${base}${blob.uuid}/download/"><i class="fa fa-download text-light" aria-hidden="true"></i></a>
-            <a class="btn btn-sm btn-primary" href="${base}${blob.uuid}/update/"><i class="fa fa-pencil text-light" aria-hidden="true"></i></a>
-            <a class="btn btn-sm btn-danger" href="${base}${blob.uuid}/delete/"><i class="fa fa-trash text-light" aria-hidden="true"></i></a>`;
-    } else {
-        nameCell = `<i class="fa fa-file" aria-hidden="true"></i> ${file.name}`;
-        actionsCell = '—';
-    }
-    const row = `<tr><td>${nameCell}</td><td>${size}</td><td>${actionsCell}</td></tr>`;
-    $('#blob-table-body').append(row);
-}
+// ─── Toast helper ─────────────────────────────────────────────────────────────
 
-function dzPostUploadToast(message, uploadSucceeded) {
-    const text = uploadSucceeded
-        ? `Successfully uploaded ${message}.`
-        : `Failed to upload file: ${message}.`;
-    const template = `
-        <div class="toast ml-auto" role="alert" data-delay="3000" data-autohide="true">
-          <div class="toast-header">
-            <strong class="mr-auto text-primary">Blob Upload</strong>
-            <button type="button" class="ml-2 mb-1 close" data-dismiss="toast" aria-label="Close">
-              <span aria-hidden="true">&times;</span>
-            </button>
-          </div>
-          <div class="toast-body">${text}</div>
-        </div>`;
-    $('.alert-container').append(template);
-    $('.toast').toast('show');
+function dzToast(message, ok) {
+    var text = ok ? 'Uploaded ' + message : 'Failed: ' + message;
+    var html =
+        '<div class="toast ml-auto" role="alert" data-delay="4000" data-autohide="true">' +
+          '<div class="toast-header">' +
+            '<strong class="mr-auto ' + (ok ? 'text-success' : 'text-danger') + '">Upload</strong>' +
+            '<button type="button" class="ml-2 mb-1 close" data-dismiss="toast"><span>&times;</span></button>' +
+          '</div>' +
+          '<div class="toast-body">' + text + '</div>' +
+        '</div>';
+    document.querySelector('.alert-container').insertAdjacentHTML('beforeend', html);
+    $('.alert-container .toast').last().toast('show');
 }

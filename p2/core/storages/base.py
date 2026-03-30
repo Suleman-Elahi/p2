@@ -6,7 +6,6 @@ from tempfile import SpooledTemporaryFile
 from typing import AsyncIterator
 
 from p2.core.controllers import Controller
-from p2.core.models import Blob
 from p2.core.telemetry import tracer
 
 
@@ -35,7 +34,7 @@ class AsyncStorageController:
         """Yield chunks of blob data asynchronously. Satisfies Requirement 9.5."""
         with tracer.start_as_current_span(
             "storage.read",
-            attributes={"storage.operation": "read", "blob.pk": str(blob.pk)},
+            attributes={"storage.operation": "read", "blob.id": str(getattr(blob, 'pk', getattr(blob, 'id', 'unknown')))},
         ):
             async for chunk in self._get_read_stream(blob):
                 yield chunk
@@ -48,7 +47,7 @@ class AsyncStorageController:
         """Write blob data from async stream. Satisfies Requirement 9.5."""
         with tracer.start_as_current_span(
             "storage.write",
-            attributes={"storage.operation": "write", "blob.pk": str(blob.pk)},
+            attributes={"storage.operation": "write", "blob.id": str(getattr(blob, 'pk', getattr(blob, 'id', 'unknown')))},
         ):
             await self._commit(blob, stream)
 
@@ -60,7 +59,7 @@ class AsyncStorageController:
         """Delete blob data. Satisfies Requirement 9.5."""
         with tracer.start_as_current_span(
             "storage.delete",
-            attributes={"storage.operation": "delete", "blob.pk": str(blob.pk)},
+            attributes={"storage.operation": "delete", "blob.id": str(getattr(blob, 'pk', getattr(blob, 'id', 'unknown')))},
         ):
             await self._delete(blob)
 
@@ -72,7 +71,7 @@ class AsyncStorageController:
         """Collect size, MIME type, etc. Satisfies Requirement 9.5."""
         with tracer.start_as_current_span(
             "storage.collect_attributes",
-            attributes={"storage.operation": "collect_attributes", "blob.pk": str(blob.pk)},
+            attributes={"storage.operation": "collect_attributes", "blob.id": str(getattr(blob, 'pk', getattr(blob, 'id', 'unknown')))},
         ):
             return await self._collect_attributes(blob)
 
@@ -86,23 +85,23 @@ class StorageController(Controller):
 
     form_class = 'p2.core.forms.StorageForm'
 
-    def collect_attributes(self, blob: Blob):
+    def collect_attributes(self, blob):
         """Collect stats like size and mime type. This is being called during Blob's save"""
 
-    def get_read_handle(self, blob: Blob) -> RawIOBase:
+    def get_read_handle(self, blob) -> RawIOBase:
         """Return file-like object which can be used to manipulate payload."""
         raise NotImplementedError
 
     # pylint: disable=unused-argument
-    def get_write_handle(self, blob: Blob) -> RawIOBase:
+    def get_write_handle(self, blob) -> RawIOBase:
         """Return file-like object to write data into. Default implementation opens a temporary
         file in w+b mode."""
         return SpooledTemporaryFile(max_size=500)
 
-    def commit(self, blob: Blob, handle: RawIOBase):
+    def commit(self, blob, handle: RawIOBase):
         """Called when blob is saved and data can be flushed to disk/remote"""
         raise NotImplementedError
 
-    def delete(self, blob: Blob):
+    def delete(self, blob):
         """Delete Blob"""
         raise NotImplementedError

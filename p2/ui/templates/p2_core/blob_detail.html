@@ -1,13 +1,10 @@
 {% extends 'base/base.html' %}
-
 {% load i18n %}
 {% load static %}
-
 {% load p2_ui %}
 
 {% block head %}
 {{ block.super }}
-{{ form.media }}
 <script src="{% static 'codemirror/codemirror.js' %}"></script>
 <link rel="stylesheet" href="{% static 'codemirror/codemirror.css' %}">
 <link rel="stylesheet" href="{% static 'codemirror/theme/monokai.css' %}">
@@ -15,111 +12,119 @@
 {% endblock %}
 
 {% block container %}
+{% with object.attributes as attrs %}
+{% with attrs|get_item:"blob.p2.io/mime" as mime %}
 <div class="container-fluid">
   <div class="row">
     <div class="col-12 py-md-3">
       {% include 'blocks/messages.html' %}
       <nav aria-label="breadcrumb">
         <ol class="breadcrumb">
-          <li class="breadcrumb-item"><a href="{% url 'p2_ui:core-blob-list' pk=object.volume.pk %}?prefix=/">{{ object.volume.name|truncatechars:160 }}</a></li>
+          <li class="breadcrumb-item">
+            <a href="{% url 'p2_ui:core-blob-list' volume_pk=object.volume.pk %}">{{ object.volume.name|truncatechars:160 }}</a>
+          </li>
           {% for crumb in breadcrumbs %}
-            <li class="breadcrumb-item"><a href="{% url 'p2_ui:core-blob-list' pk=object.volume.pk %}?prefix={{ crumb.prefix }}">{{ crumb.title|truncatechars:160 }}</a></li>
+          <li class="breadcrumb-item">
+            <a href="{% url 'p2_ui:core-blob-list' volume_pk=object.volume.pk %}?prefix={{ crumb.prefix }}">{{ crumb.title|truncatechars:160 }}</a>
+          </li>
           {% endfor %}
           <li class="breadcrumb-item active" aria-current="page">{{ object.filename|truncatechars:160 }}</li>
         </ol>
       </nav>
     </div>
   </div>
+
   <div class="row">
-    <div class="col-md-6">
-      {% with object|get_attribute:"p2.core.constants.ATTR_BLOB_IS_TEXT" as is_text %}
-      {% with object|get_attribute:"p2.core.constants.ATTR_BLOB_MIME" as mime %}
-      {% if is_text %}
-        {% include 'p2_core/blob_detail_text.html' with object=object only %}
-      {% elif mime|startswith:'image/' %}
-        {% include 'p2_core/blob_detail_image.html' with object=object only %}
-      {% elif mime|startswith:'audio/' %}
-        {% include 'p2_core/blob_detail_audio.html' with object=object only %}
-      {% elif mime|startswith:'video/' %}
-        {% include 'p2_core/blob_detail_video.html' with object=object only %}
-      {% elif mime == 'application/pdf' %}
-        {% include 'p2_core/blob_detail_pdf.html' with object=object only %}
-      {% else %}
-        {% include 'p2_core/blob_detail_fallback.html' with object=object only %}
-      {% endif %}
-      {% endwith %}
-      {% endwith %}
-    </div>
-    <div class="col-md-6">
-      <div class="card">
-        <div class="card-body">
-          <h5 class="card-title">{% trans 'Metadata' %}</h5>
+    <!-- Preview panel -->
+    <div class="col-md-7 mb-3">
+      <div class="card h-100">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="fa fa-eye" aria-hidden="true"></i> {% trans 'Preview' %}</span>
+          <small class="text-muted">{{ mime|default:"application/octet-stream" }}</small>
         </div>
-        <table class="table table-bordered table-hover table-sm mb-0">
+        <div class="card-body p-2">
+          {% if mime|startswith:"image/" %}
+            {% include 'p2_core/blob_detail_image.html' with object=object only %}
+          {% elif mime|startswith:"audio/" %}
+            {% include 'p2_core/blob_detail_audio.html' with object=object only %}
+          {% elif mime|startswith:"video/" %}
+            {% include 'p2_core/blob_detail_video.html' with object=object only %}
+          {% elif mime == "application/pdf" %}
+            {% include 'p2_core/blob_detail_pdf.html' with object=object only %}
+          {% elif mime|startswith:"text/" %}
+            {% include 'p2_core/blob_detail_text.html' with object=object only %}
+          {% else %}
+            {% include 'p2_core/blob_detail_fallback.html' with object=object only %}
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Info + actions panel -->
+    <div class="col-md-5">
+
+      <!-- Actions -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <h5 class="card-title">{% trans 'Actions' %}</h5>
+          <a href="{% url 'p2_ui:core-blob-download' volume_pk=object.volume.pk blob_path=object.path %}"
+             class="btn btn-primary btn-sm mr-1">
+            <i class="fa fa-download" aria-hidden="true"></i> {% trans 'Download' %}
+          </a>
+          <a href="{% url 'p2_ui:core-blob-delete' volume_pk=object.volume.pk blob_path=object.path %}"
+             class="btn btn-danger btn-sm mr-1">
+            <i class="fa fa-trash" aria-hidden="true"></i> {% trans 'Delete' %}
+          </a>
+          <button class="btn btn-secondary btn-sm" id="copy-url-btn"
+                  data-url="/{{ object.volume.name }}/{{ object.path }}">
+            <i class="fa fa-link" aria-hidden="true"></i> {% trans 'Copy S3 URL' %}
+          </button>
+          <button class="btn btn-outline-secondary btn-sm" id="presign-btn"
+                  data-volume="{{ object.volume.name }}"
+                  data-key="{{ object.path }}">
+            <i class="fa fa-clock-o" aria-hidden="true"></i> {% trans 'Presigned URL' %}
+          </button>
+        </div>
+      </div>
+
+      <!-- Metadata -->
+      <div class="card mb-3">
+        <div class="card-header">{% trans 'Metadata' %}</div>
+        <table class="table table-sm table-bordered mb-0">
           <tbody>
-            <tr>
-              <th>{% trans 'Path' %}</th>
-              <td>{{ object.path }}</td>
+            <tr><th>{% trans 'Path' %}</th><td><code>{{ object.path }}</code></td></tr>
+            <tr><th>{% trans 'Volume' %}</th>
+              <td><a href="{% url 'p2_ui:core-volume-detail' pk=object.volume.pk %}">{{ object.volume }}</a></td>
             </tr>
-            <tr>
-              <th>{% trans 'Volume' %}</th>
-              <td>
-                <a href="{% url 'p2_ui:core-volume-detail' pk=object.volume.pk %}">{{ object.volume }}</a>
-              </td>
-            </tr>
-            <tr>
-              <th>{% trans 'Attributes' %}</th>
-              <td>
-                <table class="table table-striped table-bordered table-hover table-sm">
-                  <tbody>
-                    {% for key, value in object.attributes.items|dictsort:"0.lower" %}
-                    <tr>
-                      <th>{{ key }}</th>
-                      <td>{{ value }}</td>
-                    </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </td>
-            </tr>
-            <tr>
-              <th>{% trans 'Tags' %}</th>
-              <td>
-                <table class="table table-striped table-bordered table-hover table-sm">
-                  <tbody>
-                    {% for key, value in object.tags.items|dictsort:"0.lower" %}
-                    <tr>
-                      <th>{{ key }}</th>
-                      <td>{{ value }}</td>
-                    </tr>
-                    {% endfor %}
-                  </tbody>
-                </table>
-              </td>
-            </tr>
+            {% for key, value in object.attributes.items %}
+            <tr><th>{{ key }}</th><td>{{ value }}</td></tr>
+            {% endfor %}
           </tbody>
         </table>
       </div>
-      <hr>
-      <div class="card">
-        <div class="card-body">
-          <h5 class="card-title">{% trans 'Actions' %}</h5>
-          <a href="{% url 'p2_ui:core-blob-download' pk=object.pk %}" class="btn btn-primary">{% trans 'Download' %}</a>
-          <a href="{% url 'p2_ui:core-blob-update' pk=object.pk %}" class="btn btn-primary">{% trans 'Edit' %}</a>
-          <a href="{% url 'p2_ui:core-blob-delete' pk=object.pk %}" class="btn btn-danger">{% trans 'Delete' %}</a>
-        </div>
+
+      <!-- Tags -->
+      {% if object.tags %}
+      <div class="card mb-3">
+        <div class="card-header">{% trans 'Tags' %}</div>
+        <table class="table table-sm table-bordered mb-0">
+          <tbody>
+            {% for key, value in object.tags.items %}
+            <tr><th>{{ key }}</th><td>{{ value }}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
-      <hr>
-      <div class="card"><div class="card-body">
-        <h5 class="card-title">{% trans 'Permissions' %}</h5>
-        <table class="table table-striped table-bordered table-hover table-sm mb-0">
-          {% regroup permissions by user as permission_list %}
+      {% endif %}
+
+      <!-- Permissions -->
+      <div class="card mb-3">
+        <div class="card-header">{% trans 'Permissions' %}</div>
+        <table class="table table-sm table-bordered mb-0">
           <thead>
             <tr>
               <th>{% trans 'User' %}</th>
-              {% for perm in model_perms %}
-              <th>{{ perm.name }}</th>
-              {% endfor %}
+              {% for perm in model_perms %}<th>{{ perm.name }}</th>{% endfor %}
             </tr>
           </thead>
           <tbody>
@@ -129,9 +134,9 @@
               {% for perm in model_perms %}
               <td>
                 {% if perm.codename in user_perms %}
-                <i class="fa fa-check text-success" aria-hidden="true"></i>
+                  <i class="fa fa-check text-success" aria-hidden="true"></i>
                 {% else %}
-                <i class="fa fa-times text-danger" aria-hidden="true"></i>
+                  <i class="fa fa-times text-danger" aria-hidden="true"></i>
                 {% endif %}
               </td>
               {% endfor %}
@@ -140,7 +145,65 @@
           </tbody>
         </table>
       </div>
-    </div>
-  </div>
+
+    </div><!-- /col -->
+  </div><!-- /row -->
 </div>
+{% endwith %}
+{% endwith %}
+
+<script>
+document.getElementById('copy-url-btn').addEventListener('click', function() {
+  var url = window.location.origin + this.dataset.url;
+  navigator.clipboard.writeText(url).then(function() {
+    var btn = document.getElementById('copy-url-btn');
+    btn.textContent = '✓ Copied!';
+    setTimeout(function() {
+      btn.innerHTML = '<i class="fa fa-link" aria-hidden="true"></i> Copy S3 URL';
+    }, 2000);
+  });
+});
+
+document.getElementById('presign-btn').addEventListener('click', function() {
+  var btn = this;
+  var bucket = btn.dataset.volume;
+  var key = btn.dataset.key;
+  btn.disabled = true;
+  btn.textContent = '…';
+
+  fetch('/_/api/v1/s3/presign/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || ''
+    },
+    body: JSON.stringify({
+      bucket: bucket,
+      key: key,
+      method: 'GET',
+      expires_in: 3600,
+      base_url: window.location.origin
+    })
+  })
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    if (data.url) {
+      navigator.clipboard.writeText(data.url).then(function() {
+        btn.innerHTML = '✓ Copied (1h)';
+        setTimeout(function() {
+          btn.innerHTML = '<i class="fa fa-clock-o"></i> Presigned URL';
+          btn.disabled = false;
+        }, 2000);
+      });
+    } else {
+      btn.textContent = 'Error';
+      btn.disabled = false;
+    }
+  })
+  .catch(function() {
+    btn.textContent = 'Error';
+    btn.disabled = false;
+  });
+});
+</script>
 {% endblock %}

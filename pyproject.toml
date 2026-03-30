@@ -16,7 +16,8 @@ dependencies = [
     "crispy-bootstrap4>=2022.1",
 
     # Database
-    "psycopg[binary]>=3.1",
+    "django-libsql>=0.0.1",
+    "libsql-experimental>=0.0.31",
 
     # Auth
     "djangorestframework-simplejwt>=5.3",

@@ -1,13 +1,17 @@
-"""Replication signals — arq-based task enqueueing (Celery removed)."""
+"""Replication signals — arq-based task enqueueing (Celery removed).
+
+NOTE: The pre_delete signal for Blob has been removed since the Blob model
+is gone.  The Component post_save signal is kept — it triggers an initial
+full replication job when a ReplicationController component is saved.
+"""
 import logging
 
 from asgiref.sync import async_to_sync
-from django.db.models.signals import post_save, pre_delete
+from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from p2.components.replication.constants import TAG_REPLICATION_OFFSET
 from p2.components.replication.controller import ReplicationController
-from p2.core.models import Blob, Component
+from p2.core.models import Component
 from p2.lib.reflection import class_to_path
 
 logger = logging.getLogger(__name__)
@@ -30,22 +34,6 @@ async def _enqueue(job_name: str, *args, countdown: int = 0):
         await pool.aclose()
 
 
-@receiver(pre_delete, sender=Blob)
-def blob_pre_delete(sender, instance, **kwargs):  # pylint: disable=unused-argument
-    """Enqueue replicate_delete arq task when a blob is about to be deleted."""
-    controller_path = class_to_path(ReplicationController)
-    component = instance.volume.component_set.filter(
-        controller_path=controller_path, enabled=True
-    ).first()
-    if not component:
-        return
-    countdown = int(component.tags.get(TAG_REPLICATION_OFFSET, 0))
-    try:
-        async_to_sync(_enqueue)("replicate_delete", str(instance.pk), countdown=countdown)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("blob_pre_delete: failed to enqueue replicate_delete for blob %s: %s", instance.pk, exc)
-
-
 @receiver(post_save, sender=Component)
 def component_post_save(sender, instance, **kwargs):  # pylint: disable=unused-argument
     """Trigger initial full replication after a ReplicationController component is saved."""
@@ -54,5 +42,7 @@ def component_post_save(sender, instance, **kwargs):  # pylint: disable=unused-a
     try:
         async_to_sync(_enqueue)("initial_full_replication", str(instance.volume.pk))
     except Exception as exc:  # noqa: BLE001
-        logger.error("component_post_save: failed to enqueue initial_full_replication for volume %s: %s",
-                     instance.volume.pk, exc)
+        logger.error(
+            "component_post_save: failed to enqueue initial_full_replication for volume %s: %s",
+            instance.volume.pk, exc
+        )

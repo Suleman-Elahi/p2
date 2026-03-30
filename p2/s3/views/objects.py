@@ -1,18 +1,15 @@
 """p2 S3 Object views"""
-import asyncio
 import logging
+from email.utils import format_datetime
 from xml.etree import ElementTree
 
-from asgiref.sync import sync_to_async
-from django.db import IntegrityError
-from django.http.response import HttpResponse, StreamingHttpResponse
+from django.http.response import HttpResponse
+from django.utils.dateparse import parse_datetime
 
-from p2.core.acl import VolumeACL, has_volume_permission
+from p2.core.acl import has_volume_permission
 from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
-                               ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME)
-from p2.core.models import Blob
-from p2.core.signals import BLOB_PRE_SAVE
-from p2.core.storages.base import AsyncStorageController
+                               ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME,
+                               ATTR_BLOB_STAT_CTIME)
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX,
                              XML_NAMESPACE)
 from p2.s3.checksum import verify_request_checksum
@@ -22,6 +19,18 @@ from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
+
+
+def _format_http_date(mtime_str: str) -> str:
+    """Convert stored mtime string to RFC 7231 HTTP date format."""
+    if not mtime_str:
+        return ''
+    dt = parse_datetime(mtime_str)
+    if dt is None:
+        return mtime_str
+    return format_datetime(dt, usegmt=True)
+
+from p2.s3 import p2_s3_meta
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,26 +44,6 @@ _CANNED_ACL_PERMS = {
     "bucket-owner-full-control":["read", "write", "delete"],
 }
 
-
-async def _request_body_chunks(request):
-    body = request.body
-    if body:
-        yield body
-
-
-async def _blob_read_stream(blob):
-    controller = blob.volume.storage.controller
-    if isinstance(controller, AsyncStorageController):
-        async for chunk in controller.get_read_stream(blob):
-            yield chunk
-    else:
-        data = await asyncio.to_thread(blob.read)
-        if data:
-            yield data
-
-
-def _fire_pre_save(blob):
-    BLOB_PRE_SAVE.send(sender=Blob, blob=blob)
 
 
 def _check_conditional_headers(request, blob) -> HttpResponse | None:
@@ -95,11 +84,12 @@ def _check_conditional_headers(request, blob) -> HttpResponse | None:
     return None
 
 
-def _user_tags_from_blob(blob: Blob) -> dict:
-    """Extract S3 user tags (s3.user/* prefix) from blob.tags."""
+def _user_tags_from_blob(blob: dict) -> dict:
+    """Extract S3 user tags (s3.user/* prefix) from metadata dict tags."""
+    tags = blob.get('tags', {}) if isinstance(blob, dict) else getattr(blob, 'tags', {})
     return {
         k[len(TAG_S3_USER_TAG_PREFIX):]: v
-        for k, v in blob.tags.items()
+        for k, v in tags.items()
         if k.startswith(TAG_S3_USER_TAG_PREFIX)
     }
 
@@ -126,7 +116,7 @@ def _build_tagging_xml(tags: dict) -> ElementTree.Element:
     return root
 
 
-def _build_acl_xml(blob: Blob, owner_id: str, owner_name: str) -> ElementTree.Element:
+def _build_acl_xml(blob, owner_id: str, owner_name: str) -> ElementTree.Element:
     root = ElementTree.Element("{%s}AccessControlPolicy" % XML_NAMESPACE)
     owner = ElementTree.SubElement(root, "Owner")
     ElementTree.SubElement(owner, "ID").text = owner_id
@@ -157,8 +147,8 @@ class ObjectView(S3View):
         if not token:
             return
         max_age = int(request.GET.get("X-Amz-Expires", 3600))
-        validate_presigned_token(token, bucket, path, request.method, max_age=max_age)
-        # Mark request as presigned so middleware skips re-auth
+        # Normalize: token key has no leading slash (matches URL router capture)
+        validate_presigned_token(token, bucket, path.lstrip('/'), request.method, max_age=max_age)
         request._presigned_validated = True
 
     async def _apply_cors(self, request, response, volume):
@@ -189,16 +179,25 @@ class ObjectView(S3View):
     async def head(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html"""
         await self._check_presigned(request, bucket, path)
-        volume = await self.get_volume(request.user, bucket, 'read')
-        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
-        if blob is None:
+        volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
+
+        engine = await self.get_engine(volume)
+        metadata_json = engine.get(path)
+        if not metadata_json:
             return HttpResponse(status=404)
+
+        import json
+        attributes = json.loads(metadata_json)
+
         response = HttpResponse(status=200)
-        response['Content-Length'] = blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
-        response['Content-Type'] = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-        response['Last-Modified'] = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
-        response['ETag'] = blob.attributes.get('blob.p2.io/hash/md5', '')
+        response['Content-Length'] = attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
+        response['Content-Type'] = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
+        response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+        etag = attributes.get('blob.p2.io/hash/md5', '')
+        if etag:
+            response['ETag'] = f'"{etag}"'
         response['Accept-Ranges'] = 'bytes'
+        
         return await self._apply_cors(request, response, volume)
 
     async def get(self, request, bucket, path):
@@ -215,17 +214,18 @@ class ObjectView(S3View):
         if 'uploadId' in request.GET:
             return await MultipartUploadView().dispatch(request, bucket, path)
 
-        volume = await self.get_volume(request.user, bucket, 'read')
-        blob = await self.get_blob(volume, path)
-        content_type = blob.attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-        total_size = int(blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
+        volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
+        engine = await self.get_engine(volume)
+        metadata_json = engine.get(path)
+        if not metadata_json:
+            return HttpResponse(status=404)
 
-        # Range request support
-        range_header = request.META.get('HTTP_RANGE', '')
-        if range_header:
-            return await self._range_response(request, blob, content_type, total_size, range_header, volume)
+        import json
+        attributes = json.loads(metadata_json)
+        content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
+        total_size = int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
 
-        etag = blob.attributes.get('blob.p2.io/hash/md5', '')
+        etag = attributes.get('blob.p2.io/hash/md5', '')
         # If-None-Match → 304 Not Modified
         if_none_match = request.META.get('HTTP_IF_NONE_MATCH')
         if if_none_match and etag:
@@ -234,34 +234,55 @@ class ObjectView(S3View):
                 resp = HttpResponse(status=304)
                 resp['ETag'] = etag
                 return await self._apply_cors(request, resp, volume)
-        # If-Modified-Since → 304 Not Modified
-        if_mod_since = request.META.get('HTTP_IF_MODIFIED_SINCE')
-        if if_mod_since:
-            from email.utils import parsedate_to_datetime
-            from django.utils.dateparse import parse_datetime
-            try:
-                threshold = parsedate_to_datetime(if_mod_since)
-                mtime = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
-                if mtime:
-                    blob_dt = parse_datetime(str(mtime))
-                    if blob_dt and blob_dt <= threshold:
-                        resp = HttpResponse(status=304)
-                        return await self._apply_cors(request, resp, volume)
-            except (ValueError, TypeError):
-                pass
-        response = StreamingHttpResponse(_blob_read_stream(blob), content_type=content_type)
-        response['Content-Length'] = total_size
-        response['Last-Modified'] = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
-        response['ETag'] = etag
-        response['Accept-Ranges'] = 'bytes'
-        # S3 response override query params
-        if 'response-content-type' in request.GET:
-            response['Content-Type'] = request.GET['response-content-type']
-        if 'response-content-disposition' in request.GET:
-            response['Content-Disposition'] = request.GET['response-content-disposition']
-        elif content_type != 'application/octet-stream':
-            response['Content-Disposition'] = 'inline'
-        return await self._apply_cors(request, response, volume)
+
+        from django.conf import settings
+        # Only use X-Accel-Redirect when the request actually came through Nginx.
+        # Nginx sets X-Real-IP; direct uvicorn access won't have it.
+        _accel_enabled = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
+        use_accel = _accel_enabled and bool(request.META.get('HTTP_X_REAL_IP'))
+        internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{volume.uuid.hex}{path}")
+        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+
+        if use_accel:
+            # X-Accel-Redirect to Nginx — zero-copy sendfile path.
+            # Do NOT set Content-Length here: the body is empty from uvicorn's
+            # perspective. Nginx reads the file and sets the correct length itself.
+            response = HttpResponse()
+            response['X-Accel-Redirect'] = internal_path
+            response['Content-Type'] = content_type
+            response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            response['ETag'] = etag
+            response['Accept-Ranges'] = 'bytes'
+            if 'response-content-type' in request.GET:
+                response['Content-Type'] = request.GET['response-content-type']
+            if 'response-content-disposition' in request.GET:
+                response['Content-Disposition'] = request.GET['response-content-disposition']
+            return await self._apply_cors(request, response, volume)
+        else:
+            # Direct aiofiles streaming (no Nginx)
+            import aiofiles
+            from django.http import StreamingHttpResponse
+
+            async def _stream():
+                async with aiofiles.open(fs_path, 'rb') as f:
+                    chunk = await f.read(1 << 20)  # 1 MB
+                    while chunk:
+                        yield chunk
+                        chunk = await f.read(1 << 20)
+
+            response = StreamingHttpResponse(_stream(), content_type=content_type, status=200)
+            response['Content-Length'] = total_size
+            response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            response['ETag'] = etag
+            response['Accept-Ranges'] = 'bytes'
+            if 'response-content-type' in request.GET:
+                response['Content-Type'] = request.GET['response-content-type']
+            if 'response-content-disposition' in request.GET:
+                response['Content-Disposition'] = request.GET['response-content-disposition']
+            elif content_type != 'application/octet-stream':
+                response['Content-Disposition'] = 'inline'
+            return await self._apply_cors(request, response, volume)
+
 
     async def post(self, request, bucket, path):
         return await MultipartUploadView().dispatch(request, bucket, path)
@@ -283,62 +304,121 @@ class ObjectView(S3View):
             return await self._copy_object(request, bucket, path, copy_source)
 
         volume = await self.get_volume(request.user, bucket, 'write')
-        # Check conditional headers against existing object
-        existing = await Blob.objects.filter(path=path, volume=volume).afirst()
-        cond_resp = _check_conditional_headers(request, existing)
-        if cond_resp is not None:
-            return cond_resp
-        created = False
+        import os
+        import uuid
+        import json
+        import aiofiles
+        from django.utils.timezone import now
+        
+        engine = await self.get_engine(volume)
+        metadata_json = engine.get(path)
+        existing_attributes = json.loads(metadata_json) if metadata_json else {}
+
+        # Honour Content-Type from the client
+        client_ct = request.META.get('CONTENT_TYPE', 'application/octet-stream')
+
+        # Streaming high-throughput write
+        blob_uuid = uuid.uuid4().hex
+        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+        os.makedirs(dir_path, exist_ok=True)
+        fs_path = os.path.join(dir_path, blob_uuid)
+        internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+
+        import asyncio
+        import hashlib
+
+        # Use Rust checksum extension for inline hashing if available (zero GIL overhead)
         try:
-            blob, created = await Blob.objects.aget_or_create(path=path, volume=volume)
-        except IntegrityError:
-            blob = await Blob.objects.aget(path=path, volume=volume)
-        if created and request.body == b'':
-            blob.attributes[ATTR_BLOB_IS_FOLDER] = True
+            from p2.s3 import p2_s3_checksum as _rust_cs
+            _use_rust_hash = True
+        except ImportError:
+            _use_rust_hash = False
 
-        # Apply canned ACL from header if present
-        canned_acl = request.META.get('HTTP_X_AMZ_ACL')
-        if canned_acl and canned_acl in _CANNED_ACL_PERMS:
-            blob.tags[TAG_S3_ACL] = canned_acl
-            if 'public-read' in canned_acl:
-                blob.volume.public_read = True
-                await blob.volume.asave(update_fields=['public_read'])
+        md5_hash = hashlib.md5()
+        sha256_hash = hashlib.sha256()
+        blob_size = 0
+        # 4 MB accumulation buffer — reduces aiofiles write syscalls on fast storage
+        _WRITE_BUF = bytearray()
+        _BUF_LIMIT = 4 << 20  # 4 MB
 
-        await sync_to_async(_fire_pre_save)(blob)
+        async with aiofiles.open(fs_path, 'wb') as f:
+            if hasattr(request, '__aiter__'):
+                # ASGI: true async streaming — uvicorn yields chunks as they arrive
+                async for chunk in request:
+                    _WRITE_BUF += chunk
+                    md5_hash.update(chunk)
+                    sha256_hash.update(chunk)
+                    blob_size += len(chunk)
+                    if len(_WRITE_BUF) >= _BUF_LIMIT:
+                        await f.write(_WRITE_BUF)
+                        _WRITE_BUF.clear()
+                if _WRITE_BUF:
+                    await f.write(_WRITE_BUF)
+            else:
+                # WSGI fallback
+                data = await asyncio.to_thread(request.read)
+                await f.write(data)
+                md5_hash.update(data)
+                sha256_hash.update(data)
+                blob_size = len(data)
 
-        # Honour Content-Type from the client (SDKs send the correct MIME type)
-        client_ct = request.META.get('CONTENT_TYPE', '')
-        if client_ct and client_ct != 'application/octet-stream':
-            blob.attributes[ATTR_BLOB_MIME] = client_ct
+        final_md5 = md5_hash.hexdigest()
+        final_sha256 = sha256_hash.hexdigest()
 
-        # Verify payload checksum if x-amz-checksum-* header present
-        checksum_err = verify_request_checksum(request, request.body)
-        if checksum_err:
-            raise AWSBadDigest
+        # Update and save attributes in redb
+        existing_attributes.update({
+            ATTR_BLOB_MIME: client_ct,
+            ATTR_BLOB_SIZE_BYTES: str(blob_size),
+            ATTR_BLOB_IS_FOLDER: False,
+            ATTR_BLOB_STAT_MTIME: str(now()),
+            'blob.p2.io/hash/md5': final_md5,
+            'blob.p2.io/hash/sha256': final_sha256,
+            'internal_path': internal_path
+        })
+        
+        if not metadata_json:
+            existing_attributes[ATTR_BLOB_STAT_CTIME] = str(now())
 
-        controller = volume.storage.controller
-        if isinstance(controller, AsyncStorageController):
-            await controller.commit(blob, _request_body_chunks(request))
-        else:
-            body = request.body
-            await asyncio.to_thread(blob.write, body)
+        engine.put(path, json.dumps(existing_attributes))
 
-        await sync_to_async(blob.save)()
+        # Publish event to Dragonfly for background processing (webhooks, EXIF, etc.)
+        try:
+            from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
+            event = make_event(
+                blob_uuid=blob_uuid,
+                volume_uuid=volume.uuid.hex,
+                event_type="blob_post_save"
+            )
+            event['blob_path'] = path
+            event['mime'] = client_ct
+            await publish_event(STREAM_BLOB_POST_SAVE, event)
+        except Exception as e:
+            LOGGER.warning("Failed to publish blob event: %s", e)
+
         response = HttpResponse(status=200)
-        response['ETag'] = blob.attributes.get('blob.p2.io/hash/md5', '')
+        response['ETag'] = f'"{final_md5}"'
         return await self._apply_cors(request, response, volume)
 
     async def delete(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectDELETE.html"""
-        if 'tagging' in request.GET:
-            return await self._delete_tagging(request, bucket, path)
-        # Abort multipart
-        if 'uploadId' in request.GET:
-            return await MultipartUploadView().dispatch(request, bucket, path)
+        await self._check_presigned(request, bucket, path)
         volume = await self.get_volume(request.user, bucket, 'delete')
-        blob = await Blob.objects.filter(path=path, volume=volume).afirst()
-        if blob is not None:
-            await blob.adelete()
+        
+        engine = await self.get_engine(volume)
+        metadata_json = engine.get(path)
+        
+        if metadata_json:
+            import json, os
+            attributes = json.loads(metadata_json)
+            internal_path = attributes.get('internal_path')
+            if internal_path:
+                fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                try:
+                    os.remove(fs_path)
+                except OSError:
+                    pass
+            engine.delete(path)
+            
         return HttpResponse(status=204)
 
     # -------------------------------------------------------------------------
@@ -406,58 +486,61 @@ class ObjectView(S3View):
 
     async def _copy_object(self, request, dest_bucket: str, dest_path: str, copy_source: str):
         """PUT with x-amz-copy-source — copy blob within or across volumes."""
-        # copy_source is /src-bucket/src-key or src-bucket/src-key
-        copy_source = copy_source.lstrip('/')
-        if '/' not in copy_source:
+        import urllib.parse
+        copy_source = urllib.parse.unquote(copy_source).lstrip('/')
+        
+        parts = copy_source.split('/', 1)
+        if len(parts) != 2:
             return HttpResponse(status=400)
-        src_bucket, src_key = copy_source.split('/', 1)
-        src_key = '/' + src_key
-
+            
+        src_bucket, src_path = parts
+        
         src_volume = await self.get_volume(request.user, src_bucket, 'read')
-        src_blob = await Blob.objects.filter(path=src_key, volume=src_volume).select_related('volume__storage').afirst()
-        if src_blob is None:
-            raise AWSNoSuchKey
-
         dest_volume = await self.get_volume(request.user, dest_bucket, 'write')
-        # Check conditional headers against existing destination object
-        existing_dest = await Blob.objects.filter(path=dest_path, volume=dest_volume).afirst()
-        cond_resp = _check_conditional_headers(request, existing_dest)
-        if cond_resp is not None:
-            return cond_resp
-
-        # Read source data
-        src_controller = src_volume.storage.controller
-        if isinstance(src_controller, AsyncStorageController):
-            chunks = []
-            async for chunk in src_controller.get_read_stream(src_blob):
-                chunks.append(chunk)
-            data = b''.join(chunks)
-        else:
-            data = await asyncio.to_thread(src_blob.read)
-
-        # Write to destination
+        
+        src_engine = await self.get_engine(src_volume)
+        dest_engine = await self.get_engine(dest_volume)
+        
+        src_json = src_engine.get(src_path)
+        if not src_json:
+            return HttpResponse(status=404)
+            
+        import json, os, uuid, shutil
+        import asyncio
+        from django.utils.timezone import now
+        
+        src_attr = json.loads(src_json)
+        src_internal_path = src_attr.get('internal_path')
+        if not src_internal_path:
+            return HttpResponse(status=404)
+            
+        src_fs = src_internal_path.replace('/internal-storage/', '/storage/')
+        
+        blob_uuid = uuid.uuid4().hex
+        dir_path = os.path.join("/storage", dest_volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+        os.makedirs(dir_path, exist_ok=True)
+        dest_fs = os.path.join(dir_path, blob_uuid)
+        dest_internal_path = f"/internal-storage/volumes/{dest_volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+        
         try:
-            dest_blob, _ = await Blob.objects.aget_or_create(path=dest_path, volume=dest_volume)
-        except IntegrityError:
-            dest_blob = await Blob.objects.aget(path=dest_path, volume=dest_volume)
-
-        dest_blob.attributes.update(src_blob.attributes)
-
-        dest_controller = dest_volume.storage.controller
-
-        async def _data_stream():
-            yield data
-
-        if isinstance(dest_controller, AsyncStorageController):
-            await dest_controller.commit(dest_blob, _data_stream())
-        else:
-            await asyncio.to_thread(dest_blob.write, data)
-
-        await sync_to_async(dest_blob.save)()
-
+            await asyncio.to_thread(shutil.copy2, src_fs, dest_fs)
+        except Exception as e:
+            LOGGER.error("Failed to copy physical file: %s", e)
+            return HttpResponse(status=500)
+            
+        dest_attr = src_attr.copy()
+        dest_attr['internal_path'] = dest_internal_path
+        dest_attr[ATTR_BLOB_STAT_MTIME] = str(now())
+        dest_attr[ATTR_BLOB_STAT_CTIME] = str(now())
+        
+        dest_engine.put(dest_path, json.dumps(dest_attr))
+        
         root = ElementTree.Element("{%s}CopyObjectResult" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "LastModified").text = str(dest_blob.attributes.get(ATTR_BLOB_STAT_MTIME, ''))
-        ElementTree.SubElement(root, "ETag").text = dest_blob.attributes.get('blob.p2.io/hash/md5', '')
+        ElementTree.SubElement(root, "LastModified").text = dest_attr[ATTR_BLOB_STAT_MTIME]
+        etag = dest_attr.get('blob.p2.io/hash/md5', '')
+        if etag:
+            ElementTree.SubElement(root, "ETag").text = f'"{etag}"'
+            
         return XMLResponse(root)
 
     # -------------------------------------------------------------------------
@@ -466,26 +549,52 @@ class ObjectView(S3View):
 
     async def _get_tagging(self, request, bucket: str, path: str):
         volume = await self.get_volume(request.user, bucket, 'read')
-        blob = await self.get_blob(volume, path)
-        tags = _user_tags_from_blob(blob)
+        engine = await self.get_engine(volume)
+        meta = engine.get(path)
+        if not meta: return HttpResponse(status=404)
+        
+        import json
+        attr = json.loads(meta)
+        tags = {k[len(TAG_S3_USER_TAG_PREFIX):]: v for k, v in attr.items() if k.startswith(TAG_S3_USER_TAG_PREFIX)}
         return XMLResponse(_build_tagging_xml(tags))
 
     async def _put_tagging(self, request, bucket: str, path: str):
         volume = await self.get_volume(request.user, bucket, 'write')
-        blob = await self.get_blob(volume, path)
-        new_tags = _parse_tagging_xml(request.body)
-        # Remove old user tags, apply new ones
-        blob.tags = {k: v for k, v in blob.tags.items() if not k.startswith(TAG_S3_USER_TAG_PREFIX)}
+        engine = await self.get_engine(volume)
+        meta = engine.get(path)
+        if not meta: return HttpResponse(status=404)
+        
+        body = request.body
+        new_tags = _parse_tagging_xml(body)
+        import json
+        attr = json.loads(meta)
+        
+        for k in list(attr.keys()):
+            if k.startswith(TAG_S3_USER_TAG_PREFIX):
+                del attr[k]
+                
         for k, v in new_tags.items():
-            blob.tags[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
-        await blob.asave(update_fields=['tags'])
+            attr[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
+            
+        engine.put(path, json.dumps(attr))
         return HttpResponse(status=200)
 
     async def _delete_tagging(self, request, bucket: str, path: str):
         volume = await self.get_volume(request.user, bucket, 'write')
-        blob = await self.get_blob(volume, path)
-        blob.tags = {k: v for k, v in blob.tags.items() if not k.startswith(TAG_S3_USER_TAG_PREFIX)}
-        await blob.asave(update_fields=['tags'])
+        engine = await self.get_engine(volume)
+        meta = engine.get(path)
+        if not meta: return HttpResponse(status=204)
+        
+        import json
+        attr = json.loads(meta)
+        changed = False
+        for k in list(attr.keys()):
+            if k.startswith(TAG_S3_USER_TAG_PREFIX):
+                del attr[k]
+                changed = True
+                
+        if changed:
+            engine.put(path, json.dumps(attr))
         return HttpResponse(status=204)
 
     # -------------------------------------------------------------------------
@@ -494,21 +603,32 @@ class ObjectView(S3View):
 
     async def _get_acl(self, request, bucket: str, path: str):
         volume = await self.get_volume(request.user, bucket, 'read')
-        blob = await self.get_blob(volume, path)
-        owner_id = str(request.user.pk)
-        owner_name = request.user.username
-        return XMLResponse(_build_acl_xml(blob, owner_id, owner_name))
+        engine = await self.get_engine(volume)
+        meta = engine.get(path)
+        if not meta: return HttpResponse(status=404)
+        
+        import json
+        attr = json.loads(meta)
+        class StubBlob: pass
+        b = StubBlob()
+        b.tags = {TAG_S3_ACL: attr.get(TAG_S3_ACL, 'private')}
+        
+        owner_id = str(volume.owner.pk) if volume.owner else "0"
+        owner_name = volume.owner.username if volume.owner else "System"
+        return XMLResponse(_build_acl_xml(b, owner_id, owner_name))
 
     async def _put_acl(self, request, bucket: str, path: str):
         volume = await self.get_volume(request.user, bucket, 'write')
-        blob = await self.get_blob(volume, path)
-        canned = request.META.get('HTTP_X_AMZ_ACL', 'private')
-        if canned not in _CANNED_ACL_PERMS:
-            canned = 'private'
-        blob.tags[TAG_S3_ACL] = canned
-        # Sync public_read flag on volume for public-read ACLs
-        if 'public-read' in canned:
-            volume.public_read = True
-            await volume.asave(update_fields=['public_read'])
-        await blob.asave(update_fields=['tags'])
+        engine = await self.get_engine(volume)
+        meta = engine.get(path)
+        if not meta: return HttpResponse(status=404)
+        
+        acl_header = request.META.get('HTTP_X_AMZ_ACL')
+        if not acl_header:
+            return HttpResponse(status=200)
+            
+        import json
+        attr = json.loads(meta)
+        attr[TAG_S3_ACL] = acl_header
+        engine.put(path, json.dumps(attr))
         return HttpResponse(status=200)

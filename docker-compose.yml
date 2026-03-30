@@ -1,19 +1,20 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: p2
-      POSTGRES_USER: p2
-      POSTGRES_PASSWORD: p2
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+
 
   redis:
-    image: redis:7-alpine
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
     ports:
       - "6379:6379"
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./storage:/storage:ro
+    depends_on:
+      - web
 
   migrate:
     build: .
@@ -24,26 +25,22 @@ services:
       - venv:/app/.venv
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
-      DATABASE_URL: postgresql://p2:p2@db:5432/p2
-    depends_on:
-      - db
-
   web:
     build: .
-    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "p2"]
+    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--reload", "--reload-dir", "p2"]
     env_file: .env
     volumes:
       - .:/app
       - venv:/app/.venv
       - media:/app/media
-      - storage:/storage
+      - ./storage:/storage
     ports:
       - "8000:8000"
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
-      DATABASE_URL: postgresql://p2:p2@db:5432/p2
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
+      P2_STORAGE__USE_X_ACCEL_REDIRECT: "true"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -58,10 +55,9 @@ services:
       - .:/app
       - venv:/app/.venv
       - media:/app/media
-      - storage:/storage
+      - ./storage:/storage
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
-      DATABASE_URL: postgresql://p2:p2@db:5432/p2
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
@@ -78,12 +74,11 @@ services:
       - .:/app
       - venv:/app/.venv
       - media:/app/media
-      - storage:/storage
+      - ./storage:/storage
     ports:
       - "50051:50051"
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
-      DATABASE_URL: postgresql://p2:p2@db:5432/p2
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
@@ -93,7 +88,6 @@ services:
         condition: service_started
 
 volumes:
-  postgres_data:
+
   media:
-  storage:
   venv:

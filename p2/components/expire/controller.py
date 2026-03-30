@@ -1,28 +1,26 @@
-"""p2 expiry controller"""
-from time import time
+"""p2 expiry controller
 
+NOTE: The Blob ORM model has been removed. expire_volume() has been stubbed
+out — expiry will be reimplemented using the p2_s3_meta LSM engine by scanning
+the redb metadata store for entries whose TAG_EXPIRE_DATE has passed.
+"""
 import logging
 
-from p2.components.expire.constants import TAG_EXPIRE_DATE
 from p2.core.components.base import ComponentController
-from p2.core.models import Blob
 
 LOGGER = logging.getLogger(__name__)
+
 
 # pylint: disable=too-few-public-methods
 class ExpiryController(ComponentController):
     """Add permissions to blob to be publicly accessible"""
 
     template_name = 'components/expiry/card.html'
-    # No custom form needed
     form_class = 'p2.core.components.forms.ComponentForm'
 
     def expire_volume(self, volume):
-        """Delete blobs from Volume which are expired"""
-        for blob in Blob.objects.filter(**{
-                'volume': volume,
-                'tags__%s__isnull' % TAG_EXPIRE_DATE: False
-            }):
-            if int(time()) >= blob.tags[TAG_EXPIRE_DATE]:
-                LOGGER.debug("%r needs to be expired!", blob)
-                blob.delete()
+        """Delete expired objects from Volume — stubbed pending LSM reimplementation."""
+        LOGGER.warning(
+            "ExpiryController.expire_volume: stubbed (Blob model removed). "
+            "Expiry for volume %s skipped.", volume.pk
+        )

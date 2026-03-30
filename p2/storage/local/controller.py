@@ -12,7 +12,6 @@ import logging
 
 from p2.core.constants import (ATTR_BLOB_IS_TEXT, ATTR_BLOB_MIME,
                                ATTR_BLOB_SIZE_BYTES)
-from p2.core.models import Blob
 from p2.core.storages.base import AsyncStorageController, StorageController
 from p2.storage.local.constants import TAG_ROOT_PATH
 
@@ -27,14 +26,14 @@ class LocalStorageController(StorageController):
             TAG_ROOT_PATH
         ]
 
-    def _build_subdir(self, blob: Blob) -> str:
+    def _build_subdir(self, blob) -> str:
         """get 1e/2f/ from blob where UUID starts with 1e2f"""
         return os.path.sep.join([
             blob.uuid.hex[0:2],
             blob.uuid.hex[2:4]
         ])
 
-    def _build_path(self, blob: Blob) -> str:
+    def _build_path(self, blob) -> str:
         root = self.tags.get(TAG_ROOT_PATH)
         return os.path.join(root, self._build_subdir(blob), blob.uuid.hex)
 
@@ -57,7 +56,7 @@ class LocalStorageController(StorageController):
             return False
         return True
 
-    def collect_attributes(self, blob: Blob):
+    def collect_attributes(self, blob):
         """Collect attributes such as size and mime type"""
         if os.path.exists(self._build_path(blob)):
             mime_type = magic.from_file(self._build_path(blob), mime=True)
@@ -67,7 +66,7 @@ class LocalStorageController(StorageController):
             blob.attributes[ATTR_BLOB_SIZE_BYTES] = str(size)
             LOGGER.debug('Updated size to Blob: %s bytes for %s', size, blob)
 
-    def get_read_handle(self, blob: Blob) -> RawIOBase:
+    def get_read_handle(self, blob) -> RawIOBase:
         fs_path = self._build_path(blob)
         LOGGER.debug('LocalStorageController::Retrieve blob=%s file=%s', blob, fs_path)
         if os.path.exists(fs_path) and os.path.isfile(fs_path):
@@ -75,14 +74,14 @@ class LocalStorageController(StorageController):
         LOGGER.warning("File does not exist or is not a file: %s", fs_path)
         return None
 
-    def commit(self, blob: Blob, handle: RawIOBase):
+    def commit(self, blob, handle: RawIOBase):
         fs_path = self._build_path(blob)
         os.makedirs(os.path.dirname(fs_path), exist_ok=True)
         LOGGER.debug('LocalStorageController::Commit blob=%s file=%s', blob, fs_path)
         with open(fs_path, 'wb') as _dest:
             return copyfileobj(handle, _dest)
 
-    def delete(self, blob: Blob):
+    def delete(self, blob):
         fs_path = self._build_path(blob)
         os.makedirs(os.path.dirname(fs_path), exist_ok=True)
         # Not file_like, delete file if it exists
@@ -102,11 +101,11 @@ class AsyncLocalStorageController(AsyncStorageController):
     def __init__(self, tags: dict):
         self.tags = tags
 
-    def _build_path(self, blob: Blob) -> str:
+    def _build_path(self, blob) -> str:
         root = self.tags.get(TAG_ROOT_PATH)
         return os.path.join(root, blob.uuid.hex)
 
-    async def _get_read_stream(self, blob: Blob) -> AsyncIterator[bytes]:
+    async def _get_read_stream(self, blob) -> AsyncIterator[bytes]:
         """Yield 64 KB chunks from the blob file asynchronously."""
         fs_path = self._build_path(blob)
         async with aiofiles.open(fs_path, 'rb') as f:
@@ -116,7 +115,7 @@ class AsyncLocalStorageController(AsyncStorageController):
                     break
                 yield chunk
 
-    async def _commit(self, blob: Blob, stream: AsyncIterator[bytes]) -> None:
+    async def _commit(self, blob, stream: AsyncIterator[bytes]) -> None:
         """Write blob data from an async iterator to the filesystem."""
         fs_path = self._build_path(blob)
         os.makedirs(os.path.dirname(fs_path), exist_ok=True)
@@ -124,7 +123,7 @@ class AsyncLocalStorageController(AsyncStorageController):
             async for chunk in stream:
                 await f.write(chunk)
 
-    async def _collect_attributes(self, blob: Blob) -> dict:
+    async def _collect_attributes(self, blob) -> dict:
         """Collect size and MIME type using stdlib; update blob.attributes."""
         fs_path = self._build_path(blob)
         size = os.path.getsize(fs_path)
@@ -138,7 +137,7 @@ class AsyncLocalStorageController(AsyncStorageController):
             ATTR_BLOB_MIME: mime_type,
         }
 
-    async def _delete(self, blob: Blob) -> None:
+    async def _delete(self, blob) -> None:
         """Delete the blob file asynchronously."""
         fs_path = self._build_path(blob)
         try:

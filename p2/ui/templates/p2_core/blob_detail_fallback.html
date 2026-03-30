@@ -1,25 +1,15 @@
 {% load i18n %}
-{% load p2_ui %}
-
-<style>
-  iframe.blob-payload {
-    height: calc(100vh - 152px - 35px - 35px);
-    width: 100%;
-  }
-</style>
 <div class="blob-detail-container">
-  <h3>{% trans "We're not sure how to preview this file." %}</h3><br>
-  <button class="btn btn-primary show-iframe">{% trans 'Try anyway' %}</button>
+  <p class="text-muted">{% trans "No preview available for this file type." %}</p>
+  <button class="btn btn-secondary btn-sm show-iframe">{% trans 'Try anyway' %}</button>
 </div>
-
-{% block scripts %}
 <script>
-  $('button.show-iframe').on('click', (e) => {
-    $('button.show-iframe').parent().empty();
-    $('<iframe>', {
-      src: '{% url "p2_ui:core-blob-inline" pk=object.pk %}',
-      class: "blob-payload",
-    }).appendTo('.blob-detail-container');
+  document.querySelector('button.show-iframe').addEventListener('click', function() {
+    var c = document.querySelector('.blob-detail-container');
+    c.innerHTML = '';
+    var f = document.createElement('iframe');
+    f.src = "{% url 'p2_ui:core-blob-inline' volume_pk=object.volume.pk blob_path=object.path %}";
+    f.style = 'width:100%;height:calc(100vh - 200px);border:none;';
+    c.appendChild(f);
   });
 </script>
-{% endblock %}

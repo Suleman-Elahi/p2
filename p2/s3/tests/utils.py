@@ -6,6 +6,7 @@ from django.contrib.auth.models import User
 from django.test import LiveServerTestCase
 
 from p2.api.models import APIKey
+from p2.core.acl import VolumeACL
 from p2.core.models import Volume
 from p2.core.tests.utils import get_test_storage
 from p2.s3.constants import TAG_S3_DEFAULT_STORAGE
@@ -27,6 +28,11 @@ class S3TestCase(LiveServerTestCase):
         self.storage.save()
         self.volume = Volume.objects.create(
             name='test-1', storage=self.storage)
+        VolumeACL.objects.create(
+            volume=self.volume,
+            user=self.user,
+            permissions=['read', 'write', 'delete', 'list', 'admin'],
+        )
         session = boto3.session.Session()
         self.boto3 = session.client(
             service_name='s3',

@@ -1,6 +1,6 @@
 {% load p2_ui %}
-
-<video controls preload="metadata" style="width: 100%; max-height: 70vh;">
-  <source src="{% url 'p2_ui:core-blob-inline' pk=object.pk %}" type="{{ object|get_attribute:'p2.core.constants.ATTR_BLOB_MIME' }}">
+<video controls preload="metadata" style="width:100%;max-height:70vh;">
+  <source src="{% url 'p2_ui:core-blob-inline' volume_pk=object.volume.pk blob_path=object.path %}"
+          type="{{ object.attributes|get_item:'blob.p2.io/mime'|default:'video/mp4' }}">
   Your browser does not support the video element.
 </video>

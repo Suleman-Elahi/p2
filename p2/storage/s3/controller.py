@@ -8,7 +8,6 @@ import boto3
 from botocore.exceptions import ClientError
 
 from p2.core.constants import ATTR_BLOB_MIME, ATTR_BLOB_SIZE_BYTES
-from p2.core.models import Blob
 from p2.core.storages.base import AsyncStorageController, StorageController, async_retry
 from p2.storage.s3.constants import (TAG_ACCESS_KEY, TAG_ENDPOINT,
                                      TAG_ENDPOINT_SSL_VERIFY, TAG_REGION,
@@ -41,7 +40,7 @@ class S3StorageController(StorageController):
             TAG_REGION,
         ]
 
-    def collect_attributes(self, blob: Blob):
+    def collect_attributes(self, blob):
         """Collect attributes such as size and mime type"""
 
     def _ensure_bucket_exists(self, name):
@@ -56,17 +55,17 @@ class S3StorageController(StorageController):
         except ClientError:
             pass
 
-    def get_read_handle(self, blob: Blob) -> RawIOBase:
+    def get_read_handle(self, blob) -> RawIOBase:
         _handle = SpooledTemporaryFile()
         self._ensure_bucket_exists(blob.volume.name)
         self._client.download_fileobj(blob.volume.name, blob.path, _handle)
         return _handle
 
-    def commit(self, blob: Blob, handle: RawIOBase):
+    def commit(self, blob, handle: RawIOBase):
         self._ensure_bucket_exists(blob.volume.name)
         self._client.upload_fileobj(handle, blob.volume.name, blob.path)
 
-    def delete(self, blob: Blob):
+    def delete(self, blob):
         self._ensure_bucket_exists(blob.volume.name)
         self._client.delete_object(
             Bucket=blob.volume.name,
@@ -96,7 +95,7 @@ class AsyncS3StorageController(AsyncStorageController):
             'verify': self.tags.get(TAG_ENDPOINT_SSL_VERIFY, True),
         }
 
-    async def _get_read_stream(self, blob: Blob) -> AsyncIterator[bytes]:
+    async def _get_read_stream(self, blob) -> AsyncIterator[bytes]:
         """Yield 64 KB chunks from S3 object body asynchronously.
 
         Note: retry is not applied here because async generators cannot be
@@ -115,7 +114,7 @@ class AsyncS3StorageController(AsyncStorageController):
                 yield chunk
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(IOError, ClientError))
-    async def _commit(self, blob: Blob, stream: AsyncIterator[bytes]) -> None:
+    async def _commit(self, blob, stream: AsyncIterator[bytes]) -> None:
         """Collect all chunks from the async iterator and upload to S3 via put_object."""
         import aiobotocore.session
         chunks = []
@@ -133,7 +132,7 @@ class AsyncS3StorageController(AsyncStorageController):
         LOGGER.debug('AsyncS3StorageController::Commit', extra={'blob': str(blob)})
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(IOError, ClientError))
-    async def _delete(self, blob: Blob) -> None:
+    async def _delete(self, blob) -> None:
         """Delete the S3 object asynchronously."""
         import aiobotocore.session
         session = aiobotocore.session.get_session()
@@ -145,7 +144,7 @@ class AsyncS3StorageController(AsyncStorageController):
         LOGGER.debug('AsyncS3StorageController::Delete', extra={'blob': str(blob)})
 
     @async_retry(max_attempts=3, base_delay=1.0, exceptions=(IOError, ClientError))
-    async def _collect_attributes(self, blob: Blob) -> dict:
+    async def _collect_attributes(self, blob) -> dict:
         """Call head_object to get size and content-type; update blob.attributes."""
         import aiobotocore.session
         session = aiobotocore.session.get_session()

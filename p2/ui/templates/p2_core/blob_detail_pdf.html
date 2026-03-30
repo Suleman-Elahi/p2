@@ -1,3 +1,1 @@
-{% load p2_ui %}
-
-<iframe src="{% url 'p2_ui:core-blob-inline' pk=object.pk %}" style="width: 100%; height: calc(100vh - 200px); border: none;"></iframe>
+<iframe src="{% url 'p2_ui:core-blob-inline' volume_pk=object.volume.pk blob_path=object.path %}" style="width:100%;height:calc(100vh - 200px);border:none;"></iframe>

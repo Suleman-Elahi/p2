@@ -18,9 +18,6 @@ from p2.lib.views import CreateAssignPermView
 from p2.serve.forms import ServeRuleDebugForm, ServeRuleForm
 from p2.serve.grpc import Serve, hijack_log
 from p2.serve.models import ServeRule
-from p2.core.models import Blob
-
-
 class ServeRuleListView(LoginRequiredMixin, ListView):
     """List all serve rules the user has access to"""
 
@@ -114,8 +111,7 @@ class ServeRuleDebugView(PermissionRequiredMixin, FormView):
                 lookup = _mw.rule_lookup(request, self.get_object(), match_object)
         except Exception as exc:  # pylint: disable=broad-except
             log_output = StringIO(str(exc))
-        blob = Blob.objects.filter(**lookup)
-        log_output.write(f"Found object {blob}\n")
+        log_output.write(f"Parsed lookup dict {lookup}\n")
         log_output.seek(0)
         form = ServeRuleDebugForm(
             data={

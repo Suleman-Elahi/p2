@@ -25,7 +25,7 @@
           Browse blobs saved in this Volume.
           {% endblocktrans %}
         </h6>
-        <a href="{% url 'p2_ui:core-blob-list' pk=volume.pk %}" class="card-link btn btn-outline btn-sm btn-primary">{% trans 'Browse' %}</a>
+        <a href="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}" class="card-link btn btn-outline btn-sm btn-primary">{% trans 'Browse' %}</a>
       </div>
     </div>
   </div>

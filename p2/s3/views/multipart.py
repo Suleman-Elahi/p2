@@ -1,349 +1,239 @@
 """p2 S3 Multipart Upload views"""
 import asyncio
 import logging
+import os
+import shutil
+import uuid
+import hashlib
+import json
 from time import time
-from uuid import uuid4
 from xml.etree import ElementTree
 
-from arq import create_pool
-from arq.connections import RedisSettings
+import aiofiles
 from django.conf import settings
 from django.http.response import HttpResponse
+from django.utils.timezone import now
 
-from p2.components.expire.constants import TAG_EXPIRE_DATE
 from p2.core.acl import VolumeACL
-from p2.core.constants import ATTR_BLOB_HASH_MD5, ATTR_BLOB_SIZE_BYTES
-from p2.core.models import Blob
+from p2.core.constants import ATTR_BLOB_HASH_MD5, ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME, ATTR_BLOB_STAT_CTIME, ATTR_BLOB_MIME, ATTR_BLOB_IS_FOLDER
 from p2.core.prefix_helper import make_absolute_path
-from p2.s3.constants import (TAG_S3_MULTIPART_BLOB_PART,
-                             TAG_S3_MULTIPART_BLOB_TARGET_BLOB,
-                             TAG_S3_MULTIPART_BLOB_UPLOAD_ID, XML_NAMESPACE)
-from p2.core.storages.base import AsyncStorageController
+from p2.s3.constants import XML_NAMESPACE
 from p2.s3.http import XMLResponse
 from p2.s3.views.common import S3View
+from p2.s3 import p2_s3_meta
 
-logger = logging.getLogger(__name__)
-
-DEFAULT_BLOB_EXPIRY = 86400
-
+LOGGER = logging.getLogger(__name__)
 
 class MultipartUploadView(S3View):
-    """Multipart-Object related views -- all handlers are async."""
+    """Multipart-Object handling via LSM engine"""
 
-    async def post(self, request, bucket, path):
+    async def dispatch(self, request, bucket, path):
+        if request.method == 'POST':
+            if 'uploads' in request.GET:
+                return await self._create_multipart(request, bucket, path)
+            elif 'uploadId' in request.GET:
+                return await self._complete_multipart(request, bucket, path)
+        elif request.method == 'PUT':
+            if 'partNumber' in request.GET and 'uploadId' in request.GET:
+                return await self._upload_part(request, bucket, path)
+        elif request.method == 'DELETE':
+            if 'uploadId' in request.GET:
+                return await self._abort_multipart(request, bucket, path)
+        elif request.method == 'GET':
+            if 'uploadId' in request.GET:
+                return await self._list_parts(request, bucket, path)
+                
+        return HttpResponse(status=405)
+
+    async def _create_multipart(self, request, bucket, path):
         volume = await self.get_volume(request.user, bucket, 'write')
-        if 'uploadId' in request.GET:
-            return await self.post_handle_mp_complete(request, volume, path)
-        return await self.post_handle_mp_initiate(request, volume, path)
-
-    async def post_handle_mp_complete(self, request, volume, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadComplete.html"""
-        upload_id = request.GET.get('uploadId')
-        exists = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).aexists()
-        if not exists:
-            return HttpResponse(status=404)
-
-        try:
-            pool = await create_pool(RedisSettings.from_dsn(settings.ARQ_REDIS_URL))
-            try:
-                await pool.enqueue_job(
-                    "complete_multipart",
-                    upload_id,
-                    request.user.pk,
-                    str(volume.pk),
-                    path,
-                )
-            finally:
-                await pool.aclose()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("post_handle_mp_complete: failed to enqueue: %s", exc)
-            return HttpResponse(status=500)
-
-        return HttpResponse(status=200)
-
-    async def post_handle_mp_initiate(self, request, volume, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadInitiate.html"""
-        existing = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).afirst()
+        upload_id = uuid.uuid4().hex
+        
+        internal_key = f"/.multipart/{upload_id}/_meta"
+        engine = await self.get_engine(volume)
+        
+        engine.put(internal_key, json.dumps({
+            "target_path": path,
+            "content_type": request.META.get('CONTENT_TYPE', 'application/octet-stream')
+        }))
 
         root = ElementTree.Element("{%s}InitiateMultipartUploadResult" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "Bucket").text = volume.name
-        ElementTree.SubElement(root, "Key").text = path.lstrip('/')
-        upload_id = uuid4().hex
-
-        if existing is not None:
-            blob = existing
-        else:
-            blob = await Blob.objects.acreate(
-                path=make_absolute_path("/%s_%s/part_%d" % (path, upload_id, 1)),
-                volume=volume,
-                tags={
-                    TAG_S3_MULTIPART_BLOB_PART: 1,
-                    TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-                    TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-                    TAG_EXPIRE_DATE: time() + DEFAULT_BLOB_EXPIRY,
-                }
-            )
-            await VolumeACL.objects.aupdate_or_create(
-                volume=volume,
-                user=request.user,
-                defaults={'permissions': ['read', 'write']},
-            )
-
-        ElementTree.SubElement(root, "UploadId").text = blob.tags[TAG_S3_MULTIPART_BLOB_UPLOAD_ID]
+        ElementTree.SubElement(root, "Bucket").text = bucket
+        ElementTree.SubElement(root, "Key").text = path[1:] if path.startswith('/') else path
+        ElementTree.SubElement(root, "UploadId").text = upload_id
         return XMLResponse(root)
 
-    async def put(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadUploadPart.html"""
+    async def _upload_part(self, request, bucket, path):
         volume = await self.get_volume(request.user, bucket, 'write')
-        upload_id = request.GET.get('uploadId')
-        part_number = int(request.GET.get('partNumber'))
-
-        exists = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).aexists()
-        if not exists:
-            return HttpResponse(status=404)
-
-        # UploadPartCopy: read data from source blob instead of request body
-        copy_source = request.META.get('HTTP_X_AMZ_COPY_SOURCE')
-        if copy_source:
-            copy_source = copy_source.lstrip('/')
-            src_bucket, src_key = copy_source.split('/', 1)
-            src_key = '/' + src_key
-            src_volume = await self.get_volume(request.user, src_bucket, 'read')
-            src_blob = await Blob.objects.filter(
-                path=src_key, volume=src_volume,
-            ).select_related('volume__storage').afirst()
-            if src_blob is None:
-                return HttpResponse(status=404)
-            controller = src_volume.storage.controller
-            if isinstance(controller, AsyncStorageController):
-                chunks = []
-                async for chunk in controller.get_read_stream(src_blob):
-                    chunks.append(chunk)
-                data = b''.join(chunks)
+        upload_id = request.GET['uploadId']
+        part_number = int(request.GET['partNumber'])
+        
+        blob_uuid = uuid.uuid4().hex
+        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, "parts", upload_id)
+        os.makedirs(dir_path, exist_ok=True)
+        fs_path = os.path.join(dir_path, f"{part_number}_{blob_uuid}")
+        
+        md5_hash = hashlib.md5()
+        blob_size = 0
+        
+        async with aiofiles.open(fs_path, 'wb') as f:
+            if hasattr(request, '__aiter__'):
+                async for chunk in request:
+                    await f.write(chunk)
+                    md5_hash.update(chunk)
+                    blob_size += len(chunk)
             else:
-                data = await asyncio.to_thread(src_blob.read)
-        else:
-            data = request.body
+                data = await asyncio.to_thread(request.read)
+                await f.write(data)
+                md5_hash.update(data)
+                blob_size = len(data)
+                
+        final_md5 = md5_hash.hexdigest()
 
-        blob = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_PART: part_number,
-            'volume': volume,
-        }).afirst()
-
-        if blob is None:
-            blob = await Blob.objects.acreate(
-                path=make_absolute_path("/%s_%s/part_%d" % (path, upload_id, part_number)),
-                volume=volume,
-                tags={
-                    TAG_S3_MULTIPART_BLOB_PART: part_number,
-                    TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-                    TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-                    TAG_EXPIRE_DATE: time() + DEFAULT_BLOB_EXPIRY,
-                }
-            )
-
-        blob.write(data)
-        await blob.asave()
-
+        
+        engine = await self.get_engine(volume)
+        internal_key = f"/.multipart/{upload_id}/{part_number}"
+        
+        engine.put(internal_key, json.dumps({
+            "fs_path": fs_path,
+            "md5": final_md5,
+            "size": blob_size
+        }))
+        
         response = HttpResponse(status=200)
-        response['ETag'] = blob.attributes.get(ATTR_BLOB_HASH_MD5)
-        if copy_source:
-            response['x-amz-copy-source-version-id'] = ''
+        response['ETag'] = f'"{final_md5}"'
         return response
 
-    async def delete(self, request, bucket, path):
-        """AbortMultipartUpload — DELETE /<bucket>/<key>?uploadId=...
-        https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadAbort.html"""
-        upload_id = request.GET.get('uploadId')
-        if not upload_id:
-            return HttpResponse(status=400)
+    async def _complete_multipart(self, request, bucket, path):
         volume = await self.get_volume(request.user, bucket, 'write')
-        # Delete all part blobs for this upload
-        async for part in Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).aiterator():
-            await part.adelete()
+        upload_id = request.GET['uploadId']
+        engine = await self.get_engine(volume)
+        
+        try:
+            body = request.body
+            root = ElementTree.fromstring(body)
+        except Exception:
+            return HttpResponse(status=400)
+            
+        parts_to_merge = []
+        for part_el in root.iter("{%s}Part" % XML_NAMESPACE):
+            num = part_el.find("{%s}PartNumber" % XML_NAMESPACE)
+            etag = part_el.find("{%s}ETag" % XML_NAMESPACE)
+            parts_to_merge.append({
+                "number": int(num.text),
+                "etag": etag.text.strip('"')
+            })
+            
+        if not parts_to_merge:
+            for part_el in root.iter("Part"):
+                num = part_el.find("PartNumber")
+                etag = part_el.find("ETag")
+                parts_to_merge.append({
+                    "number": int(num.text),
+                    "etag": etag.text.strip('"')
+                })
+            
+        valid_parts = []
+        for p in parts_to_merge:
+            num = p["number"]
+            meta_str = engine.get(f"/.multipart/{upload_id}/{num}")
+            if not meta_str: return HttpResponse(status=400)
+            attr = json.loads(meta_str)
+            if attr["md5"] != p["etag"]: return HttpResponse(status=400)
+            valid_parts.append(attr)
+            
+        blob_uuid = uuid.uuid4().hex
+        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+        os.makedirs(dir_path, exist_ok=True)
+        final_fs_path = os.path.join(dir_path, blob_uuid)
+        internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+        
+        total_size = 0
+        
+        async with aiofiles.open(final_fs_path, 'wb') as outfile:
+            for part in valid_parts:
+                async with aiofiles.open(part["fs_path"], 'rb') as infile:
+                    chunk = await infile.read(1 << 20)  # 1 MB
+                    while chunk:
+                        await outfile.write(chunk)
+                        total_size += len(chunk)
+                        chunk = await infile.read(1 << 20)  # 1 MB
+                os.remove(part["fs_path"])
+                engine.delete(f"/.multipart/{upload_id}/{part['number']}")
+                
+        final_etag = f"multipart-{len(valid_parts)}"
+        
+        meta_str = engine.get(f"/.multipart/{upload_id}/_meta")
+        m_attr = json.loads(meta_str) if meta_str else {}
+        engine.delete(f"/.multipart/{upload_id}/_meta")
+        try:
+            os.rmdir(os.path.join("/storage", volume.uuid.hex, "parts", upload_id))
+        except OSError: pass
+
+        engine.put(path, json.dumps({
+            ATTR_BLOB_MIME: m_attr.get('content_type', 'application/octet-stream'),
+            ATTR_BLOB_SIZE_BYTES: str(total_size),
+            ATTR_BLOB_IS_FOLDER: False,
+            ATTR_BLOB_STAT_MTIME: str(now()),
+            ATTR_BLOB_STAT_CTIME: str(now()),
+            'blob.p2.io/hash/md5': final_etag,
+            'internal_path': internal_path
+        }))
+        
+        res = ElementTree.Element("{%s}CompleteMultipartUploadResult" % XML_NAMESPACE)
+        ElementTree.SubElement(res, "Location").text = f"http://{request.get_host()}/{bucket}{path}"
+        ElementTree.SubElement(res, "Bucket").text = bucket
+        ElementTree.SubElement(res, "Key").text = path[1:] if path.startswith('/') else path
+        ElementTree.SubElement(res, "ETag").text = f'"{final_etag}"'
+        
+        return XMLResponse(res)
+
+    async def _abort_multipart(self, request, bucket, path):
+        volume = await self.get_volume(request.user, bucket, 'write')
+        upload_id = request.GET['uploadId']
+        engine = await self.get_engine(volume)
+        
+        prefix = f"/.multipart/{upload_id}/"
+        items = engine.list(prefix, None, 10000)
+        for key, val in items:
+            try:
+                attr = json.loads(val)
+                fs_path = attr.get('fs_path')
+                if fs_path: os.remove(fs_path)
+            except Exception: pass
+            engine.delete(key)
+            
+        try:
+            shutil.rmtree(os.path.join("/storage", volume.uuid.hex, "parts", upload_id))
+        except OSError: pass
+            
         return HttpResponse(status=204)
 
-    async def get(self, request, bucket, path):
-        """ListParts — GET /<bucket>/<key>?uploadId=...
-        https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadListParts.html"""
-        upload_id = request.GET.get('uploadId')
-        if not upload_id:
-            return HttpResponse(status=400)
+    async def _list_parts(self, request, bucket, path):
         volume = await self.get_volume(request.user, bucket, 'read')
-        max_parts = int(request.GET.get('max-parts', 1000))
-        part_number_marker = int(request.GET.get('part-number-marker', 0))
-
-        root = ElementTree.Element("{%s}ListPartsResult" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "Bucket").text = bucket
-        ElementTree.SubElement(root, "Key").text = path.lstrip('/')
-        ElementTree.SubElement(root, "UploadId").text = upload_id
-
-        parts = []
-        async for blob in Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).order_by('path').aiterator():
-            part_num = blob.tags.get(TAG_S3_MULTIPART_BLOB_PART, 0)
-            if int(part_num) > part_number_marker:
-                parts.append(blob)
-
-        is_truncated = len(parts) > max_parts
-        parts = parts[:max_parts]
-
-        ElementTree.SubElement(root, "IsTruncated").text = str(is_truncated).lower()
-        ElementTree.SubElement(root, "MaxParts").text = str(max_parts)
-
-        for blob in parts:
-            part_el = ElementTree.SubElement(root, "Part")
-            ElementTree.SubElement(part_el, "PartNumber").text = str(
-                blob.tags.get(TAG_S3_MULTIPART_BLOB_PART, 0))
-            ElementTree.SubElement(part_el, "ETag").text = blob.attributes.get(ATTR_BLOB_HASH_MD5, '')
-            ElementTree.SubElement(part_el, "Size").text = str(
-                blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
-
-        return XMLResponse(root)
-
-
-logger = logging.getLogger(__name__)
-
-DEFAULT_BLOB_EXPIRY = 86400
-
-
-class MultipartUploadView(S3View):
-    """Multipart-Object related views -- all handlers are async. Requirements: 2.1, 2.4"""
-
-    ## HTTP Method handlers
-
-    async def post(self, request, bucket, path):
-        """Post handler"""
-        volume = await self.get_volume(request.user, bucket, 'write')
-        if 'uploadId' in request.GET:
-            return await self.post_handle_mp_complete(request, volume, path)
-        return await self.post_handle_mp_initiate(request, volume, path)
-
-    ## API Handlers
-
-    async def post_handle_mp_complete(self, request, volume, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadComplete.html"""
-        upload_id = request.GET.get('uploadId')
-        # Ensure multipart upload has started -- verify at least one part blob exists.
-        exists = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).aexists()
-        if not exists:
-            return HttpResponse(status=404)
-
-        try:
-            pool = await create_pool(RedisSettings.from_dsn(settings.ARQ_REDIS_URL))
-            try:
-                await pool.enqueue_job(
-                    "complete_multipart",
-                    upload_id,
-                    request.user.pk,
-                    str(volume.pk),
-                    path,
-                )
-            finally:
-                await pool.aclose()
-        except Exception as exc:  # noqa: BLE001
-            logger.error("post_handle_mp_complete: failed to enqueue complete_multipart: %s", exc)
-            return HttpResponse(status=500)
-
-        return HttpResponse(status=200)
-
-    async def post_handle_mp_initiate(self, request, volume, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadInitiate.html"""
-        # Check if an existing multipart upload exists for this path.
-        existing = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).afirst()
-
-        root = ElementTree.Element("{%s}InitiateMultipartUploadResult" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "Bucket").text = volume.name
-        ElementTree.SubElement(root, "Key").text = path.lstrip('/')
-        upload_id = uuid4().hex
-
-        if existing is not None:
-            blob = existing
-        else:
-            blob = await Blob.objects.acreate(
-                path=make_absolute_path("/%s_%s/part_%d" % (path, upload_id, 1)),
-                volume=volume,
-                tags={
-                    TAG_S3_MULTIPART_BLOB_PART: 1,
-                    TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-                    TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-                    TAG_EXPIRE_DATE: time() + DEFAULT_BLOB_EXPIRY,
-                }
-            )
-            await VolumeACL.objects.aupdate_or_create(
-                volume=volume,
-                user=request.user,
-                defaults={'permissions': ['read', 'write']},
-            )
-
-        ElementTree.SubElement(root, "UploadId").text = blob.tags[TAG_S3_MULTIPART_BLOB_UPLOAD_ID]
-        return XMLResponse(root)
-
-    async def put(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/mpUploadUploadPart.html"""
-        volume = await self.get_volume(request.user, bucket, 'write')
-        upload_id = request.GET.get('uploadId')
-        part_number = int(request.GET.get('partNumber'))
-
-        # Ensure multipart upload has started -- verify the upload ID exists.
-        exists = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'volume': volume,
-        }).aexists()
-        if not exists:
-            return HttpResponse(status=404)
-
-        # Create new upload part, or reuse existing part and overwrite data.
-        blob = await Blob.objects.filter(**{
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-            'tags__%s' % TAG_S3_MULTIPART_BLOB_PART: part_number,
-            'volume': volume,
-        }).afirst()
-
-        if blob is None:
-            blob = await Blob.objects.acreate(
-                path=make_absolute_path("/%s_%s/part_%d" % (path, upload_id, part_number)),
-                volume=volume,
-                tags={
-                    TAG_S3_MULTIPART_BLOB_PART: part_number,
-                    TAG_S3_MULTIPART_BLOB_TARGET_BLOB: path,
-                    TAG_S3_MULTIPART_BLOB_UPLOAD_ID: upload_id,
-                    TAG_EXPIRE_DATE: time() + DEFAULT_BLOB_EXPIRY,
-                }
-            )
-
-        blob.write(request.body)
-        await blob.asave()
-
-        response = HttpResponse(status=200)
-        response['ETag'] = blob.attributes.get(ATTR_BLOB_HASH_MD5)
-        return response
+        upload_id = request.GET['uploadId']
+        engine = await self.get_engine(volume)
+        
+        res = ElementTree.Element("{%s}ListPartsResult" % XML_NAMESPACE)
+        ElementTree.SubElement(res, "Bucket").text = bucket
+        ElementTree.SubElement(res, "Key").text = path[1:] if path.startswith('/') else path
+        ElementTree.SubElement(res, "UploadId").text = upload_id
+        
+        prefix = f"/.multipart/{upload_id}/"
+        items = engine.list(prefix, None, 10000)
+        
+        sorted_parts = []
+        for key, val in items:
+            pnum = key.split('/')[-1]
+            if pnum != '_meta':
+                sorted_parts.append((int(pnum), val))
+        
+        sorted_parts.sort(key=lambda x: x[0])
+        for num, val in sorted_parts:
+            attr = json.loads(val)
+            part_el = ElementTree.SubElement(res, "Part")
+            ElementTree.SubElement(part_el, "PartNumber").text = str(num)
+            ElementTree.SubElement(part_el, "ETag").text = f'"{attr["md5"]}"'
+            ElementTree.SubElement(part_el, "Size").text = str(attr["size"])
+            
+        return XMLResponse(res)

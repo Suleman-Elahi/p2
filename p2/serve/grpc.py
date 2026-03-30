@@ -1,18 +1,21 @@
-"""Serve gRPC functionality (async)"""
+"""Serve gRPC functionality (async)
+
+NOTE: get_blob_from_rule() and RetrieveFile() depended on the Blob ORM model
+which has been removed.  These are stubbed out — gRPC serving will be
+reimplemented using the p2_s3_meta LSM engine in a subsequent pass.
+"""
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from io import StringIO
 from logging import getLogger
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import unquote
 
 from django.contrib.auth.models import User
 from django.contrib.sessions.models import Session
 
 from p2.core.acl import has_volume_permission
-from p2.core.constants import TAG_BLOB_HEADERS
-from p2.core.models import Blob
 from p2.grpc.protos.serve_pb2 import ServeReply, ServeRequest
 from p2.grpc.protos.serve_pb2_grpc import ServeServicer
 from p2.serve.models import ServeRule
@@ -76,32 +79,12 @@ class Serve(ServeServicer):
             return AnonymousUser()
         return await User.objects.aget(pk=uid)
 
-    async def get_blob_from_rule(self, request: ServeRequest, user: Any) -> Optional[Blob]:
-        """Try to find a blob matching a ServeRule using async ORM queries."""
-        async for rule in ServeRule.objects.all():
-            regex_match = rule.matches(request)
-            if regex_match:
-                try:
-                    lookups = self._rule_lookup(request, rule, regex_match)
-                    blob = await Blob.objects.filter(**lookups).select_related('volume').afirst()
-                    if blob is None:
-                        continue
-                    if not await has_volume_permission(user, blob.volume, 'read'):
-                        continue
-                    return blob
-                except (IndexError, ValueError) as exc:
-                    LOGGER.warning(exc)
+    async def get_blob_from_rule(self, request: ServeRequest, user: Any) -> None:
+        """Stub: Blob lookup will be reimplemented against the LSM engine."""
+        LOGGER.warning("get_blob_from_rule: stubbed (Blob model removed), returning None")
         return None
 
     async def RetrieveFile(self, request: ServeRequest, context) -> ServeReply:
-        """Handle a file retrieval request asynchronously."""
-        user = await self.get_user(request)
-        req_ctx = RequestContext(user=user, path=unquote(request.url), headers=dict(request.headers))
-        blob = await self.get_blob_from_rule(request, req_ctx.user)
-        if not blob:
-            return ServeReply(matching=False, data=b'', headers={})
-        headers = blob.tags.get(TAG_BLOB_HEADERS, {})
-        chunks: List[bytes] = []
-        async for chunk in blob.volume.storage.controller.get_read_stream(blob):
-            chunks.append(chunk)
-        return ServeReply(matching=True, data=b''.join(chunks), headers=headers)
+        """Handle a file retrieval request — stubbed pending LSM reimplementation."""
+        LOGGER.warning("RetrieveFile: stubbed (Blob model removed), returning no-match reply")
+        return ServeReply(matching=False, data=b'', headers={})

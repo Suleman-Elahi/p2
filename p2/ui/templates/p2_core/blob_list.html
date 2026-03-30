@@ -1,5 +1,4 @@
 {% extends 'base/base.html' %}
-
 {% load i18n %}
 {% load p2_ui %}
 
@@ -10,20 +9,28 @@
       {% include 'blocks/messages.html' %}
       <nav aria-label="breadcrumb">
         <ol class="breadcrumb">
-          <li class="breadcrumb-item"><a href="{% url 'p2_ui:core-volume-detail' pk=volume.pk %}?prefix=/">{{ volume.name }}</a></li>
+          <li class="breadcrumb-item">
+            <a href="{% url 'p2_ui:core-volume-detail' pk=volume.pk %}">{{ volume.name }}</a>
+          </li>
           {% for crumb in breadcrumbs %}
             {% if not forloop.last %}
-              <li class="breadcrumb-item"><a href="{% url 'p2_ui:core-blob-list' pk=volume.pk %}?prefix={{ crumb.full }}">{{ crumb.part|truncatechars:160 }}</a></li>
-            {% endif %}
-            {% if forloop.last %}
+              <li class="breadcrumb-item">
+                <a href="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}?prefix={{ crumb.full }}">{{ crumb.part|truncatechars:160 }}</a>
+              </li>
+            {% else %}
               <li class="breadcrumb-item active" aria-current="page">{{ crumb.part|truncatechars:160 }}</li>
             {% endif %}
           {% endfor %}
         </ol>
       </nav>
-      <form action="{% url 'p2_api:volume-upload' pk=volume.pk %}?prefix={{ request.GET.prefix }}" class="dz" method="POST">
-        {% csrf_token %}
-        <div class="dz-message mb-3 p-3 border border-dashed rounded text-center text-muted" style="border-style: dashed !important; cursor: pointer;">
+
+      {# Upload dropzone — standalone form, no table inside #}
+      <div class="dz"
+           data-upload-url="{% url 'p2_api:volume-upload' pk=volume.pk %}?prefix={{ request.GET.prefix }}"
+           data-volume-pk="{{ volume.pk }}"
+           data-list-url="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}?prefix={{ request.GET.prefix }}">
+        <div class="dz-message mb-3 p-3 border rounded text-center text-muted"
+             style="border-style: dashed !important; cursor: pointer;">
           <i class="fa fa-upload fa-2x mb-2" aria-hidden="true"></i>
           <p class="mb-0">{% trans 'Drop files here or click to upload' %}</p>
         </div>
@@ -33,61 +40,101 @@
             <input type="file" id="folder-upload-input" webkitdirectory multiple style="display:none">
           </label>
         </div>
-        <table class="table table-striped table-bordered table-hover table-sm">
-          <thead class="thead-dark">
-            <tr>
-              <th>{% trans 'Path' %}</th>
-              <th>{% trans 'Size' %}</th>
-              <th>{% trans 'Actions' %}</th>
-            </tr>
-          </thead>
-          <tbody id="blob-table-body">
-            {% for prefix in prefixes %}
-            <tr>
-              <td>
-                <a href="?prefix={{ prefix.absolute_path }}">
-                  <i class="fa fa-folder" aria-hidden="true"></i>
-                  {{ prefix.relative_path }}
-                </a>
-              </td>
-              <td>—</td>
-              <td>—</td>
-            </tr>
-            {% endfor %}
-            {% for object in object_list %}
-            <tr>
-              <td>
-                {% if 'blob.p2.io/is_folder' in object.attributes %}
-                <a href="?prefix={{ object.path }}">
-                  <i class="fa fa-folder" aria-hidden="true"></i>
-                  {{ object.filename|truncatechars:160 }}
-                </a>
-                {% else %}
-                <a href="{% url 'p2_ui:core-blob-detail' pk=object.pk %}">
-                  <i class="fa fa-file" aria-hidden="true"></i>
-                  {{ object.filename|truncatechars:160 }}
-                </a>
-                {% endif %}
-              </td>
-              <td>{{ object|get_attribute:"p2.core.constants.ATTR_BLOB_SIZE_BYTES"|filesizeformat }}</td>
-              <td>
-                <a class="btn btn-sm btn-primary" href="{% url 'p2_ui:core-blob-download' pk=object.pk %}">
-                  <i class="fa fa-download text-light" aria-hidden="true"></i>
-                </a>
-                <a class="btn btn-sm btn-primary" href="{% url 'p2_ui:core-blob-update' pk=object.pk %}">
-                  <i class="fa fa-pencil text-light" aria-hidden="true"></i>
-                </a>
-                <a class="btn btn-sm btn-danger" href="{% url 'p2_ui:core-blob-delete' pk=object.pk %}">
-                  <i class="fa fa-trash text-light" aria-hidden="true"></i>
-                </a>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </form>
+      </div>
+
+      {# File/folder table — completely separate from the upload form #}
+      <table class="table table-striped table-bordered table-hover table-sm">
+        <thead class="thead-dark">
+          <tr>
+            <th>{% trans 'Name' %}</th>
+            <th>{% trans 'Size' %}</th>
+            <th>{% trans 'Actions' %}</th>
+          </tr>
+        </thead>
+        <tbody id="blob-table-body">
+          {% for prefix in prefixes %}
+          <tr>
+            <td>
+              <a href="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}?prefix={{ prefix.absolute_path }}">
+                <i class="fa fa-folder text-warning" aria-hidden="true"></i>
+                {{ prefix.relative_path }}
+              </a>
+            </td>
+            <td>
+              {% if prefix.count %}
+                {{ prefix.bytes|filesizeformat }} &middot; {{ prefix.count }} file{{ prefix.count|pluralize }}
+              {% else %}—{% endif %}
+            </td>
+            <td>
+              <a class="btn btn-sm btn-outline-secondary"
+                 href="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}?prefix={{ prefix.absolute_path }}"
+                 title="{% trans 'Open' %}">
+                <i class="fa fa-folder-open" aria-hidden="true"></i>
+              </a>
+              <a class="btn btn-sm btn-primary"
+                 href="{% url 'p2_ui:core-folder-download' volume_pk=volume.pk folder_prefix=prefix.absolute_path %}"
+                 title="{% trans 'Download as ZIP' %}">
+                <i class="fa fa-download text-light" aria-hidden="true"></i>
+              </a>
+              <button class="btn btn-sm btn-danger btn-delete-folder"
+                      data-url="{% url 'p2_ui:core-folder-delete' volume_pk=volume.pk folder_prefix=prefix.absolute_path %}"
+                      data-name="{{ prefix.relative_path }}"
+                      title="{% trans 'Delete folder' %}">
+                <i class="fa fa-trash text-light" aria-hidden="true"></i>
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+          {% for object in object_list %}
+          <tr>
+            <td>
+              <a href="{% url 'p2_ui:core-blob-detail' volume_pk=volume.pk blob_path=object.path %}">
+                <i class="fa fa-file" aria-hidden="true"></i>
+                {{ object.filename|truncatechars:160 }}
+              </a>
+            </td>
+            <td>{{ object.attributes|get_item:"blob.p2.io/size/bytes"|filesizeformat }}</td>
+            <td>
+              <a class="btn btn-sm btn-primary"
+                 href="{% url 'p2_ui:core-blob-download' volume_pk=volume.pk blob_path=object.path %}"
+                 title="{% trans 'Download' %}">
+                <i class="fa fa-download text-light" aria-hidden="true"></i>
+              </a>
+              <button class="btn btn-sm btn-danger btn-delete-blob"
+                      data-url="{% url 'p2_ui:core-blob-delete' volume_pk=volume.pk blob_path=object.path %}"
+                      data-name="{{ object.filename }}"
+                      title="{% trans 'Delete' %}">
+                <i class="fa fa-trash text-light" aria-hidden="true"></i>
+              </button>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
     </div>
   </div>
 </div>
-{% include 'blocks/pagination.html' %}
+
+<script>
+// Delete blob via fetch POST — no nested form needed
+document.addEventListener('click', function(e) {
+  var btn = e.target.closest('.btn-delete-blob, .btn-delete-folder');
+  if (!btn) return;
+  var name = btn.dataset.name || 'this item';
+  var label = btn.classList.contains('btn-delete-folder') ? 'folder "' + name + '" and all its contents' : '"' + name + '"';
+  if (!confirm('Delete ' + label + '?')) return;
+  btn.disabled = true;
+  fetch(btn.dataset.url, {
+    method: 'POST',
+    headers: { 'X-CSRFToken': (document.cookie.match(/csrftoken=([^;]+)/) || [])[1] || '' }
+  }).then(function() {
+    var row = btn.closest('tr');
+    if (row) row.remove();
+  }).catch(function() {
+    btn.disabled = false;
+    alert('Delete failed.');
+  });
+});
+</script>
 {% endblock %}

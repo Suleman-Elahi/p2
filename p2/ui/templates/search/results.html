@@ -10,39 +10,7 @@
       {% include 'blocks/messages.html' %}
       {% if object_list %}
       <h1>{% trans 'Search Results' %}</h1>
-      <table class="table table-striped table-bordered table-hover table-sm">
-        <thead class="thead-dark">
-          <tr>
-            <th>{% trans 'Path' %}</th>
-            <th>{% trans 'Size' %}</th>
-            <th>{% trans 'Actions' %}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for object in object_list %}
-          <tr>
-            <td>
-              <a href="{% url 'p2_ui:core-blob-detail' pk=object.pk %}">
-                <i class="fa fa-file" aria-hidden="true"></i>
-                {{ object.filename|truncatechars:160 }}
-              </a>
-            </td>
-            <td>{{ object|get_attribute:"p2.core.constants.ATTR_BLOB_SIZE_BYTES"|filesizeformat }}</td>
-            <td>
-              <a class="btn btn-sm btn-primary" href="{% url 'p2_ui:core-blob-download' pk=object.pk %}">
-                <i class="fa fa-download text-light" aria-hidden="true"></i>
-              </a>
-              <a class="btn btn-sm btn-primary" href="{% url 'p2_ui:core-blob-update' pk=object.pk %}">
-                <i class="fa fa-pencil text-light" aria-hidden="true"></i>
-              </a>
-              <a class="btn btn-sm btn-danger" href="{% url 'p2_ui:core-blob-delete' pk=object.pk %}">
-                <i class="fa fa-trash text-light" aria-hidden="true"></i>
-              </a>
-            </td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <p class="text-muted">{% trans 'Object search is temporarily disabled while the backend metadata engine is being upgraded.' %}</p>
       {% else %}
       <h3>{% trans 'Nothing found.' %}</h3>
       {% endif %}

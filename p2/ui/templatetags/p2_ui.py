@@ -62,6 +62,14 @@ def startswith(text, starts):
     return False
 
 
+@register.filter('get_item')
+def get_item(dictionary, key):
+    """Access a dict by key in templates: {{ mydict|get_item:key }}"""
+    if isinstance(dictionary, dict):
+        return dictionary.get(key)
+    return None
+
+
 @register.filter('json')
 def json_pretty(obj):
     """Convert obj into pretty-printed JSON"""

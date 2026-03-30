@@ -20,15 +20,7 @@ import sys
 from p2 import __version__
 from p2.lib.config import CONFIG
 
-# Compat shim: old migrations reference django.contrib.postgres.fields.jsonb
-# which was removed in Django 4+. Redirect to django.db.models.JSONField.
-import django.contrib.postgres.fields as _pg_fields
-import django.db.models as _djmodels
-import types
-_jsonb_mod = types.ModuleType("django.contrib.postgres.fields.jsonb")
-_jsonb_mod.JSONField = _djmodels.JSONField
-sys.modules["django.contrib.postgres.fields.jsonb"] = _jsonb_mod
-_pg_fields.jsonb = _jsonb_mod
+# Compat shim removed since we are no longer using django.contrib.postgres.
 
 # ---------------------------------------------------------------------------
 # Base paths
@@ -52,6 +44,10 @@ TEST = any('test' in arg for arg in sys.argv)
 
 CORS_ORIGIN_ALLOW_ALL = DEBUG
 SECURE_SSL_REDIRECT = False
+X_FRAME_OPTIONS = "SAMEORIGIN"
+
+# Set True in production when Nginx handles X-Accel-Redirect (zero-copy reads)
+USE_X_ACCEL_REDIRECT = CONFIG.y_bool("storage.use_x_accel_redirect", default=False)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ALLOWED_HOSTS = ['*']
@@ -69,7 +65,6 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django.contrib.sites',
-    'django.contrib.postgres',
     # Third-party
     'rest_framework',
     'rest_framework_simplejwt',
@@ -134,22 +129,32 @@ ASGI_APPLICATION = 'p2.core.asgi.application'
 DATA_UPLOAD_MAX_MEMORY_SIZE = 536870912
 
 # ---------------------------------------------------------------------------
-# Database — psycopg 3.x async-capable engine
+# Database — Turso (libSQL) async-capable engine
 # ---------------------------------------------------------------------------
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'HOST': CONFIG.y('postgresql.host', 'localhost'),
-        'NAME': CONFIG.y('postgresql.name', 'p2'),
-        'USER': CONFIG.y('postgresql.user', 'p2'),
-        'PASSWORD': CONFIG.y('postgresql.password', ''),
-        'OPTIONS': {
-            # psycopg 3.x uses the 'psycopg' driver name
-            'pool': False,
-        },
+_libsql_sync_url = CONFIG.y('libsql.sync_url', '')
+_db_path = CONFIG.y('libsql.file', os.path.join(BASE_DIR, 'p2-control.db'))
+
+if _libsql_sync_url:
+    # Turso / embedded replica mode — needs file:// URI
+    DATABASES = {
+        'default': {
+            'ENGINE': 'libsql.db.backends.sqlite3',
+            'NAME': f'file:{_db_path}',
+            'OPTIONS': {
+                'sync_url': _libsql_sync_url,
+                'auth_token': CONFIG.y('libsql.auth_token', ''),
+            },
+        }
     }
-}
+else:
+    # Local dev — plain SQLite (no Turso connection needed)
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': _db_path,
+        }
+    }
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 

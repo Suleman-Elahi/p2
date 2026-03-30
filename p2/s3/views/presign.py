@@ -41,7 +41,7 @@ class PresignedURLView(LoginRequiredMixin, View):
         if method not in ("GET", "PUT", "HEAD"):
             return JsonResponse({"error": "method must be GET, PUT, or HEAD"}, status=400)
 
-        key = '/' + key.lstrip('/')
-        object_url = f"{base_url}/{bucket}{key}"
+        key = key.lstrip('/')  # no leading slash — matches URL router capture
+        object_url = f"{base_url}/{bucket}/{key}"
         url = generate_presigned_url(object_url, bucket, key, method, expires_in)
         return JsonResponse({"url": url, "expires_in": expires_in})

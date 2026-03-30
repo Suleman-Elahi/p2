@@ -9,7 +9,7 @@ from django.http import HttpResponse
 from p2.core.acl import VolumeACL
 from p2.core.constants import (ATTR_BLOB_HASH_MD5, ATTR_BLOB_IS_FOLDER,
                                ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME)
-from p2.core.models import Blob, Storage, Volume
+from p2.core.models import Storage, Volume
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_DEFAULT_STORAGE,
                              TAG_S3_STORAGE_CLASS, XML_NAMESPACE)
 from p2.s3.cors import (apply_cors_headers, build_cors_xml,
@@ -126,107 +126,94 @@ class BucketView(S3View):
     # Bucket list with continuation tokens (ListObjectsV2)
     # -------------------------------------------------------------------------
 
-    def _etree_for_blob(self, blob):
+    def _etree_for_json(self, key, attributes_json):
+        import json
+        try:
+            attr = json.loads(attributes_json)
+        except Exception:
+            attr = {}
+
         content = ElementTree.Element("Contents")
-        ElementTree.SubElement(content, "Key").text = blob.path[1:]
-        mtime = blob.attributes.get(ATTR_BLOB_STAT_MTIME)
+        ElementTree.SubElement(content, "Key").text = key
+        mtime = attr.get(ATTR_BLOB_STAT_MTIME, '')
         ElementTree.SubElement(content, "LastModified").text = str(mtime) if mtime else ''
-        ElementTree.SubElement(content, "ETag").text = blob.attributes.get(ATTR_BLOB_HASH_MD5, '')
-        ElementTree.SubElement(content, "Size").text = str(blob.attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
-        ElementTree.SubElement(content, "StorageClass").text = \
-            blob.volume.storage.controller.tags.get(TAG_S3_STORAGE_CLASS, 'STANDARD')
+        etag = attr.get('blob.p2.io/hash/md5', '')
+        ElementTree.SubElement(content, "ETag").text = f'"{etag}"' if etag else '""'
+        ElementTree.SubElement(content, "Size").text = str(attr.get(ATTR_BLOB_SIZE_BYTES, 0))
+        ElementTree.SubElement(content, "StorageClass").text = 'STANDARD'
         return content
 
     async def handler_list(self, request, bucket):
-        """ListObjectsV2 with continuation token support."""
-        root = ElementTree.Element("{%s}ListBucketResult" % XML_NAMESPACE)
+        """ListObjectsV2 with continuation token support against LSM MetaEngine."""
         volume = await self.get_volume(request.user, bucket, 'list')
-
-        requested_prefix = request.GET.get('prefix', '')
-        max_keys = min(int(request.GET.get('max-keys', 1000)), 1000)
-        encoding_type = request.GET.get('encoding-type', 'url')
+        
+        prefix = request.GET.get('prefix', '')
         delimiter = request.GET.get('delimiter', '')
-        continuation_token = request.GET.get('continuation-token', '')
         start_after = request.GET.get('start-after', '')
+        continuation_token = request.GET.get('continuation-token', '')
+        
+        token = continuation_token if continuation_token else start_after
+        start_param = token if token else None
 
-        # Decode continuation token to get the last key seen
-        after_path = _decode_token(continuation_token) if continuation_token else start_after
-        if after_path and not after_path.startswith('/'):
-            after_path = '/' + after_path
+        try:
+            max_keys = int(request.GET.get('max-keys', 1000))
+        except ValueError:
+            max_keys = 1000
+        if max_keys > 1000: max_keys = 1000
 
-        # Build absolute prefix for querying (internal paths start with /)
-        abs_prefix = '/' + requested_prefix if requested_prefix else '/'
-
-        base_qs = Blob.objects.filter(
-            path__startswith=abs_prefix,
-            volume=volume,
-        ).exclude(
-            attributes__has_key=ATTR_BLOB_IS_FOLDER
-        ).order_by('path').select_related('volume__storage')
-
-        if after_path:
-            base_qs = base_qs.filter(path__gt=after_path)
-
-        # Collect blobs and compute common prefixes if delimiter is set
-        blobs = []
-        common_prefixes = set()
-        prefix_len = len(abs_prefix)
-
-        async for blob in base_qs[:max_keys * 2].aiterator():
-            # Key without leading slash
-            key = blob.path[1:]
-            
-            if delimiter:
-                # Check if there's a delimiter after the prefix
-                suffix = blob.path[prefix_len:]
-                delim_pos = suffix.find(delimiter)
-                if delim_pos >= 0:
-                    # This blob is "inside" a common prefix
-                    common_prefix = requested_prefix + suffix[:delim_pos + 1]
-                    common_prefixes.add(common_prefix)
-                    continue
-            
-            blobs.append(blob)
-            if len(blobs) > max_keys:
-                break
-
-        is_truncated = len(blobs) > max_keys
-        if is_truncated:
-            blobs = blobs[:max_keys]
-
-        ElementTree.SubElement(root, "Name").text = volume.name
-        ElementTree.SubElement(root, "Prefix").text = requested_prefix
-        ElementTree.SubElement(root, "KeyCount").text = str(len(blobs) + len(common_prefixes))
+        engine = await self.get_engine(volume)
+        
+        # Overfetch from engine because multiple keys can collapse into one CommonPrefix
+        # If it doesn't give enough to fill max_keys, S3 pagination standard allows returning less
+        results = engine.list(prefix, start_param, max_keys * 5)
+        
+        root = ElementTree.Element("{%s}ListBucketResult" % XML_NAMESPACE)
+        ElementTree.SubElement(root, "Name").text = bucket
+        ElementTree.SubElement(root, "Prefix").text = prefix
         ElementTree.SubElement(root, "MaxKeys").text = str(max_keys)
         if delimiter:
             ElementTree.SubElement(root, "Delimiter").text = delimiter
-        ElementTree.SubElement(root, "EncodingType").text = encoding_type
-        ElementTree.SubElement(root, "IsTruncated").text = str(is_truncated).lower()
 
-        if is_truncated and blobs:
-            next_token = _encode_token(blobs[-1].path)
+        count = 0
+        is_truncated = False
+        next_token = ''
+        common_prefixes = set()
+        
+        for key, val_json in results:
+            if count >= max_keys:
+                is_truncated = True
+                break
+                
+            remainder = key[len(prefix):]
+            if delimiter and delimiter in remainder:
+                # It's a common prefix
+                folder_name = remainder.split(delimiter)[0] + delimiter
+                cp = prefix + folder_name
+                if cp not in common_prefixes:
+                    common_prefixes.add(cp)
+                    cp_el = ElementTree.SubElement(root, "CommonPrefixes")
+                    ElementTree.SubElement(cp_el, "Prefix").text = cp
+                    count += 1
+                next_token = key # Tracking where we left off
+            else:
+                if key == prefix and delimiter:
+                    # S3 does not list the folder itself if scanning with delimiter unless it's an object?
+                    pass 
+                content_el = self._etree_for_json(key, val_json)
+                root.append(content_el)
+                count += 1
+                next_token = key
+
+        # If the original results length == max_keys*5 and we still didn't hit max_keys output,
+        # it might technically be truncated deep in the metadata layer.
+        if len(results) == max_keys * 5 and count < max_keys:
+            is_truncated = True
+
+        ElementTree.SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+        if is_truncated and next_token:
             ElementTree.SubElement(root, "NextContinuationToken").text = next_token
 
-        if continuation_token:
-            ElementTree.SubElement(root, "ContinuationToken").text = continuation_token
-
-        for blob in blobs:
-            root.append(self._etree_for_blob(blob))
-
-        # Add CommonPrefixes for each unique prefix
-        for prefix in sorted(common_prefixes):
-            cp_elem = ElementTree.SubElement(root, "CommonPrefixes")
-            ElementTree.SubElement(cp_elem, "Prefix").text = prefix
-
-        response = XMLResponse(root)
-        # Apply CORS if applicable
-        origin = request.META.get("HTTP_ORIGIN", "")
-        if origin:
-            rules = get_cors_rules(volume)
-            rule = find_matching_rule(rules, origin, "GET")
-            if rule:
-                apply_cors_headers(response, rule, origin)
-        return response
+        return XMLResponse(root)
 
     def _handler_versioning(self):
         root = ElementTree.Element("{%s}VersioningConfiguration" % XML_NAMESPACE)
@@ -320,40 +307,7 @@ class BucketView(S3View):
         return response
 
     async def _list_multipart_uploads(self, request, bucket):
-        """ListMultipartUploads — returns active (incomplete) multipart uploads."""
-        from p2.s3.constants import (TAG_S3_MULTIPART_BLOB_TARGET_BLOB,
-                                     TAG_S3_MULTIPART_BLOB_UPLOAD_ID)
-        volume = await self.get_volume(request.user, bucket, 'read')
-        prefix = request.GET.get('prefix', '')
-        max_uploads = min(int(request.GET.get('max-uploads', 1000)), 1000)
-
-        root = ElementTree.Element("{%s}ListMultipartUploadsResult" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "Bucket").text = bucket
-        ElementTree.SubElement(root, "Prefix").text = prefix
-        ElementTree.SubElement(root, "MaxUploads").text = str(max_uploads)
-        ElementTree.SubElement(root, "IsTruncated").text = "false"
-
-        seen_upload_ids = set()
-        async for blob in Blob.objects.filter(
-            volume=volume,
-            **{f'tags__{TAG_S3_MULTIPART_BLOB_UPLOAD_ID}__isnull': False},
-        ).order_by('path').aiterator():
-            upload_id = blob.tags.get(TAG_S3_MULTIPART_BLOB_UPLOAD_ID)
-            target = blob.tags.get(TAG_S3_MULTIPART_BLOB_TARGET_BLOB, '')
-            if not upload_id or upload_id in seen_upload_ids:
-                continue
-            if prefix and not target.lstrip('/').startswith(prefix):
-                continue
-            seen_upload_ids.add(upload_id)
-            upload_el = ElementTree.SubElement(root, "Upload")
-            ElementTree.SubElement(upload_el, "Key").text = target.lstrip('/')
-            ElementTree.SubElement(upload_el, "UploadId").text = upload_id
-            initiator = ElementTree.SubElement(upload_el, "Initiator")
-            ElementTree.SubElement(initiator, "ID").text = str(request.user.pk)
-            ElementTree.SubElement(initiator, "DisplayName").text = request.user.username
-            ElementTree.SubElement(upload_el, "StorageClass").text = "STANDARD"
-
-        return XMLResponse(root)
+        return HttpResponse(status=501)
 
     # -------------------------------------------------------------------------
     # Bucket create
@@ -390,26 +344,7 @@ class BucketView(S3View):
     # -------------------------------------------------------------------------
 
     async def _multi_delete(self, request, bucket):
-        """POST /<bucket>?delete — delete multiple objects in one request."""
-        volume = await self.get_volume(request.user, bucket, 'delete')
-        root_in = ElementTree.fromstring(request.body)
-        ns = XML_NAMESPACE
-
-        keys = []
-        for obj_el in root_in.iter("Object"):
-            key_el = obj_el.find("Key") or obj_el.find(f"{{{ns}}}Key")
-            if key_el is not None and key_el.text:
-                keys.append('/' + key_el.text.lstrip('/'))
-
-        root_out = ElementTree.Element("{%s}DeleteResult" % ns)
-        for key in keys:
-            blob = await Blob.objects.filter(path=key, volume=volume).afirst()
-            if blob is not None:
-                await blob.adelete()
-            deleted = ElementTree.SubElement(root_out, "Deleted")
-            ElementTree.SubElement(deleted, "Key").text = key.lstrip('/')
-
-        return XMLResponse(root_out)
+        return HttpResponse(status=501)
 
     # -------------------------------------------------------------------------
     # CORS

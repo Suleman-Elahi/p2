@@ -3,7 +3,7 @@ from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.cache import cache
 from django.views.generic import ListView
 
-from p2.core.models import Blob, Volume
+from p2.core.models import Volume
 from p2.ui.constants import CACHE_KEY_BLOB_COUNT
 
 
@@ -20,11 +20,7 @@ class IndexView(LoginRequiredMixin, ListView):
         return super().get_queryset(*args, **kwrags).select_related('storage')
 
     def get_blob_count(self):
-        """Get cached Blob Count"""
-        if not cache.get(CACHE_KEY_BLOB_COUNT, None):
-            count = len(Blob.objects.all())
-            cache.set(CACHE_KEY_BLOB_COUNT, count, 30)
-        return cache.get(CACHE_KEY_BLOB_COUNT)
+        return 0
 
     def get_context_data(self, **kwargs):
         data = super().get_context_data(**kwargs)
@@ -32,12 +28,11 @@ class IndexView(LoginRequiredMixin, ListView):
         return data
 
 class SearchView(LoginRequiredMixin, ListView):
-    """Search Blobs by their key"""
+    """Search Blobs by their key - currently disabled"""
 
-    model = Blob
-    ordering = 'path'
+    model = Volume
+    ordering = 'name'
     template_name = 'search/results.html'
 
     def get_queryset(self):
-        return Blob.objects.filter(
-            path__icontains=self.request.GET.get('q', '')).order_by(self.ordering)
+        return Volume.objects.none()

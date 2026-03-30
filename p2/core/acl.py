@@ -33,15 +33,19 @@ class VolumeACL(models.Model):
 
 async def has_volume_permission(user, volume: Volume, permission: str) -> bool:
     """Check if a user has a given permission on a volume."""
-    if volume.public_read and permission == "read":
+    # Public volumes allow anonymous read AND list
+    if volume.public_read and permission in ("read", "list"):
         return True
     # Resolve the lazy user object in a thread to avoid sync DB access in async context
     is_authenticated = await sync_to_async(lambda: bool(user and user.is_authenticated))()
     if not is_authenticated:
         return False
     group_ids = [gid async for gid in Group.objects.filter(user=user).values_list('pk', flat=True).aiterator()]
-    return await VolumeACL.objects.filter(
+    acls = VolumeACL.objects.filter(
         Q(user=user) | Q(group__in=group_ids),
         volume=volume,
-        permissions__contains=[permission],
-    ).aexists()
+    )
+    async for acl in acls:
+        if permission in acl.permissions:
+            return True
+    return False
