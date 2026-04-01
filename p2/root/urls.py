@@ -4,6 +4,7 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.contrib.auth import views
 from django.urls import include, path
+from p2.auth.views import P2LoginView
 from django.views.generic import RedirectView
 
 from p2.ui.views.errors import ServerErrorView
@@ -25,7 +26,7 @@ urlpatterns = [
     path('_/ui/', include('p2.ui.urls', namespace='p2_ui')),
     path('_/oidc/', include('p2.auth.urls', namespace='p2_auth')),
     path('_/auth/password/', views.PasswordChangeView.as_view(), name='auth_password'),
-    path('_/auth/login/', views.LoginView.as_view(), name='auth_login'),
+    path('_/auth/login/', P2LoginView.as_view(), name='auth_login'),
     path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),
     path('', include('p2.s3.urls', namespace='p2_s3')),
 ] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

@@ -189,7 +189,11 @@ ensure_maturin
 ensure_target_python
 build_extension "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext"
 build_extension "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"
+build_extension "p2_s3_meta"     "$REPO_ROOT/p2/s3/meta_ext"
 
 echo ""
 echo -e "${GREEN}Done.${NC} Commit the .so files and run: docker compose up"
-echo "  git add p2/s3/p2_s3_crypto.so p2/s3/p2_s3_checksum.so"
+echo "  git add p2/s3/p2_s3_crypto.so p2/s3/p2_s3_checksum.so p2/s3/p2_s3_meta.so"
+echo ""
+warn "NOTE: .so files must be built against the same Python version as the Docker image."
+warn "If you see 'undefined symbol' errors, rebuild using: docker run --rm -v \$(pwd)/p2/s3/meta_ext:/ext -v \$(pwd)/p2/s3:/out python:3.12.13-slim ..."

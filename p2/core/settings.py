@@ -91,10 +91,11 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'p2.s3.middleware.S3RoutingMiddleware',  # MUST be first - short-circuits S3 requests
+    'p2.core.middleware.HealthCheckMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'p2.s3.middleware.S3RoutingMiddleware',
-    'p2.core.middleware.HealthCheckMiddleware',
+    'p2.core.middleware.S3AuthPreserveMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.http.ConditionalGetMiddleware',
@@ -177,8 +178,12 @@ CACHES = {
     }
 }
 
-SESSION_ENGINE = 'django.contrib.sessions.backends.db'
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
 SESSION_SAVE_EVERY_REQUEST = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_SECURE = False
+
+CSRF_TRUSTED_ORIGINS = CONFIG.y('csrf_trusted_origins', 'http://localhost,http://127.0.0.1').split(',')
 
 # ---------------------------------------------------------------------------
 # ARQ task queue (replaces Celery)
@@ -332,10 +337,12 @@ LOGGING = {
         'level': 'WARNING',
     },
     'loggers': {
-        'p2': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
+        'p2.s3.middleware': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
+        'p2': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'django': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'django.contrib.sessions': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
         'arq': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
-        'grpc': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
+        'grpc': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
     },
 }
 

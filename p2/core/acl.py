@@ -33,19 +33,52 @@ class VolumeACL(models.Model):
 
 async def has_volume_permission(user, volume: Volume, permission: str) -> bool:
     """Check if a user has a given permission on a volume."""
+    from p2.s3.cache import get_cached_acl, set_cached_acl
+    import logging
+    LOGGER = logging.getLogger(__name__)
+    
     # Public volumes allow anonymous read AND list
     if volume.public_read and permission in ("read", "list"):
         return True
-    # Resolve the lazy user object in a thread to avoid sync DB access in async context
-    is_authenticated = await sync_to_async(lambda: bool(user and user.is_authenticated))()
-    if not is_authenticated:
+    
+    # Check user attributes directly (avoid sync_to_async issues)
+    try:
+        user_id = user.id
+        is_authenticated = hasattr(user, 'is_authenticated') and bool(user.is_authenticated)
+        is_superuser = hasattr(user, 'is_superuser') and user.is_superuser
+        username = getattr(user, 'username', 'unknown')
+    except Exception as e:
+        LOGGER.warning("has_volume_permission: error accessing user attributes: %s", e)
         return False
+    
+    if not is_authenticated:
+        LOGGER.debug("has_volume_permission: user '%s' not authenticated", username)
+        return False
+    
+    # Superusers have full access to all volumes
+    if is_superuser:
+        LOGGER.info("has_volume_permission: superuser '%s' granted '%s' on volume '%s'", username, permission, volume.name)
+        return True
+    
+    # Use pk (uuid) for cache key since Volume uses UUID as primary key
+    volume_pk = str(volume.pk)
+    
+    # Check cache
+    cached = get_cached_acl(user_id, volume_pk, permission)
+    if cached is not None:
+        return cached
+    
+    # Cache miss - query database
     group_ids = [gid async for gid in Group.objects.filter(user=user).values_list('pk', flat=True).aiterator()]
     acls = VolumeACL.objects.filter(
         Q(user=user) | Q(group__in=group_ids),
         volume=volume,
     )
+    allowed = False
     async for acl in acls:
         if permission in acl.permissions:
-            return True
-    return False
+            allowed = True
+            break
+    
+    set_cached_acl(user_id, volume_pk, permission, allowed)
+    return allowed

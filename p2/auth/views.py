@@ -1,12 +1,15 @@
-"""p2 OIDC authentication views using authlib Django integration."""
+"""p2 authentication views — async-native login + OIDC."""
 import logging
 
+from asgiref.sync import sync_to_async
 from authlib.integrations.django_client import OAuth
 from django.conf import settings
 from django.contrib.auth import get_user_model, login
+from django.contrib.auth.forms import AuthenticationForm
 from django.http import HttpRequest, HttpResponse
-from django.shortcuts import redirect
+from django.shortcuts import redirect, render
 from django.urls import reverse
+from django.views import View
 
 LOGGER = logging.getLogger(__name__)
 
@@ -20,6 +23,42 @@ oauth.register(
 )
 
 User = get_user_model()
+
+
+class P2LoginView(View):
+    """Async-native login view — correctly sets the session cookie under ASGI/uvicorn.
+
+    Django's built-in LoginView is sync-only. Under ASGI it runs in a thread pool
+    via async_to_sync, which causes SessionMiddleware to lose the Set-Cookie header
+    on the response. This view is fully async so the session save and cookie are
+    handled in the same async context as the middleware.
+    """
+
+    template_name = 'registration/login.html'
+
+    async def get(self, request: HttpRequest) -> HttpResponse:
+        form = AuthenticationForm()
+        next_url = request.GET.get('next', settings.LOGIN_REDIRECT_URL)
+        return render(request, self.template_name, {
+            'form': form,
+            'redirect_field_name': 'next',
+            'redirect_field_value': next_url,
+        })
+
+    async def post(self, request: HttpRequest) -> HttpResponse:
+        form = AuthenticationForm(request, data=request.POST)
+        next_url = request.POST.get('next') or request.GET.get('next') or settings.LOGIN_REDIRECT_URL
+
+        if not await sync_to_async(form.is_valid)():
+            return render(request, self.template_name, {
+                'form': form,
+                'redirect_field_name': 'next',
+                'redirect_field_value': next_url,
+            })
+
+        user = form.get_user()
+        await sync_to_async(login)(request, user)
+        return redirect(next_url)
 
 
 def oidc_login(request: HttpRequest) -> HttpResponse:
@@ -59,7 +98,6 @@ def oidc_callback(request: HttpRequest) -> HttpResponse:
     )
 
     if not created:
-        # Keep email/name in sync with the provider
         updated = False
         if email and user.email != email:
             user.email = email

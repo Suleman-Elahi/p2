@@ -143,67 +143,79 @@ function readDirectoryEntries(dirEntry, pathPrefix) {
 $(document).ready(function () {
     if ($('.dz').length === 0) return;
 
-    var uploadUrl = $('.dz').data('upload-url');
-
-    // Folder button
-    $('#folder-upload-input').on('change', function() {
-        var fileList = Array.from(this.files);
-        var files = fileList.map(function(f) {
-            return { file: f, relativePath: f.webkitRelativePath || f.name };
+    // Folder button (uses the first .dz element's URL)
+    var primaryDz = $('.dz').first();
+    var primaryUrl = primaryDz.data('upload-url') || primaryDz.attr('action');
+    if (primaryUrl) {
+        $('#folder-upload-input').on('change', function() {
+            var fileList = Array.from(this.files);
+            var files = fileList.map(function(f) {
+                return { file: f, relativePath: f.webkitRelativePath || f.name };
+            });
+            this.value = '';
+            uploadFolder(files, primaryUrl);
         });
-        this.value = '';
-        uploadFolder(files, uploadUrl);
-    });
+    }
 
-    $('.dz').dropzone({
-        previewTemplate: '<div style="display:none"></div>',
-        maxFilesize: null,
-        drop: function(e) {
-            var items = e.dataTransfer && e.dataTransfer.items;
-            if (!items) return;
-            var self = this;
-            var folderFiles = [];
-            var plainFiles = [];
-            var pending = items.length;
-
-            function checkDone() {
-                if (--pending > 0) return;
-                if (folderFiles.length) {
-                    uploadFolder(folderFiles, uploadUrl);
-                }
-                // plain files handled by addedfile below
-            }
-
-            Array.from(items).forEach(function(item) {
-                var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-                if (entry && entry.isDirectory) {
-                    readDirectoryEntries(entry, entry.name).then(function(sub) {
-                        folderFiles = folderFiles.concat(sub);
-                        checkDone();
-                    });
-                } else {
-                    checkDone();
-                }
-            });
-
-            // Let Dropzone handle plain files via addedfile
-            Dropzone.prototype.drop.call(self, e);
-        },
-        init: function () {
-            var self = this;
-            this.on('addedfile', function(file) {
-                self.removeFile(file);
-                // Single file — upload and refresh
-                uploadFile(file, uploadUrl, file.name)
-                    .then(function(data) {
-                        dzToast(file.name, true);
-                        refreshBlobTable();
-                    })
-                    .catch(function(err) {
-                        dzToast(file.name + ': ' + err.message, false);
-                    });
-            });
+    // Initialize each .dz element with its own URL
+    $('.dz').each(function() {
+        var $el = $(this);
+        var uploadUrl = $el.data('upload-url') || $el.attr('action');
+        if (!uploadUrl) {
+            console.warn('Dropzone: No upload URL found on .dz element', this);
+            return;
         }
+
+        $el.dropzone({
+            url: uploadUrl,
+            previewTemplate: '<div style="display:none"></div>',
+            maxFilesize: null,
+            drop: function(e) {
+                var items = e.dataTransfer && e.dataTransfer.items;
+                if (!items) return;
+                var self = this;
+                var folderFiles = [];
+                var pending = items.length;
+
+                function checkDone() {
+                    if (--pending > 0) return;
+                    if (folderFiles.length) {
+                        uploadFolder(folderFiles, uploadUrl);
+                    }
+                    // plain files handled by addedfile below
+                }
+
+                Array.from(items).forEach(function(item) {
+                    var entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+                    if (entry && entry.isDirectory) {
+                        readDirectoryEntries(entry, entry.name).then(function(sub) {
+                            folderFiles = folderFiles.concat(sub);
+                            checkDone();
+                        });
+                    } else {
+                        checkDone();
+                    }
+                });
+
+                // Let Dropzone handle plain files via addedfile
+                Dropzone.prototype.drop.call(self, e);
+            },
+            init: function () {
+                var self = this;
+                this.on('addedfile', function(file) {
+                    self.removeFile(file);
+                    // Single file — upload and refresh
+                    uploadFile(file, uploadUrl, file.name)
+                        .then(function(data) {
+                            dzToast(file.name, true);
+                            refreshBlobTable();
+                        })
+                        .catch(function(err) {
+                            dzToast(file.name + ': ' + err.message, false);
+                        });
+                });
+            }
+        });
     });
 });
 

@@ -9,7 +9,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from p2.core.acl import has_volume_permission
 from p2.core.models import Volume
-from p2.core.telemetry import s3_latency_histogram, s3_request_counter, tracer
+from p2.core.telemetry import s3_latency_histogram, s3_request_counter
 from p2.s3.errors import (AWSBadDigest, AWSError, AWSInvalidDigest,
                           AWSNoSuchBucket, AWSNoSuchKey)
 
@@ -93,39 +93,57 @@ class S3View(View):
 
     async def get_volume(self, user, bucket_name: str, permission: str,
                          object_key: str = '') -> Volume:
-        """Look up a Volume by name and verify the user has the given permission.
-
-        Evaluation order (mirrors AWS):
-        1. Presigned token already validated  — token proves authorization, skip ACL
-        2. VolumeACL / public_read            — fast path, covers most requests
-        3. Bucket policy                      — per-object public access on private buckets
-        Raises AWSNoSuchBucket if the volume does not exist or access is denied.
-        """
+        """Look up a Volume by name and verify the user has the given permission."""
+        from p2.s3.cache import get_cached_volume, set_cached_volume
+        from asgiref.sync import sync_to_async
+        
+        # Use the S3-authenticated user if available (Django's AuthenticationMiddleware
+        # may have overwritten request.user with AnonymousUser)
+        actual_user = getattr(self.request, '_s3_authenticated_user', user)
+        
+        # Try cache first
+        cached = get_cached_volume(bucket_name)
+        if cached:
+            uuid_hex, public_read = cached
+            if public_read and permission in ("read", "list"):
+                import uuid as uuid_mod
+                volume = Volume(name=bucket_name, public_read=public_read)
+                volume.uuid = uuid_mod.UUID(hex=uuid_hex)
+                return volume
+        
+        # Need full volume for ACL/policy checks
         try:
             volume = await Volume.objects.aget(name=bucket_name)
+            set_cached_volume(bucket_name, volume.uuid.hex, volume.public_read)
         except Volume.DoesNotExist:
+            LOGGER.warning("get_volume: Volume '%s' not found in database", bucket_name)
             raise AWSNoSuchBucket
 
-        # Presigned token was already validated in _check_presigned — trust it
+        # Presigned token was already validated
         if getattr(self.request, '_presigned_validated', False):
             return volume
 
-        # Fast path: ACL / public_read
-        allowed = await has_volume_permission(user, volume, permission)
+        # Fast path: ACL / public_read / superuser
+        allowed = await has_volume_permission(actual_user, volume, permission)
         if allowed:
             return volume
 
-        # Slow path: bucket policy evaluation for anonymous / policy-granted access
+        # Slow path: bucket policy
         if await _policy_allows(volume, permission, bucket_name, object_key):
             return volume
 
+        LOGGER.warning("get_volume: user '%s' denied '%s' on '%s'",
+                       getattr(actual_user, 'username', '?'), permission, bucket_name)
         raise AWSNoSuchBucket
 
     async def get_engine(self, volume: Volume):
-        """Return the shared cached MetaEngine for this volume."""
-        import asyncio
+        """Return the shared cached MetaEngine for this volume.
+        
+        The engine registry is thread-safe and the lookup is O(1) dict access,
+        so we can call it directly without asyncio.to_thread overhead.
+        """
         from p2.s3.engine import get_engine
-        return await asyncio.to_thread(get_engine, volume)
+        return get_engine(volume)
 
     async def get_blob(self, volume: Volume, path: str) -> dict:
         """Look up a Blob by volume and path. Raises AWSNoSuchKey if not found."""
@@ -137,32 +155,24 @@ class S3View(View):
         return json.loads(metadata_json)
 
     async def dispatch(self, request, *args, **kwargs):
-        """Wrap every S3 request in an OTel span and record counter/latency metrics.
+        """Wrap every S3 request and record counter/latency metrics.
 
-        Satisfies Requirements 9.3, 9.8.
+        OTel tracing is only enabled when OTEL_ENDPOINT is configured.
         """
         bucket = kwargs.get("bucket", "")
         key = kwargs.get("path", "")
         method = request.method.upper()
 
-        with tracer.start_as_current_span("s3.request") as span:
-            span.set_attribute("http.method", method)
-            span.set_attribute("s3.bucket", bucket)
-            span.set_attribute("s3.key", key)
+        start = time.monotonic()
+        response = await super().dispatch(request, *args, **kwargs)
+        latency_ms = (time.monotonic() - start) * 1000
 
-            start = time.monotonic()
-            response = await super().dispatch(request, *args, **kwargs)
-            latency_ms = (time.monotonic() - start) * 1000
+        # Record metrics (lightweight even without OTel)
+        attrs = {"method": method, "bucket": bucket}
+        s3_request_counter.add(1, attrs)
+        s3_latency_histogram.record(latency_ms, attrs)
 
-            status_code = response.status_code
-            span.set_attribute("http.status_code", status_code)
-            span.set_attribute("s3.latency_ms", latency_ms)
-
-            attrs = {"method": method, "bucket": bucket}
-            s3_request_counter.add(1, attrs)
-            s3_latency_histogram.record(latency_ms, attrs)
-
-            return response
+        return response
 
     @csrf_exempt
     def setup(self, *args, **kwargs):

@@ -136,7 +136,13 @@ class BucketView(S3View):
         content = ElementTree.Element("Contents")
         ElementTree.SubElement(content, "Key").text = key
         mtime = attr.get(ATTR_BLOB_STAT_MTIME, '')
-        ElementTree.SubElement(content, "LastModified").text = str(mtime) if mtime else ''
+        if mtime:
+            from django.utils.dateparse import parse_datetime
+            dt = parse_datetime(mtime)
+            iso_mtime = dt.strftime('%Y-%m-%dT%H:%M:%S.000Z') if dt else mtime
+        else:
+            iso_mtime = ''
+        ElementTree.SubElement(content, "LastModified").text = iso_mtime
         etag = attr.get('blob.p2.io/hash/md5', '')
         ElementTree.SubElement(content, "ETag").text = f'"{etag}"' if etag else '""'
         ElementTree.SubElement(content, "Size").text = str(attr.get(ATTR_BLOB_SIZE_BYTES, 0))
@@ -318,10 +324,20 @@ class BucketView(S3View):
             'tags__%s' % TAG_S3_DEFAULT_STORAGE: True
         }).afirst()
         if storage is None:
-            LOGGER.warning("No Storage marked as default. Add tag '%s: true'.", TAG_S3_DEFAULT_STORAGE)
+            storage = await Storage.objects.afirst()
+            if storage is None:
+                LOGGER.warning("No Storage exists. Create one first via the UI.")
+                raise AWSAccessDenied
+            storage.tags[TAG_S3_DEFAULT_STORAGE] = True
+            await storage.asave(update_fields=['tags'])
+            LOGGER.info("Auto-marked storage '%s' as default for S3.", storage.name)
+        
+        # Use S3-authenticated user (Django auth middleware may have overwritten request.user)
+        actual_user = getattr(request, '_s3_authenticated_user', request.user)
+        is_superuser = getattr(actual_user, 'is_superuser', False)
+        if not is_superuser and not await actual_user.ahas_perm('p2_core.add_volume'):
             raise AWSAccessDenied
-        if not await request.user.ahas_perm('p2_core.add_volume'):
-            raise AWSAccessDenied
+        
         volume, _ = await Volume.objects.aget_or_create(
             name=bucket, defaults={'storage': storage}
         )
@@ -334,7 +350,7 @@ class BucketView(S3View):
         await volume.asave(update_fields=['tags'])
 
         await VolumeACL.objects.aget_or_create(
-            volume=volume, user=request.user,
+            volume=volume, user=actual_user,
             defaults={'permissions': ['read', 'write', 'delete', 'list', 'admin']},
         )
         return HttpResponse(status=200)
@@ -344,7 +360,50 @@ class BucketView(S3View):
     # -------------------------------------------------------------------------
 
     async def _multi_delete(self, request, bucket):
-        return HttpResponse(status=501)
+        """POST /<bucket>?delete — S3 Multi-Object Delete"""
+        import asyncio, os
+        volume = await self.get_volume(request.user, bucket, 'delete')
+        engine = await self.get_engine(volume)
+
+        try:
+            root = ElementTree.fromstring(request.body)
+        except ElementTree.ParseError:
+            return HttpResponse(status=400)
+
+        ns = {'s3': XML_NAMESPACE}
+        keys = [el.text for el in root.findall('.//s3:Key', ns) if el.text]
+        # Fallback: no-namespace keys
+        if not keys:
+            keys = [el.text for el in root.findall('.//Key') if el.text]
+
+        result = ElementTree.Element(f'{{{XML_NAMESPACE}}}DeleteResult')
+        quiet = root.find(f'{{{XML_NAMESPACE}}}Quiet') or root.find('Quiet')
+        is_quiet = quiet is not None and (quiet.text or '').lower() == 'true'
+
+        for key in keys:
+            try:
+                meta_json = await asyncio.to_thread(engine.get, key)
+                if meta_json:
+                    attr = json.loads(meta_json)
+                    internal_path = attr.get('internal_path')
+                    if internal_path:
+                        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                        try:
+                            os.remove(fs_path)
+                        except OSError:
+                            pass
+                    await asyncio.to_thread(engine.delete, key)
+                if not is_quiet:
+                    deleted = ElementTree.SubElement(result, f'{{{XML_NAMESPACE}}}Deleted')
+                    ElementTree.SubElement(deleted, f'{{{XML_NAMESPACE}}}Key').text = key
+            except Exception as exc:
+                LOGGER.warning("multi_delete: error deleting %s: %s", key, exc)
+                error = ElementTree.SubElement(result, f'{{{XML_NAMESPACE}}}Error')
+                ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Key').text = key
+                ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Code').text = 'InternalError'
+                ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Message').text = str(exc)
+
+        return XMLResponse(result)
 
     # -------------------------------------------------------------------------
     # CORS

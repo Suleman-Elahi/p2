@@ -3,6 +3,11 @@
 redb holds an exclusive file lock per database, so only one MetaEngine
 instance per path can exist in a process. This module provides a single
 shared registry used by both the S3 views and the upload viewset.
+
+NOTE: redb does not support multiple processes accessing the same database.
+For multi-worker deployments, either:
+1. Use a single uvicorn worker (current approach)
+2. Replace redb with a multi-process safe store (SQLite WAL, Redis, etc.)
 """
 import os
 import threading

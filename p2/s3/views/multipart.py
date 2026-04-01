@@ -20,6 +20,7 @@ from p2.core.prefix_helper import make_absolute_path
 from p2.s3.constants import XML_NAMESPACE
 from p2.s3.http import XMLResponse
 from p2.s3.views.common import S3View
+from p2.s3.utils import decode_aws_chunked
 from p2.s3 import p2_s3_meta
 
 LOGGER = logging.getLogger(__name__)
@@ -76,17 +77,17 @@ class MultipartUploadView(S3View):
         md5_hash = hashlib.md5()
         blob_size = 0
         
+        # Read body and decode aws-chunked if needed
+        data = await asyncio.to_thread(request.read)
+        content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
+        decoded_length = request.META.get('HTTP_X_AMZ_DECODED_CONTENT_LENGTH')
+        if 'aws-chunked' in content_encoding or decoded_length:
+            data = decode_aws_chunked(data)
+        
         async with aiofiles.open(fs_path, 'wb') as f:
-            if hasattr(request, '__aiter__'):
-                async for chunk in request:
-                    await f.write(chunk)
-                    md5_hash.update(chunk)
-                    blob_size += len(chunk)
-            else:
-                data = await asyncio.to_thread(request.read)
-                await f.write(data)
-                md5_hash.update(data)
-                blob_size = len(data)
+            await f.write(data)
+            md5_hash.update(data)
+            blob_size = len(data)
                 
         final_md5 = md5_hash.hexdigest()
 

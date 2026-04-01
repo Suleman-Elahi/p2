@@ -51,6 +51,16 @@ class StorageCreateView(SuccessMessageMixin, DjangoPermissionRequiredMixin, Crea
         'p2_core.delete_storage',
     ]
 
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        # Auto-set as default storage for S3 if no other default exists
+        from p2.s3.constants import TAG_S3_DEFAULT_STORAGE
+        has_default = Storage.objects.filter(**{f'tags__{TAG_S3_DEFAULT_STORAGE}': True}).exists()
+        if not has_default:
+            self.object.tags[TAG_S3_DEFAULT_STORAGE] = True
+            self.object.save(update_fields=['tags'])
+        return response
+
     def get_success_url(self):
         return reverse('p2_ui:core-storage-list')
 

@@ -19,6 +19,7 @@ from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
+from p2.s3.utils import decode_aws_chunked
 
 
 def _format_http_date(mtime_str: str) -> str:
@@ -215,13 +216,21 @@ class ObjectView(S3View):
             return await MultipartUploadView().dispatch(request, bucket, path)
 
         volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
-        engine = await self.get_engine(volume)
-        metadata_json = engine.get(path)
-        if not metadata_json:
-            return HttpResponse(status=404)
-
-        import json
-        attributes = json.loads(metadata_json)
+        
+        # Try metadata cache first
+        from p2.s3.cache import get_cached_metadata, set_cached_metadata
+        attributes = get_cached_metadata(volume.uuid.hex, path)
+        
+        if attributes is None:
+            # Cache miss - fetch from redb
+            engine = await self.get_engine(volume)
+            metadata_json = engine.get(path)
+            if not metadata_json:
+                return HttpResponse(status=404)
+            import json
+            attributes = json.loads(metadata_json)
+            set_cached_metadata(volume.uuid.hex, path, attributes)
+        
         content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
         total_size = int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
 
@@ -317,6 +326,18 @@ class ObjectView(S3View):
         # Honour Content-Type from the client
         client_ct = request.META.get('CONTENT_TYPE', 'application/octet-stream')
 
+        # Read body — decode aws-chunked if present
+        # AWS SDKs use x-amz-decoded-content-length when sending chunked payloads
+        import asyncio
+        body = await asyncio.to_thread(request.read)
+        content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
+        decoded_length = request.META.get('HTTP_X_AMZ_DECODED_CONTENT_LENGTH')
+        
+        # Detect aws-chunked: either explicit header or decoded-length hint
+        if 'aws-chunked' in content_encoding or decoded_length:
+            body = decode_aws_chunked(body)
+            LOGGER.debug("PUT %s: decoded aws-chunked %d -> %d bytes", path, len(body) + 175, len(body))
+
         # Streaming high-throughput write
         blob_uuid = uuid.uuid4().hex
         dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
@@ -324,7 +345,6 @@ class ObjectView(S3View):
         fs_path = os.path.join(dir_path, blob_uuid)
         internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
 
-        import asyncio
         import hashlib
 
         # Use Rust checksum extension for inline hashing if available (zero GIL overhead)
@@ -336,31 +356,12 @@ class ObjectView(S3View):
 
         md5_hash = hashlib.md5()
         sha256_hash = hashlib.sha256()
-        blob_size = 0
-        # 4 MB accumulation buffer — reduces aiofiles write syscalls on fast storage
-        _WRITE_BUF = bytearray()
-        _BUF_LIMIT = 4 << 20  # 4 MB
+        md5_hash.update(body)
+        sha256_hash.update(body)
+        blob_size = len(body)
 
         async with aiofiles.open(fs_path, 'wb') as f:
-            if hasattr(request, '__aiter__'):
-                # ASGI: true async streaming — uvicorn yields chunks as they arrive
-                async for chunk in request:
-                    _WRITE_BUF += chunk
-                    md5_hash.update(chunk)
-                    sha256_hash.update(chunk)
-                    blob_size += len(chunk)
-                    if len(_WRITE_BUF) >= _BUF_LIMIT:
-                        await f.write(_WRITE_BUF)
-                        _WRITE_BUF.clear()
-                if _WRITE_BUF:
-                    await f.write(_WRITE_BUF)
-            else:
-                # WSGI fallback
-                data = await asyncio.to_thread(request.read)
-                await f.write(data)
-                md5_hash.update(data)
-                sha256_hash.update(data)
-                blob_size = len(data)
+            await f.write(body)
 
         final_md5 = md5_hash.hexdigest()
         final_sha256 = sha256_hash.hexdigest()
@@ -380,6 +381,10 @@ class ObjectView(S3View):
             existing_attributes[ATTR_BLOB_STAT_CTIME] = str(now())
 
         engine.put(path, json.dumps(existing_attributes))
+        
+        # Invalidate metadata cache after write
+        from p2.s3.cache import invalidate_metadata
+        invalidate_metadata(volume.uuid.hex, path)
 
         # Publish event to Dragonfly for background processing (webhooks, EXIF, etc.)
         try:

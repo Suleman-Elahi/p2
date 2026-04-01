@@ -176,8 +176,36 @@ class AWSV4Authentication(BaseAuth):
 
     async def _lookup_access_key(self, access_key: str) -> Optional[APIKey]:
         """Lookup access_key in database, return APIKey if found otherwise None.
-        Uses async ORM to avoid blocking the event loop during database I/O."""
-        return await APIKey.objects.select_related('user').filter(access_key=access_key).afirst()
+        Uses in-memory cache to avoid database round-trips on hot paths."""
+        from p2.s3.cache import get_cached_apikey, set_cached_apikey
+        
+        # Check cache first
+        cached = get_cached_apikey(access_key)
+        if cached:
+            secret_key, user_id, username, is_superuser = cached
+            # Return a minimal APIKey-like object with cached data
+            # Create a minimal User object without DB hit
+            from django.contrib.auth.models import User
+            user = User(id=user_id, username=username, is_superuser=is_superuser)
+            user._state.adding = False  # Mark as existing in DB
+            
+            class CachedAPIKey:
+                def __init__(self, ak, sk, u):
+                    self.access_key = ak
+                    self._secret = sk
+                    self.user = u
+                
+                def decrypt_secret_key(self):
+                    return self._secret
+            
+            return CachedAPIKey(access_key, secret_key, user)
+        
+        # Cache miss - hit database
+        apikey = await APIKey.objects.select_related('user').filter(access_key=access_key).afirst()
+        if apikey:
+            set_cached_apikey(access_key, apikey.decrypt_secret_key(), apikey.user_id, 
+                            apikey.user.username, apikey.user.is_superuser)
+        return apikey
 
     @staticmethod
     def can_handle(request: HttpRequest) -> bool:
@@ -238,6 +266,12 @@ class AWSV4Authentication(BaseAuth):
         ])
         our_signature = self._sign(signing_key, string_to_sign).hex()
         if auth_request.signature != our_signature:
+            LOGGER.debug("Signature mismatch debug: path=%s, method=%s, query=%s, signed_headers=%s",
+                        self.request.META.get('PATH_INFO'), self.request.META.get('REQUEST_METHOD'),
+                        self.request.META.get('QUERY_STRING'), auth_request.signed_headers)
+            LOGGER.debug("Canonical request:\n%s", canonical_request)
+            LOGGER.debug("String to sign:\n%s", string_to_sign)
+            LOGGER.debug("Their sig: %s, Our sig: %s", auth_request.signature, our_signature)
             LOGGER.warning("Signature mismatch for access_key=%s", auth_request.access_key)
             raise AWSSignatureMismatch
         return secret_key.user

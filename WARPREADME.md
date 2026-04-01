@@ -1085,11 +1085,40 @@ warp put \
 
 # GET
 warp get \
-  --host=localhost:8000 \
-  --access-key=Q3QKGCUP4496HROMR3UO \
-  --secret-key=04rlEqiMiI=biy4wnBxwYrhhU4mZa++JI80njdir \
+  --host=localhost \
+  --access-key=8GPMVOOBVRWO6I7QOBRF \
+  --secret-key=3heFkcjy5ls=vO4/UmxXMCyLhPvwmU184X3siZyW \
   --bucket=test \
   --obj.size=4KiB \
   --duration=1m \
   --concurrent=20 \
   --tls=false
+
+
+  warp get \
+  --host=localhost:9000 \
+  --access-key=Utu04TFu3CuA9ff0dx9n \
+  --secret-key=Hrt64VbvqJy162AiPIwDZSRDZPF1X4kfXgAektD4 \
+  --bucket=test \
+  --obj.size=4KiB \
+  --duration=1m \
+  --concurrent=20 \
+  --tls=false
+                                              
+Benchmarking: Press 'q' to stop benchmark. ...
+                                                 
+ λ ████████████████████████████████████████████████████████████████████████░  99%
+                                                                                                   
+Reqs: 253047, Errs:0, Objs:253047, Bytes: 988.5MiB                                                 
+ -       GET Average: 4292 Obj/s, 16.8MiB/s; Current 4018 Obj/s, 15.7MiB/s, 5.7 ms/req, TTFB: 5.6ms
+                                                                                                   
+
+Report: GET. Concurrency: 20. Ran: 57s
+ * Average: 16.75 MiB/s, 4287.98 obj/s
+ * Reqs: Avg: 4.8ms, 50%: 4.2ms, 90%: 7.6ms, 99%: 16.7ms, Fastest: 0.6ms, Slowest: 166.4ms, StdDev: 3.2ms
+ * TTFB: Avg: 5ms, Best: 1ms, 25th: 3ms, Median: 4ms, 75th: 6ms, 90th: 8ms, 99th: 17ms, Worst: 166ms StdDev: 3ms
+
+Throughput, split into 57 x 1s:
+ * Fastest: 21.0MiB/s, 5377.93 obj/s
+ * 50% Median: 17.8MiB/s, 4557.31 obj/s
+ * Slowest: 9.6MiB/s, 2459.64 obj/s
