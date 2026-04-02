@@ -155,22 +155,23 @@ class S3View(View):
         return json.loads(metadata_json)
 
     async def dispatch(self, request, *args, **kwargs):
-        """Wrap every S3 request and record counter/latency metrics.
+        """Wrap every S3 request, catch AWSErrors, and record metrics."""
+        from p2.s3.errors import AWSError
+        from p2.s3.http import AWSErrorView
 
-        OTel tracing is only enabled when OTEL_ENDPOINT is configured.
-        """
         bucket = kwargs.get("bucket", "")
-        key = kwargs.get("path", "")
         method = request.method.upper()
-
         start = time.monotonic()
-        response = await super().dispatch(request, *args, **kwargs)
-        latency_ms = (time.monotonic() - start) * 1000
 
-        # Record metrics (lightweight even without OTel)
-        attrs = {"method": method, "bucket": bucket}
-        s3_request_counter.add(1, attrs)
-        s3_latency_histogram.record(latency_ms, attrs)
+        try:
+            response = await super().dispatch(request, *args, **kwargs)
+        except AWSError as exc:
+            response = AWSErrorView(exc)
+        finally:
+            latency_ms = (time.monotonic() - start) * 1000
+            attrs = {"method": method, "bucket": bucket}
+            s3_request_counter.add(1, attrs)
+            s3_latency_histogram.record(latency_ms, attrs)
 
         return response
 

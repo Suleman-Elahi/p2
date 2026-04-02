@@ -21,20 +21,9 @@ if command -v nginx &>/dev/null; then
     NGINX_CONF="$REPO_ROOT/deploy/nginx-host.conf"
     NGINX_DEST="/etc/nginx/sites-available/p2"
 
-    # Substitute the actual repo path into the config
-    sed "s|/path/to/p2_slim|$REPO_ROOT|g" "$NGINX_CONF" | sudo tee "$NGINX_DEST" > /dev/null
-
-    # Disable default site, enable p2
+    sudo cp "$NGINX_CONF" "$NGINX_DEST"
     sudo rm -f /etc/nginx/sites-enabled/default
     sudo ln -sf "$NGINX_DEST" /etc/nginx/sites-enabled/p2
-
-    # Allow nginx (www-data) to traverse to the repo
-    # Grant execute on each directory in the path
-    path="$REPO_ROOT"
-    while [[ "$path" != "/" ]]; do
-        sudo chmod o+x "$path"
-        path="$(dirname "$path")"
-    done
 
     sudo nginx -t && sudo nginx -s reload
     info "Nginx configured and reloaded."
