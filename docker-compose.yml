@@ -15,7 +15,7 @@ services:
 
   web:
     build: .
-    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop"]
+    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--workers", "8", "--lifespan", "off"]
     env_file: .env
     volumes:
       - .:/app

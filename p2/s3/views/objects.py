@@ -38,7 +38,7 @@ def _format_http_date(mtime_str: str) -> str:
         return mtime_str
     return format_datetime(dt, usegmt=True)
 
-from p2.s3 import p2_s3_meta
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -273,13 +273,32 @@ class ObjectView(S3View):
                 response['Content-Disposition'] = request.GET['response-content-disposition']
             return await self._apply_cors(request, response, volume)
         else:
-            # Direct Python fallback (no Nginx)
-            if total_size <= 1048576:  # 1MB
-                def _read_all():
+            # Pure Python file serving — no Nginx dependency.
+            #
+            # The OS page cache handles hot-object caching automatically and is
+            # shared across all 8 Uvicorn workers, so we don't duplicate it in
+            # Python memory. We only choose the right async strategy per size.
+            #
+            # Tier 1: tiny file (≤64KiB) — sync read.
+            #   Page-cached reads complete in ~1µs and never actually block the
+            #   event loop. Avoids thread-pool submission overhead.
+            # Tier 2: medium file (≤1MiB) — thread pool read.
+            #   Large enough that blocking the event loop is a real risk.
+            # Tier 3: large file (>1MiB) — aiofiles streaming.
+            #   Avoids allocating a single large buffer in process memory.
+            if total_size <= 65536:
+                try:
                     with open(fs_path, 'rb') as f:
-                        return f.read()
-                data = await asyncio.to_thread(_read_all)
-                response = HttpResponse(data, content_type=content_type, status=200)
+                        data = f.read()
+                    response = HttpResponse(data, content_type=content_type, status=200)
+                except OSError:
+                    return HttpResponse(status=404)
+            elif total_size <= 1048576:
+                try:
+                    data = await asyncio.to_thread(lambda: open(fs_path, 'rb').read())
+                    response = HttpResponse(data, content_type=content_type, status=200)
+                except OSError:
+                    return HttpResponse(status=404)
             else:
                 import aiofiles
 

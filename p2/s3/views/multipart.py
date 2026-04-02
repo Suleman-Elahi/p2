@@ -21,7 +21,7 @@ from p2.s3.constants import XML_NAMESPACE
 from p2.s3.http import XMLResponse
 from p2.s3.views.common import S3View
 from p2.s3.utils import decode_aws_chunked
-from p2.s3 import p2_s3_meta
+
 
 LOGGER = logging.getLogger(__name__)
 

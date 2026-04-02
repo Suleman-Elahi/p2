@@ -1,26 +1,22 @@
 # p2
 
-A petabyte-scale, S3-compatible object storage server built on Django 5 with a hybrid Python/Rust architecture. p2 delivers MinIO-level I/O performance while keeping the developer ergonomics of the Django ecosystem.
+A petabyte-scale, S3-compatible object storage server built on Django 5. p2 delivers high-throughput S3-compatible object storage while keeping the developer ergonomics of the Django ecosystem.
 
 ```
 Clients (AWS CLI / boto3 / SDKs / Browser)
          │
          ▼
-   Nginx  ──────────────────────────────────────────────────────────┐
-   (reverse proxy)                                                   │ sendfile()
-         │                                                           │ zero-copy
-         ▼                                                           ▼
-   Uvicorn + uvloop (ASGI)                              /internal-storage/…
-   ├── S3 API  (AWS v4 auth via Rust HMAC)
+   Uvicorn + uvloop  (8 worker processes, ASGI)
+   ├── S3 API   (AWS v4 auth via Rust HMAC)
    ├── REST API (DRF + JWT)
-   └── Web UI  (Django templates)
+   └── Web UI   (Django templates)
          │
          ├── Auth check  ──► Turso / SQLite (libSQL embedded replica, ~0.1 ms)
-         ├── Metadata     ──► redb Rust engine  (sub-ms prefix scans, 1B+ keys)
-         └── Blob I/O     ──► aiofiles  4 MB chunks  +  Rust inline checksums
-                                │
-                                ▼
-                         /storage/volumes/<uuid>/ab/cd/<blob-uuid>
+         ├── Metadata    ──► LMDB  (B+Tree, memory-mapped, multi-process zero-copy, 1B+ keys)
+         └── Blob I/O    ──► Tiered Python file serving  +  Rust inline checksums
+                              │
+                              ▼
+                       /storage/volumes/<uuid>/ab/cd/<blob-uuid>
          │
          ▼
    Dragonfly (Redis-compatible, multi-core)
@@ -31,6 +27,18 @@ Clients (AWS CLI / boto3 / SDKs / Browser)
                           └── Multipart assembly
 ```
 
+### Optional: Zero-Copy Nginx Fast Path
+
+When `P2_STORAGE__USE_X_ACCEL_REDIRECT=true` and Nginx is configured as the front-end, file serving bypasses Python entirely:
+
+```
+Clients ──► Nginx (reverse proxy) ──► Uvicorn (auth + LMDB metadata only)
+                │                               │
+                │◄──────── X-Accel-Redirect ────┘
+                │
+                └──► sendfile() zero-copy ──► Socket
+```
+
 ---
 
 ## Architecture
@@ -39,27 +47,63 @@ Clients (AWS CLI / boto3 / SDKs / Browser)
 
 Users, API keys, volumes (buckets), ACLs, and serve rules live in a libSQL database. In production this is a **Turso embedded replica** — the full database is synced to a local file so every auth check reads from disk at ~0.1 ms with zero network round-trips. In local dev it falls back to plain SQLite automatically.
 
-### Metadata Engine — Rust + redb
+### Metadata Engine — LMDB
 
-Every blob's metadata (path, size, MIME, ETag, timestamps) is stored in a per-volume **redb** database via a PyO3 Rust extension (`p2_s3_meta`). redb is an embedded key-value store with MVCC transactions and memory-mapped I/O. Prefix scans for `ListObjectsV2` run entirely in Rust, bypassing Python's GIL, and handle 1 billion+ keys without breaking a sweat.
+Every blob's metadata (path, size, MIME, ETag, timestamps) is stored in a per-volume **LMDB** database (`p2/s3/engine.py`). LMDB uses OS-level memory mapping (`mmap`) providing:
 
-### Zero-Copy Reads — Nginx X-Accel-Redirect
+- **Multi-process zero-copy reads** — all 8 Uvicorn workers concurrently read the same memory-mapped file with no locking. The kernel page cache is shared across processes.
+- **Petabyte scale** — virtual map size is capped at 1 TiB per volume. No physical memory is allocated until keys are actually written.
+- **Sub-millisecond prefix scans** — B+Tree range iteration for `ListObjectsV2` without loading all keys into RAM.
+- **`max_readers=1024`** — supports 8 workers × concurrent request burst without reader slot exhaustion.
 
-For `GET Object` requests Django authenticates the request and looks up metadata (~1 ms total Python time), then returns an empty response with an `X-Accel-Redirect` header pointing at the physical file path. Nginx intercepts this header and uses the Linux kernel's `sendfile()` syscall to stream the file directly from NVMe to the network socket — Python's memory stays empty for the entire transfer.
+Each volume's metadata lives at `/storage/volumes/<uuid>/metadata.lmdb`.
+
+| Method | Description |
+|---|---|
+| `engine.put(path, json)` | Write or overwrite blob metadata |
+| `engine.get(path)` | O(1) point lookup |
+| `engine.list(prefix, start_after, max_keys)` | Range scan for ListObjectsV2 |
+| `engine.delete(path)` | Remove a key |
+
+> **Previous:** metadata was stored in a `redb` Rust extension (`p2_s3_meta.so`) which held an exclusive file lock — limiting the server to a single Uvicorn process. LMDB removed this constraint and doubled throughput immediately.
+
+### File Serving — Tiered Python
+
+Without Nginx (default), `GET Object` uses a three-tier strategy based on object size:
+
+| Tier | Size | Strategy | Rationale |
+|---|---|---|---|
+| 1 | ≤ 64 KiB | Synchronous `open().read()` | Page-cached reads complete in ~1 µs and never block the event loop. Avoids thread-pool overhead. |
+| 2 | ≤ 1 MiB | `asyncio.to_thread` | Large enough that blocking the event loop is a real risk. |
+| 3 | > 1 MiB | `aiofiles` streaming | Avoids allocating a single large buffer in process memory. |
+
+The OS page cache is shared across all 8 Uvicorn workers. We do **not** duplicate hot-object bytes in Python memory — that would use 8× the RAM versus the kernel's shared page cache.
+
+### Zero-Copy Reads — Nginx X-Accel-Redirect (optional)
+
+Set `P2_STORAGE__USE_X_ACCEL_REDIRECT=true` and deploy Nginx in front. Django handles auth + LMDB lookup (~1 ms total Python time), then returns `X-Accel-Redirect` pointing at the physical file path. Nginx uses Linux `sendfile()` to stream bytes directly from NVMe to the socket — Python memory stays empty for the entire transfer. See `deploy/nginx-host.conf`.
+
+### Multi-Worker Concurrency
+
+Uvicorn runs with `--workers 8`, spawning 8 independent OS processes. Each worker runs its own uvloop event loop. Because Python's GIL is per-process, all 8 workers execute Python code truly in parallel across CPU cores.
+
+- LMDB allows unlimited concurrent readers across all workers with zero locking.
+- Auth/volume/ACL/metadata caches are per-worker in-process dicts (TTL-based). Cold misses hit the DB; hot paths are pure dict lookups.
+- `--lifespan off` skips the ASGI lifespan probe (Django does not implement it).
 
 ### High-Throughput Writes — aiofiles + Rust checksums
 
-`PUT Object` streams the request body through a 4 MB write buffer to `aiofiles`, computing MD5 and SHA-256 inline on every chunk using Python's `hashlib` (with the Rust `p2_s3_checksum` extension available for AWS SDK checksum headers). Once the file is flushed, metadata is committed to redb in a single transaction.
+`PUT Object` streams the request body through a 4 MB write buffer to `aiofiles`, computing MD5 and SHA-256 inline using `hashlib` (with the Rust `p2_s3_checksum` extension for AWS SDK checksum headers). Once the file is flushed, metadata is committed to LMDB in a single transaction.
 
 ### Event Bus — Dragonfly + arq
 
-After every write, p2 publishes a `blob_post_save` event to a Dragonfly Redis Stream. The `arq` worker picks it up and runs background tasks: EXIF extraction, expiry scheduling, replication, and multipart assembly. Dragonfly is a drop-in Redis replacement that uses all CPU cores, giving far higher stream throughput than single-threaded Redis.
+After every write, p2 publishes a `blob_post_save` event to a Dragonfly Redis Stream. The `arq` worker processes background tasks: EXIF extraction, expiry scheduling, replication, and multipart assembly. Dragonfly is a multi-threaded Redis replacement.
 
 ---
 
 ## Rust Extensions
 
-Three compiled PyO3 extensions ship as pre-built `.so` files — no Rust toolchain needed to run p2.
+Two compiled PyO3 extensions ship as pre-built `.so` files — no Rust toolchain needed to run p2.
 
 ### `p2_s3_crypto` — AWS v4 HMAC signing
 
@@ -81,7 +125,7 @@ Falls back to Python `hmac` / `hashlib` if the `.so` is absent.
 
 Source: `p2/s3/checksum_ext/`
 
-Verifies `x-amz-checksum-*` headers sent by modern AWS SDKs (CRC32, CRC32C, SHA-256, SHA-1). All algorithms run at native speed with no GIL involvement.
+Verifies `x-amz-checksum-*` headers sent by modern AWS SDKs (CRC32, CRC32C, SHA-256, SHA-1). All algorithms run at native speed.
 
 | Function | Description |
 |---|---|
@@ -92,55 +136,6 @@ Verifies `x-amz-checksum-*` headers sent by modern AWS SDKs (CRC32, CRC32C, SHA-
 | `compute_*` variants | Compute each algorithm |
 
 Falls back to Python `hashlib` / `binascii` if absent.
-
-### `p2_s3_meta` — redb metadata engine
-
-Source: `p2/s3/meta_ext/`
-
-The core metadata store. Each volume gets its own redb database at `/storage/volumes/<uuid>/metadata.redb`. A process-level singleton cache (`p2/s3/engine.py`) ensures only one `MetaEngine` instance per database (redb holds an exclusive file lock).
-
-| Method | Description |
-|---|---|
-| `engine.put(path, json)` | Write or overwrite blob metadata |
-| `engine.get(path)` | O(1) point lookup |
-| `engine.list(prefix, start_after, max_keys)` | Range scan for ListObjectsV2 |
-| `engine.delete(path)` | Remove a key |
-
-### Building the extensions
-
-The compiled `.so` files are committed to the repo. Rebuild only when you change the Rust source.
-
-```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Install maturin
-pip install maturin
-
-# Build p2_s3_crypto
-cd p2/s3/rust_ext
-maturin build --release
-cp target/wheels/*.whl ../
-cd -
-
-# Build p2_s3_checksum
-cd p2/s3/checksum_ext
-maturin build --release
-cp target/wheels/*.whl ../
-cd -
-
-# Build p2_s3_meta
-cd p2/s3/meta_ext
-maturin build --release
-cp target/wheels/*.whl ../
-# Install into the venv
-pip install target/wheels/p2_s3_meta-*.whl --force-reinstall
-cd -
-
-# Commit the updated .so files
-git add p2/s3/p2_s3_crypto.so p2/s3/p2_s3_checksum.so p2/s3/p2_s3_meta.so
-git commit -m "chore: rebuild Rust extensions"
-```
 
 ---
 
@@ -160,7 +155,7 @@ docker compose up
 ```
 
 The stack starts:
-- `web` — Uvicorn + uvloop on port 8000
+- `web` — Uvicorn + uvloop, 8 workers, port 8000
 - `worker` — arq background worker
 - `grpc` — tier0 gRPC serve layer on port 50051
 - `redis` — Dragonfly (Redis-compatible) on port 6379
@@ -193,8 +188,8 @@ mkdir -p storage/volumes
 # Run migrations
 uv run python manage.py migrate
 
-# Start the web server
-uvicorn p2.core.asgi:application --reload --loop uvloop
+# Start the web server (single worker for local dev)
+uvicorn p2.core.asgi:application --reload --loop uvloop --lifespan off
 
 # Start the worker (separate terminal)
 uv run python -m arq p2.core.worker.WorkerSettings
@@ -217,7 +212,7 @@ All config is via environment variables. The `P2_` prefix maps to nested YAML ke
 | `REDIS_URL` | `redis://redis:6379/0` | Dragonfly/Redis URL for event streams |
 | `ARQ_REDIS_URL` | `redis://redis:6379/1` | arq task queue URL |
 | `P2_S3__BASE_DOMAIN` | `s3.example.com` | Base domain for virtual-hosted bucket URLs |
-| `P2_STORAGE__USE_X_ACCEL_REDIRECT` | `false` | Set `true` when Nginx handles downloads |
+| `P2_STORAGE__USE_X_ACCEL_REDIRECT` | `false` | Set `true` when Nginx handles downloads via X-Accel-Redirect |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | OTLP collector endpoint (leave blank to disable) |
 | `OTEL_SERVICE_NAME` | `p2` | Service name for traces/metrics |
 
@@ -257,23 +252,44 @@ P2_LIBSQL__FILE=/storage/control.db
 
 ## Enabling Zero-Copy Downloads (Nginx)
 
-Set in `.env`:
-```dotenv
-P2_STORAGE__USE_X_ACCEL_REDIRECT=true
+Set `P2_STORAGE__USE_X_ACCEL_REDIRECT=true` in your environment.
+
+The `deploy/nginx-host.conf` file contains the full ready-to-use Nginx configuration including:
+- Upstream keepalive pool (512 connections, 100K requests per connection)
+- `/internal-storage/` internal location with `sendfile`, `aio threads`, `tcp_nopush`, `directio 512k`
+- Static file serving for `/_/static/`
+
+```bash
+# Install config (run from project root)
+bash scripts/setup.sh
 ```
 
-Add to your Nginx config (see `deploy/nginx.conf` for the full example):
-```nginx
-location /internal-storage/ {
-    internal;
-    alias /storage/;
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-}
+For the X-Accel-Redirect path to work, the Nginx worker user must be able to traverse to your storage directory. If Nginx runs as `http` or `www-data` and your storage is inside a home directory:
+
+```bash
+chmod o+x /home/<user>          # allow traversal into home dir
+chmod -R o+r /path/to/storage/  # ensure files are world-readable
 ```
 
-With this enabled, Python handles auth + metadata (~1 ms) and Nginx streams the file bytes at line rate.
+With Nginx enabled, Python handles auth + metadata (~1–2 ms) and Nginx serves file bytes at line rate via `sendfile()`.
+
+---
+
+## Performance
+
+Benchmarked with [warp](https://github.com/minio/warp) (`--obj.size=4KiB --concurrent=20 --duration=30s`):
+
+| Config | GET (standalone) | Mixed Total |
+|---|---|---|
+| Single Uvicorn worker + redb | ~500 obj/s | ~380 obj/s |
+| 8 Uvicorn workers + LMDB | ~750 obj/s | ~870 obj/s |
+| 8 workers + LMDB + Nginx sendfile | ~1,000+ obj/s (peak 2,000+) | ~1,280 obj/s |
+
+Key architectural decisions for throughput:
+- **LMDB over redb**: LMDB allows multiple OS processes to concurrently memory-map the same file. `redb` enforces an exclusive intra-process lock, making multi-worker deployments impossible.
+- **8 Uvicorn workers**: Bypasses Python's GIL by running separate OS processes. Auth + metadata is CPU-bound Python; parallelising it scales linearly with cores.
+- **Per-process in-memory caches**: Auth, volume, ACL, and metadata lookups are cached in each worker's process memory with TTL expiry. Cache hit = pure dict lookup with zero I/O.
+- **Tiered file serving**: Tiny files read synchronously (OS page-cache, ~1 µs), medium files via thread pool, large files via `aiofiles` streaming. The OS page cache is shared across all workers — no per-process byte duplication.
 
 ---
 
@@ -286,16 +302,6 @@ aws configure --profile p2
 # Secret Access Key: <your API secret>
 # Region:            us-east-1
 # Output format:     json
-```
-
-Or add to `~/.aws/credentials`:
-```ini
-[p2]
-aws_access_key_id = MYAPIKEY
-aws_secret_access_key = MYAPISECRET
-
-[profile p2]
-region = us-east-1
 ```
 
 ### Common operations
@@ -349,30 +355,7 @@ aws s3api put-bucket-cors $EP --bucket my-bucket \
     }]
   }'
 
-# Check if a bucket is public or private
-aws s3api get-bucket-acl $EP --bucket my-bucket
-# Public bucket has a grant with URI: http://acs.amazonaws.com/groups/global/AllUsers
-# Private bucket only has the owner with FULL_CONTROL
-
-# Check bucket policy
-aws s3api get-bucket-policy $EP --bucket my-bucket
-# Returns the JSON policy, or NoSuchBucketPolicy error if none set
-
-# Make a single file publicly accessible on a private bucket
-aws s3api put-bucket-policy $EP --bucket my-bucket \
-  --policy '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::my-bucket/public-file.mp3"
-    }]
-  }'
-# Now http://localhost:8000/my-bucket/public-file.mp3 works anonymously
-# Everything else in the bucket stays private
-
-# Make an entire prefix public
+# Bucket policy — make a prefix public
 aws s3api put-bucket-policy $EP --bucket my-bucket \
   --policy '{
     "Version": "2012-10-17",
@@ -386,13 +369,6 @@ aws s3api put-bucket-policy $EP --bucket my-bucket \
 
 # Remove bucket policy
 aws s3api delete-bucket-policy $EP --bucket my-bucket
-  --lifecycle-configuration '{
-    "Rules":[{
-      "ID":"expire-old","Status":"Enabled",
-      "Expiration":{"Days":30},
-      "Filter":{"Prefix":"tmp/"}
-    }]
-  }'
 ```
 
 ### boto3 example
