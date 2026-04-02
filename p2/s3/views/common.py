@@ -100,17 +100,8 @@ class S3View(View):
         actual_user = getattr(self.request, '_s3_authenticated_user', user)
 
         # Try cache first — works for both public and private volumes
-        cached = get_cached_volume(bucket_name)
-        if cached:
-            uuid_hex, public_read = cached
-            import uuid as uuid_mod
-            vol_uuid = uuid_mod.UUID(hex=uuid_hex)
-            volume = Volume(name=bucket_name, public_read=public_read)
-            volume.uuid = vol_uuid
-            # pk must match uuid so ACL cache key (str(volume.pk)) is correct
-            volume.pk = vol_uuid
-            volume.tags = {}
-
+        volume = get_cached_volume(bucket_name)
+        if volume:
             # Presigned token already validated upstream
             if getattr(self.request, '_presigned_validated', False):
                 return volume
@@ -119,8 +110,8 @@ class S3View(View):
             if await has_volume_permission(actual_user, volume, permission):
                 return volume
 
-            # Public volumes: also check bucket policy (tags={} so no policy)
-            if public_read and permission in ("read", "list"):
+            # Public volumes: also check bucket policy
+            if volume.public_read and permission in ("read", "list"):
                 return volume
 
             LOGGER.warning("get_volume(cache): user '%s' denied '%s' on '%s'",
@@ -130,7 +121,7 @@ class S3View(View):
         # Cache miss — hit the DB once, then cache for all future requests
         try:
             volume = await Volume.objects.aget(name=bucket_name)
-            set_cached_volume(bucket_name, volume.uuid.hex, volume.public_read)
+            set_cached_volume(bucket_name, volume)
         except Volume.DoesNotExist:
             LOGGER.warning("get_volume: Volume '%s' not found in database", bucket_name)
             raise AWSNoSuchBucket

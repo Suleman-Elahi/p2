@@ -10,8 +10,8 @@ from typing import Optional, Tuple, Dict, Any
 _apikey_cache: dict[str, Tuple[str, int, str, bool, float]] = {}
 _APIKEY_TTL = 60.0  # seconds
 
-# Volume cache: bucket_name -> (volume_uuid_hex, public_read, expires_at)
-_volume_cache: dict[str, Tuple[str, bool, float]] = {}
+# Volume cache: bucket_name -> (Volume, expires_at)
+_volume_cache: dict[str, Tuple[Any, float]] = {}
 _VOLUME_TTL = 300.0  # 5 minutes — volumes rarely change
 
 # ACL cache: (user_id, volume_pk, permission) -> (allowed, expires_at)
@@ -37,17 +37,17 @@ def set_cached_apikey(access_key: str, secret_key: str, user_id: int, username: 
     _apikey_cache[access_key] = (secret_key, user_id, username, is_superuser, time.monotonic() + _APIKEY_TTL)
 
 
-def get_cached_volume(bucket_name: str) -> Optional[Tuple[str, bool]]:
-    """Return (volume_uuid_hex, public_read) if cached."""
+def get_cached_volume(bucket_name: str) -> Optional[Any]:
+    """Return Volume instance if cached."""
     entry = _volume_cache.get(bucket_name)
-    if entry and entry[2] > time.monotonic():
-        return (entry[0], entry[1])
+    if entry and entry[1] > time.monotonic():
+        return entry[0]
     return None
 
 
-def set_cached_volume(bucket_name: str, uuid_hex: str, public_read: bool):
+def set_cached_volume(bucket_name: str, volume: Any):
     """Cache a volume lookup result."""
-    _volume_cache[bucket_name] = (uuid_hex, public_read, time.monotonic() + _VOLUME_TTL)
+    _volume_cache[bucket_name] = (volume, time.monotonic() + _VOLUME_TTL)
 
 
 def get_cached_acl(user_id: int, volume_pk: str, permission: str) -> Optional[bool]:

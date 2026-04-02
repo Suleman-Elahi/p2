@@ -20,6 +20,13 @@ from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
 from p2.s3.utils import decode_aws_chunked
+from p2.s3.cache import get_cached_metadata, set_cached_metadata, invalidate_metadata
+import json
+import asyncio
+from django.conf import settings
+from django.http import StreamingHttpResponse
+
+USE_ACCEL_REDIRECT = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
 
 
 def _format_http_date(mtime_str: str) -> str:
@@ -209,7 +216,6 @@ class ObjectView(S3View):
 
     async def get(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html"""
-        import asyncio
         await self._check_presigned(request, bucket, path)
 
         # Object tagging
@@ -224,7 +230,6 @@ class ObjectView(S3View):
 
         volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
 
-        from p2.s3.cache import get_cached_metadata, set_cached_metadata
         attributes = get_cached_metadata(volume.uuid.hex, path)
 
         if attributes is None:
@@ -232,15 +237,8 @@ class ObjectView(S3View):
             metadata_json = engine.get(path)
             if not metadata_json:
                 return HttpResponse(status=404)
-            import json
             attributes = json.loads(metadata_json)
             set_cached_metadata(volume.uuid.hex, path, attributes)
-
-        # Yield to event loop — lets other coroutines run while we build the response.
-        # Critical for throughput under concurrency: without this the single-threaded
-        # async loop serialises all 20 concurrent requests through the sync cache/dict
-        # lookups above, starving the I/O scheduler.
-        await asyncio.sleep(0)
         
         content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
         total_size = int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
@@ -255,15 +253,11 @@ class ObjectView(S3View):
                 resp['ETag'] = etag
                 return await self._apply_cors(request, resp, volume)
 
-        from django.conf import settings
         # X-Accel-Redirect: Django hands off to Nginx sendfile() — zero-copy.
-        # Enabled via USE_X_ACCEL_REDIRECT=true. Nginx must have the
-        # /internal-storage/ location block pointing at /storage/.
-        use_accel = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
         internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{volume.uuid.hex}{path}")
         fs_path = internal_path.replace('/internal-storage/', '/storage/')
 
-        if use_accel:
+        if USE_ACCEL_REDIRECT:
             # X-Accel-Redirect to Nginx — zero-copy sendfile path.
             # Do NOT set Content-Length here: the body is empty from uvicorn's
             # perspective. Nginx reads the file and sets the correct length itself.
@@ -279,18 +273,25 @@ class ObjectView(S3View):
                 response['Content-Disposition'] = request.GET['response-content-disposition']
             return await self._apply_cors(request, response, volume)
         else:
-            # Direct aiofiles streaming (no Nginx)
-            import aiofiles
-            from django.http import StreamingHttpResponse
+            # Direct Python fallback (no Nginx)
+            if total_size <= 1048576:  # 1MB
+                def _read_all():
+                    with open(fs_path, 'rb') as f:
+                        return f.read()
+                data = await asyncio.to_thread(_read_all)
+                response = HttpResponse(data, content_type=content_type, status=200)
+            else:
+                import aiofiles
 
-            async def _stream():
-                async with aiofiles.open(fs_path, 'rb') as f:
-                    chunk = await f.read(1 << 20)  # 1 MB
-                    while chunk:
-                        yield chunk
-                        chunk = await f.read(1 << 20)
+                async def _stream():
+                    async with aiofiles.open(fs_path, 'rb') as f:
+                        chunk = await f.read(1 << 20)  # 1 MB
+                        while chunk:
+                            yield chunk
+                            chunk = await f.read(1 << 20)
 
-            response = StreamingHttpResponse(_stream(), content_type=content_type, status=200)
+                response = StreamingHttpResponse(_stream(), content_type=content_type, status=200)
+
             response['Content-Length'] = total_size
             response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
             response['ETag'] = etag

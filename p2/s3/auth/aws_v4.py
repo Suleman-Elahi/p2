@@ -138,21 +138,26 @@ class AWSV4Authentication(BaseAuth):
         return '&'.join(pairs)
 
     def _get_canonical_headers(self, only: List[str]) -> str:
-        """Build canonical headers string by direct lookup instead of sorting all META.
+        """Build canonical headers string by direct lookup instead of iterating all META.
 
-        Avoids O(n*log n) sort over ~40 META entries on every request.
+        Avoids O(N) string processing over ~40 META entries on every request.
         only is already a small list (typically 3-4 headers from signed_headers).
         """
-        # Build a flat lookup: normalised-header-name -> value
-        meta_map: dict[str, str] = {}
-        for k, v in self.request.META.items():
-            normalised = k.replace('HTTP_', '', 1).replace('_', '-').lower()
-            meta_map[normalised] = str(v).strip()
-
         canonical_headers = ""
         for key in sorted(only):
-            value = meta_map.get(key)
-            if value is not None:
+            # Transform e.g. "host" -> "HTTP_HOST", "x-amz-date" -> "HTTP_X_AMZ_DATE"
+            meta_key = 'HTTP_' + key.upper().replace('-', '_')
+            if meta_key in self.request.META:
+                value = str(self.request.META[meta_key]).strip()
+                canonical_headers += f"{key}:{value}\n"
+            elif key == 'content-type' and 'CONTENT_TYPE' in self.request.META:
+                value = str(self.request.META['CONTENT_TYPE']).strip()
+                canonical_headers += f"{key}:{value}\n"
+            elif key == 'content-length' and 'CONTENT_LENGTH' in self.request.META:
+                value = str(self.request.META['CONTENT_LENGTH']).strip()
+                canonical_headers += f"{key}:{value}\n"
+            elif key == 'host' and 'SERVER_NAME' in self.request.META and 'HTTP_HOST' not in self.request.META:
+                value = str(self.request.META['SERVER_NAME']).strip()
                 canonical_headers += f"{key}:{value}\n"
         return canonical_headers
 
@@ -234,8 +239,14 @@ class AWSV4Authentication(BaseAuth):
         # would consume the stream before the view can process it.
         if self.request.method in ('PUT', 'POST'):
             return
-        # For small requests (GET params, HEAD, etc.) verify the hash
-        request_body_hash = hashlib.sha256(self.request.body).hexdigest()
+        
+        # Shortcut empty requests bypassing lazy `.body` stream evaluation
+        if self.request.method in ('GET', 'HEAD', 'OPTIONS'):
+            request_body_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        else:
+            # For small requests (DELETE, etc.) verify the hash
+            request_body_hash = hashlib.sha256(self.request.body).hexdigest()
+            
         if auth_request.hash != request_body_hash:
             LOGGER.warning("CONTENT_SHA256 Header/param incorrect: theirs=%s ours=%s",
                            auth_request.hash, request_body_hash)
