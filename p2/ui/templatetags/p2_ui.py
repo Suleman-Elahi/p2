@@ -88,4 +88,14 @@ def blob_url(blob):
 @register.filter('blob_string')
 def blob_string(blob):
     """Read blob's content and return as string"""
+    # Handle BlobPseudo objects mapped to physical disk
+    if hasattr(blob, 'attributes'):
+        internal_path = blob.attributes.get('internal_path')
+        if internal_path:
+            fs_path = internal_path.replace('/internal-storage/', '/storage/')
+            try:
+                with open(fs_path, 'rb') as f:
+                    return f.read().decode('utf-8')
+            except Exception:
+                return ''
     return blob.read().decode('utf-8')

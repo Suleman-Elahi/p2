@@ -21,12 +21,28 @@ if command -v nginx &>/dev/null; then
     NGINX_CONF="$REPO_ROOT/deploy/nginx-host.conf"
     NGINX_DEST="/etc/nginx/sites-available/p2"
 
+    sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     sudo cp "$NGINX_CONF" "$NGINX_DEST"
     sudo rm -f /etc/nginx/sites-enabled/default
     sudo ln -sf "$NGINX_DEST" /etc/nginx/sites-enabled/p2
 
-    sudo nginx -t && sudo nginx -s reload
-    info "Nginx configured and reloaded."
+    # Patch nginx.conf for Arch Linux context if needed
+    if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
+        info "Patching /etc/nginx/nginx.conf to include sites-enabled..."
+        sudo sed -i '/http {/a \    include /etc/nginx/sites-enabled/*;\n    types_hash_max_size 2048;\n    types_hash_bucket_size 64;' /etc/nginx/nginx.conf
+    fi
+
+    sudo nginx -t
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet nginx; then
+            sudo systemctl reload nginx
+        else
+            sudo systemctl enable --now nginx
+        fi
+    else
+        sudo nginx -s reload || sudo nginx
+    fi
+    info "Nginx configured and started."
 else
     warn "nginx not found — skipping nginx setup."
 fi

@@ -327,6 +327,9 @@ class FolderDownloadView(View):
 
 
 class FolderDeleteView(View):
+    async def post(self, request, volume_pk, folder_prefix):
+        return await self.get(request, volume_pk, folder_prefix)
+
     async def get(self, request, volume_pk, folder_prefix):
         if not await _require_login(request):
             return _login_redirect(request)

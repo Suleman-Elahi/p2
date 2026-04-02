@@ -39,7 +39,7 @@ class P2LoginView(View):
     async def get(self, request: HttpRequest) -> HttpResponse:
         form = AuthenticationForm()
         next_url = request.GET.get('next', settings.LOGIN_REDIRECT_URL)
-        return render(request, self.template_name, {
+        return await sync_to_async(render)(request, self.template_name, {
             'form': form,
             'redirect_field_name': 'next',
             'redirect_field_value': next_url,
@@ -50,7 +50,7 @@ class P2LoginView(View):
         next_url = request.POST.get('next') or request.GET.get('next') or settings.LOGIN_REDIRECT_URL
 
         if not await sync_to_async(form.is_valid)():
-            return render(request, self.template_name, {
+            return await sync_to_async(render)(request, self.template_name, {
                 'form': form,
                 'redirect_field_name': 'next',
                 'redirect_field_value': next_url,
