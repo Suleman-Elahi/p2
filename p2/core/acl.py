@@ -62,7 +62,7 @@ async def has_volume_permission(user, volume: Volume, permission: str) -> bool:
     
     # Use pk (uuid) for cache key since Volume uses UUID as primary key
     volume_pk = str(volume.pk)
-    
+
     # Check cache
     cached = get_cached_acl(user_id, volume_pk, permission)
     if cached is not None:

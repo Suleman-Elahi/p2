@@ -91,7 +91,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
-    'p2.s3.middleware.S3RoutingMiddleware',  # MUST be first - short-circuits S3 requests
+    'p2.s3.middleware.S3RoutingMiddleware',  # MUST be first - handles S3 auth + routing
     'p2.core.middleware.HealthCheckMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -179,7 +179,7 @@ CACHES = {
 }
 
 SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
-SESSION_SAVE_EVERY_REQUEST = True
+SESSION_SAVE_EVERY_REQUEST = False  # Only save when session data actually changes
 SESSION_COOKIE_SAMESITE = 'Lax'
 SESSION_COOKIE_SECURE = False
 

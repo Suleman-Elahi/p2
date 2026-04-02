@@ -138,19 +138,22 @@ class AWSV4Authentication(BaseAuth):
         return '&'.join(pairs)
 
     def _get_canonical_headers(self, only: List[str]) -> str:
-        """Fix header keys from HTTP_X to x"""
+        """Build canonical headers string by direct lookup instead of sorting all META.
+
+        Avoids O(n*log n) sort over ~40 META entries on every request.
+        only is already a small list (typically 3-4 headers from signed_headers).
+        """
+        # Build a flat lookup: normalised-header-name -> value
+        meta_map: dict[str, str] = {}
+        for k, v in self.request.META.items():
+            normalised = k.replace('HTTP_', '', 1).replace('_', '-').lower()
+            meta_map[normalised] = str(v).strip()
+
         canonical_headers = ""
-
-        def sorter(item):
-            """Remove HTTP_ prefix, replace underscores with hyphens
-            and lowercase convert to lowercase for comparison"""
-            return item[0].replace('HTTP_', '', 1).replace('_', '-').lower()
-
-        for header_key, header_value in sorted(self.request.META.items(), key=sorter):
-            fixed_key = header_key.replace('HTTP_', '', 1).replace('_', '-').lower()
-            if fixed_key in only:
-                # AWS spec: trim leading/trailing whitespace from header values
-                canonical_headers += f"{fixed_key}:{str(header_value).strip()}\n"
+        for key in sorted(only):
+            value = meta_map.get(key)
+            if value is not None:
+                canonical_headers += f"{key}:{value}\n"
         return canonical_headers
 
     def _get_sha256(self, data: Any) -> str:
@@ -179,25 +182,24 @@ class AWSV4Authentication(BaseAuth):
         Uses in-memory cache to avoid database round-trips on hot paths."""
         from p2.s3.cache import get_cached_apikey, set_cached_apikey
         
-        # Check cache first
+        # Check cache first — stores the already-decrypted secret, no Fernet on hot path
         cached = get_cached_apikey(access_key)
         if cached:
             secret_key, user_id, username, is_superuser = cached
-            # Return a minimal APIKey-like object with cached data
-            # Create a minimal User object without DB hit
             from django.contrib.auth.models import User
             user = User(id=user_id, username=username, is_superuser=is_superuser)
-            user._state.adding = False  # Mark as existing in DB
-            
+            user._state.adding = False
+
             class CachedAPIKey:
                 def __init__(self, ak, sk, u):
                     self.access_key = ak
                     self._secret = sk
                     self.user = u
-                
+
                 def decrypt_secret_key(self):
+                    # Secret is already decrypted in cache — no Fernet overhead
                     return self._secret
-            
+
             return CachedAPIKey(access_key, secret_key, user)
         
         # Cache miss - hit database

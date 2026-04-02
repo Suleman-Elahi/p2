@@ -70,6 +70,27 @@ def _prepare(request, bucket):
     request.user = AnonymousUser()
 
 
+async def _dispatch_s3(request):
+    """Resolve and call the S3 view directly, bypassing the rest of the middleware stack."""
+    from django.urls import resolve, Resolver404
+    from django.http import HttpResponse
+
+    try:
+        match = resolve(request.path_info, urlconf=request.urlconf)
+    except Resolver404:
+        return HttpResponse(status=404)
+
+    request.resolver_match = match
+    try:
+        response = await match.func(request, *match.args, **match.kwargs)
+    except AWSError as exc:
+        response = _s3_error(exc)
+    except Exception as exc:
+        LOGGER.exception("S3 view error: %s", exc)
+        response = HttpResponse(status=500)
+    return response
+
+
 @sync_and_async_middleware
 def S3RoutingMiddleware(get_response):
     if asyncio.iscoroutinefunction(get_response):
@@ -89,13 +110,11 @@ def S3RoutingMiddleware(get_response):
             except AWSError as exc:
                 return _s3_error(exc)
 
-            try:
-                response = await get_response(request)
-                if request.method == 'OPTIONS' and response.status_code == 405:
-                    response.status_code = 200
-                return response
-            except AWSError as exc:
-                return _s3_error(exc)
+            # Bypass the rest of the middleware stack entirely — go straight to the view.
+            response = await _dispatch_s3(request)
+            if request.method == 'OPTIONS' and response.status_code == 405:
+                response.status_code = 200
+            return response
     else:
         def middleware(request: HttpRequest):
             bucket = _extract_bucket(request)

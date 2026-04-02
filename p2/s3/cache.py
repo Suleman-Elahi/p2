@@ -12,7 +12,7 @@ _APIKEY_TTL = 60.0  # seconds
 
 # Volume cache: bucket_name -> (volume_uuid_hex, public_read, expires_at)
 _volume_cache: dict[str, Tuple[str, bool, float]] = {}
-_VOLUME_TTL = 60.0
+_VOLUME_TTL = 300.0  # 5 minutes — volumes rarely change
 
 # ACL cache: (user_id, volume_pk, permission) -> (allowed, expires_at)
 _acl_cache: dict[Tuple[int, str, str], Tuple[bool, float]] = {}
@@ -20,7 +20,7 @@ _ACL_TTL = 30.0
 
 # Metadata cache: (volume_uuid_hex, path) -> (attributes_dict, expires_at)
 _metadata_cache: dict[Tuple[str, str], Tuple[Dict[str, Any], float]] = {}
-_METADATA_TTL = 10.0  # Short TTL for metadata freshness
+_METADATA_TTL = 60.0  # 60s — safe for read-heavy workloads; invalidated on write
 _METADATA_MAX_SIZE = 10000  # Max entries to prevent memory bloat
 
 

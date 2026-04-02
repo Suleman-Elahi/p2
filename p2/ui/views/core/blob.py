@@ -30,6 +30,12 @@ async def _require_login(request):
     return is_auth
 
 
+def _login_redirect(request):
+    """Return a redirect response to the login page with next= set correctly."""
+    login_url = reverse('auth_login')
+    return redirect(f"{login_url}?next={request.path}")
+
+
 class BlobPseudo:
     def __init__(self, volume, path, attributes):
         self.volume = volume
@@ -43,8 +49,7 @@ class BlobPseudo:
 class BlobListView(View):
     async def get(self, request, volume_pk):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'list'):
             raise PermissionDenied
@@ -124,8 +129,7 @@ class BlobListView(View):
 class BlobDetailView(View):
     async def get(self, request, volume_pk, blob_path):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'read'):
             raise PermissionDenied
@@ -165,8 +169,7 @@ class BlobInlineView(View):
     """Serve blob inline for preview."""
     async def get(self, request, volume_pk, blob_path):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'read'):
             raise PermissionDenied
@@ -191,8 +194,7 @@ class BlobInlineView(View):
 class BlobDownloadView(View):
     async def get(self, request, volume_pk, blob_path):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'read'):
             raise PermissionDenied
@@ -221,8 +223,7 @@ class BlobDeleteView(View):
 
     async def _delete(self, request, volume_pk, blob_path):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'delete'):
             raise PermissionDenied
@@ -248,8 +249,7 @@ class BlobDeleteView(View):
 class FolderDownloadView(View):
     async def get(self, request, volume_pk, folder_prefix):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'read'):
             raise PermissionDenied
@@ -329,8 +329,7 @@ class FolderDownloadView(View):
 class FolderDeleteView(View):
     async def get(self, request, volume_pk, folder_prefix):
         if not await _require_login(request):
-            from django.conf import settings
-            return redirect(f"{settings.LOGIN_URL}?next={request.path}")
+            return _login_redirect(request)
         volume = await sync_to_async(get_object_or_404)(Volume, pk=volume_pk)
         if not await has_volume_permission(request.user, volume, 'delete'):
             raise PermissionDenied

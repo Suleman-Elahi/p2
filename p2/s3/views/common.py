@@ -95,23 +95,39 @@ class S3View(View):
                          object_key: str = '') -> Volume:
         """Look up a Volume by name and verify the user has the given permission."""
         from p2.s3.cache import get_cached_volume, set_cached_volume
-        from asgiref.sync import sync_to_async
-        
-        # Use the S3-authenticated user if available (Django's AuthenticationMiddleware
-        # may have overwritten request.user with AnonymousUser)
+
+        # Use the S3-authenticated user if available
         actual_user = getattr(self.request, '_s3_authenticated_user', user)
-        
-        # Try cache first
+
+        # Try cache first — works for both public and private volumes
         cached = get_cached_volume(bucket_name)
         if cached:
             uuid_hex, public_read = cached
-            if public_read and permission in ("read", "list"):
-                import uuid as uuid_mod
-                volume = Volume(name=bucket_name, public_read=public_read)
-                volume.uuid = uuid_mod.UUID(hex=uuid_hex)
+            import uuid as uuid_mod
+            vol_uuid = uuid_mod.UUID(hex=uuid_hex)
+            volume = Volume(name=bucket_name, public_read=public_read)
+            volume.uuid = vol_uuid
+            # pk must match uuid so ACL cache key (str(volume.pk)) is correct
+            volume.pk = vol_uuid
+            volume.tags = {}
+
+            # Presigned token already validated upstream
+            if getattr(self.request, '_presigned_validated', False):
                 return volume
-        
-        # Need full volume for ACL/policy checks
+
+            # has_volume_permission has its own ACL cache — O(1) on warm path
+            if await has_volume_permission(actual_user, volume, permission):
+                return volume
+
+            # Public volumes: also check bucket policy (tags={} so no policy)
+            if public_read and permission in ("read", "list"):
+                return volume
+
+            LOGGER.warning("get_volume(cache): user '%s' denied '%s' on '%s'",
+                           getattr(actual_user, 'username', '?'), permission, bucket_name)
+            raise AWSNoSuchBucket
+
+        # Cache miss — hit the DB once, then cache for all future requests
         try:
             volume = await Volume.objects.aget(name=bucket_name)
             set_cached_volume(bucket_name, volume.uuid.hex, volume.public_read)
@@ -119,16 +135,13 @@ class S3View(View):
             LOGGER.warning("get_volume: Volume '%s' not found in database", bucket_name)
             raise AWSNoSuchBucket
 
-        # Presigned token was already validated
         if getattr(self.request, '_presigned_validated', False):
             return volume
 
-        # Fast path: ACL / public_read / superuser
         allowed = await has_volume_permission(actual_user, volume, permission)
         if allowed:
             return volume
 
-        # Slow path: bucket policy
         if await _policy_allows(volume, permission, bucket_name, object_key):
             return volume
 
