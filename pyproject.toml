@@ -10,60 +10,50 @@ requires-python = ">=3.12"
 dependencies = [
     # Django core
     "django>=5.0",
-    "djangorestframework>=3.15",
     "django-filter>=23.0",
     "django-crispy-forms>=2.0",
     "crispy-bootstrap4>=2022.1",
-
     # Database
     "django-libsql>=0.0.1",
     "libsql-experimental>=0.0.31",
     "lmdb>=1.4",
-
     # Auth
-    "djangorestframework-simplejwt>=5.3",
     "authlib>=1.3",
-
-    # API schema
-    "drf-spectacular>=0.27",
-
+    # API Schema / Core
+    "django-ninja>=1.1.0",
+    "django-ninja-jwt>=5.3.2",
     # Image processing
     "Pillow>=10.0",
-
     # ASGI server
     "uvicorn[standard]>=0.27",
     "uvloop>=0.19",
-
     # Async task queue
     "arq>=0.25",
-
     # Redis
     "redis[hiredis]>=5.0",
-
     # Async I/O
     "aiofiles>=23.0",
     "aiobotocore>=2.9",
-
     # gRPC
     "grpcio>=1.60",
     "grpcio-reflection>=1.60",
     "protobuf>=5.0",
-
     # OpenTelemetry
     "opentelemetry-sdk>=1.22",
     "opentelemetry-exporter-otlp>=1.22",
     "opentelemetry-instrumentation-django>=0.43b0",
     "opentelemetry-instrumentation-logging>=0.43b0",
-
     # Encryption
     "cryptography>=42.0",
-
     # Utilities
     "boto3>=1.34",
     "PyYAML>=6.0",
     "ruamel.yaml>=0.18",
     "python-magic>=0.4",
     "pytz>=2024.1",
+    "python-dotenv>=1.2.2",
+    "whitenoise>=6.12.0",
+    "granian[dotenv,uvloop]>=2.7.2",
 ]
 
 [project.optional-dependencies]

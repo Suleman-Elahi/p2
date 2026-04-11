@@ -26,7 +26,7 @@
 
       {# Upload dropzone — standalone form, no table inside #}
       <div class="dz"
-           data-upload-url="{% url 'p2_api:volume-upload' pk=volume.pk %}?prefix={{ request.GET.prefix }}"
+           data-upload-url="{% url 'p2_api:api-1.0.0:upload_files' volume_uuid=volume.pk %}?prefix={{ request.GET.prefix }}"
            data-volume-pk="{{ volume.pk }}"
            data-list-url="{% url 'p2_ui:core-blob-list' volume_pk=volume.pk %}?prefix={{ request.GET.prefix }}">
         <div class="dz-message mb-3 p-3 border rounded text-center text-muted"

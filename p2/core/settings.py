@@ -48,6 +48,31 @@ X_FRAME_OPTIONS = "SAMEORIGIN"
 
 # Set True in production when Nginx handles X-Accel-Redirect (zero-copy reads)
 USE_X_ACCEL_REDIRECT = CONFIG.y_bool("storage.use_x_accel_redirect", default=False)
+# Publish S3 post-save events without blocking PUT response.
+S3_ASYNC_EVENT_PUBLISH = CONFIG.y_bool("s3.async_event_publish", default=False)
+# Optional bounded queue for Redis Stream publishing (experimental, off by default).
+S3_EVENT_QUEUE_ENABLED = CONFIG.y_bool("s3.event_queue.enabled", default=False)
+S3_EVENT_QUEUE_MAX_SIZE = int(CONFIG.y("s3.event_queue.max_size", default=8192))
+S3_EVENT_QUEUE_BATCH_SIZE = int(CONFIG.y("s3.event_queue.batch_size", default=64))
+S3_EVENT_QUEUE_FLUSH_MS = int(CONFIG.y("s3.event_queue.flush_ms", default=5))
+S3_EVENT_QUEUE_WAIT_FOR_ACK = CONFIG.y_bool("s3.event_queue.wait_for_ack", default=False)
+S3_BLOB_SHARD_DEPTH = max(1, min(2, int(CONFIG.y("s3.blob.shard_depth", default=2))))
+# LMDB metadata durability knobs (default durable; can be relaxed for throughput experiments).
+S3_METADATA_LMDB_SYNC = CONFIG.y_bool("s3.metadata.lmdb.sync", default=True)
+S3_METADATA_LMDB_METASYNC = CONFIG.y_bool("s3.metadata.lmdb.metasync", default=True)
+# Optional bounded queue for async metadata writes (reduces PUT tail latency under concurrency).
+S3_METADATA_WRITE_QUEUE_ENABLED = CONFIG.y_bool("s3.metadata.write_queue.enabled", default=False)
+S3_METADATA_WRITE_QUEUE_MAX_SIZE = int(CONFIG.y("s3.metadata.write_queue.max_size", default=8192))
+S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size", default=64))
+S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=5.0))
+# In-process hot-path cache TTLs (seconds) for S3 auth/ACL checks.
+S3_CACHE_APIKEY_TTL_SECONDS = float(CONFIG.y("s3.cache.apikey_ttl_seconds", default=600))
+S3_CACHE_VOLUME_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_ttl_seconds", default=600))
+S3_CACHE_ACL_TTL_SECONDS = float(CONFIG.y("s3.cache.acl_ttl_seconds", default=600))
+S3_CACHE_VOLUME_PERMISSION_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_permission_ttl_seconds", default=600))
+S3_CACHE_METADATA_TTL_SECONDS = float(CONFIG.y("s3.cache.metadata_ttl_seconds", default=60))
+# Base directory for LMDB volume data. Override with P2_STORAGE__ROOT for local dev.
+STORAGE_ROOT = CONFIG.y("storage.root", default="/storage")
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 ALLOWED_HOSTS = ['*']
@@ -66,9 +91,8 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.sites',
     # Third-party
-    'rest_framework',
-    'rest_framework_simplejwt',
-    'drf_spectacular',
+    'ninja',
+    'ninja_jwt',
     'django_filters',
     'crispy_forms',
     'crispy_bootstrap4',
@@ -97,6 +121,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'p2.core.middleware.S3AuthPreserveMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.http.ConditionalGetMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -235,44 +260,8 @@ AUTHLIB_OAUTH_CLIENTS = {
 }
 
 # ---------------------------------------------------------------------------
-# REST Framework — simplejwt + spectacular
+# REST Framework (Removed - Using Django Ninja)
 # ---------------------------------------------------------------------------
-
-REST_FRAMEWORK = {
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.LimitOffsetPagination',
-    'PAGE_SIZE': 100,
-    'DEFAULT_FILTER_BACKENDS': [
-        'django_filters.rest_framework.DjangoFilterBackend',
-        'rest_framework.filters.OrderingFilter',
-        'rest_framework.filters.SearchFilter',
-    ],
-    'DEFAULT_PERMISSION_CLASSES': (
-        'p2.api.permissions.CustomObjectPermissions',
-    ),
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework.authentication.SessionAuthentication',
-        'rest_framework.authentication.BasicAuthentication',
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
-    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
-}
-
-SPECTACULAR_SETTINGS = {
-    'TITLE': 'p2 API',
-    'DESCRIPTION': 'p2 S3-compatible object storage API',
-    'VERSION': __version__,
-    'SERVE_INCLUDE_SCHEMA': False,
-    'SECURITY': [{'jwtAuth': []}],
-    'COMPONENTS': {
-        'securitySchemes': {
-            'jwtAuth': {
-                'type': 'http',
-                'scheme': 'bearer',
-                'bearerFormat': 'JWT',
-            }
-        }
-    },
-}
 
 # ---------------------------------------------------------------------------
 # Password validation
@@ -337,10 +326,12 @@ LOGGING = {
         'level': 'WARNING',
     },
     'loggers': {
-        'p2.s3.middleware': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
+        'p2.s3.middleware': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'p2.s3.views.objects': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
+        'p2.s3.engine': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'p2': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'django': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
-        'django.contrib.sessions': {'handlers': ['console'], 'level': 'DEBUG', 'propagate': False},
+        'django.contrib.sessions': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'arq': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
         'grpc': {'handlers': ['console'], 'level': 'WARNING', 'propagate': False},
     },
@@ -358,6 +349,7 @@ if TEST:
 # ---------------------------------------------------------------------------
 
 if DEBUG:
+    INTERNAL_IPS = ['127.0.0.1', '::1']
     try:
         import debug_toolbar  # noqa: F401
         import django_extensions  # noqa: F401

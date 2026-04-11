@@ -17,6 +17,21 @@ class ListView(View):
         """Return list of buckets the authenticated user can access."""
         root = ElementTree.Element("{%s}ListAllMyBucketsResult" % XML_NAMESPACE)
 
+        # Handle anonymous users
+        if not request.user.is_authenticated:
+            owner = ElementTree.SubElement(root, "Owner")
+            ElementTree.SubElement(owner, 'ID').text = "anonymous"
+            ElementTree.SubElement(owner, 'DisplayName').text = "Anonymous"
+            buckets = ElementTree.SubElement(root, 'Buckets')
+            
+            # Only show public volumes for anonymous users
+            async for volume in Volume.objects.filter(public_read=True).aiterator():
+                bucket = ElementTree.SubElement(buckets, "Bucket")
+                ElementTree.SubElement(bucket, "Name").text = volume.name
+                ElementTree.SubElement(bucket, "CreationDate").text = "2006-02-03T16:45:09.000Z"
+            
+            return XMLResponse(root)
+
         owner = ElementTree.SubElement(root, "Owner")
         ElementTree.SubElement(owner, 'ID').text = str(request.user.id)
         ElementTree.SubElement(owner, 'DisplayName').text = request.user.username

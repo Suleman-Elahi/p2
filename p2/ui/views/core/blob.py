@@ -181,7 +181,8 @@ class BlobInlineView(View):
         internal_path = attributes.get('internal_path')
         if not internal_path:
             raise Http404
-        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+        from p2.core.storage_path import internal_to_fs
+        fs_path = internal_to_fs(internal_path)
         mime = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
         try:
             response = FileResponse(open(fs_path, 'rb'), content_type=mime)
@@ -206,7 +207,8 @@ class BlobDownloadView(View):
         internal_path = attributes.get('internal_path')
         if not internal_path:
             raise Http404
-        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+        from p2.core.storage_path import internal_to_fs
+        fs_path = internal_to_fs(internal_path)
         try:
             return FileResponse(open(fs_path, 'rb'), as_attachment=True,
                                 filename=blob_path.split('/')[-1])
@@ -233,7 +235,8 @@ class BlobDeleteView(View):
             attributes = json.loads(metadata_json)
             internal_path = attributes.get('internal_path')
             if internal_path:
-                fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                from p2.core.storage_path import internal_to_fs
+                fs_path = internal_to_fs(internal_path)
                 try:
                     os.remove(fs_path)
                 except OSError:
@@ -270,7 +273,8 @@ class FolderDownloadView(View):
                 attr = json.loads(json_val)
                 if not attr.get(ATTR_BLOB_IS_FOLDER, False):
                     internal_path = attr.get('internal_path', '')
-                    fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                    from p2.core.storage_path import internal_to_fs
+                    fs_path = internal_to_fs(internal_path) if internal_path else ''
                     blobs.append((key, fs_path))
             except Exception:
                 pass
@@ -352,7 +356,8 @@ class FolderDeleteView(View):
                 attr = json.loads(json_val)
                 internal_path = attr.get('internal_path', '')
                 if internal_path:
-                    fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                    from p2.core.storage_path import internal_to_fs
+                    fs_path = internal_to_fs(internal_path)
                     try:
                         os.remove(fs_path)
                     except OSError:

@@ -67,6 +67,22 @@ fn md5_bytes<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
     PyBytes::new(py, &Md5::digest(data))
 }
 
+/// Write small payload to disk and compute hashes sequentially in C/Rust speed.
+#[pyfunction]
+fn write_and_hash_small(path: &str, data: &[u8]) -> pyo3::PyResult<(String, String)> {
+    use std::fs::File;
+    use std::io::Write;
+    
+    // Write directly
+    let mut f = File::create(path)?;
+    f.write_all(data)?;
+    
+    // Hash
+    let md5_hex = hex::encode(Md5::digest(data));
+    let sha256_hex = hex::encode(Sha256::digest(data));
+    Ok((md5_hex, sha256_hex))
+}
+
 #[pymodule]
 fn p2_s3_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(derive_signing_key, m)?)?;
@@ -74,5 +90,6 @@ fn p2_s3_crypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hmac_sha256_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(md5_hex, m)?)?;
     m.add_function(wrap_pyfunction!(md5_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(write_and_hash_small, m)?)?;
     Ok(())
 }

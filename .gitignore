@@ -122,3 +122,7 @@ p2.crt
 p2.key
 static/**
 storage/**
+
+# Generated nginx config (created by scripts/setup.sh from deploy/nginx-host.conf).
+# Contains machine-local absolute paths — do NOT commit.
+nginx-p2.conf

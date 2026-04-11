@@ -93,9 +93,13 @@ async def handle_image_exif(data: dict) -> None:
     if mime and not mime.startswith("image/"):
         return
 
-    # Reconstruct the filesystem path from the blob UUID (matches PUT handler layout)
-    fs_path = (f"/storage/volumes/{volume_uuid}"
-               f"/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}")
+    # Prefer explicit internal path from event payload to avoid layout coupling.
+    from p2.core.storage_path import blob_fs_path, internal_to_fs
+    internal_path = data.get("internal_path", "")
+    if internal_path:
+        fs_path = internal_to_fs(internal_path)
+    else:
+        fs_path = blob_fs_path(volume_uuid, blob_uuid)
 
     if not os.path.exists(fs_path):
         logger.debug("image_exif: file not found at %s, skipping", fs_path)

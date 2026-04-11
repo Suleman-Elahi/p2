@@ -81,7 +81,9 @@ ensure_rust() {
     if command -v cargo &>/dev/null; then
         info "cargo found: $(cargo --version)"
         # Make sure env is sourced if installed via rustup
-        [[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
+        if [[ -f "$HOME/.cargo/env" ]]; then
+            source "$HOME/.cargo/env"
+        fi
         return
     fi
 

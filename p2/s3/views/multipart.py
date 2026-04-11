@@ -20,7 +20,7 @@ from p2.core.prefix_helper import make_absolute_path
 from p2.s3.constants import XML_NAMESPACE
 from p2.s3.http import XMLResponse
 from p2.s3.views.common import S3View
-from p2.s3.utils import decode_aws_chunked
+from p2.s3.utils import decode_aws_chunked, iter_request_body
 
 
 LOGGER = logging.getLogger(__name__)
@@ -70,7 +70,8 @@ class MultipartUploadView(S3View):
         part_number = int(request.GET['partNumber'])
         
         blob_uuid = uuid.uuid4().hex
-        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, "parts", upload_id)
+        from p2.core.storage_path import storage_path
+        dir_path = storage_path("volumes", volume.uuid.hex, "parts", upload_id)
         os.makedirs(dir_path, exist_ok=True)
         fs_path = os.path.join(dir_path, f"{part_number}_{blob_uuid}")
         
@@ -78,16 +79,22 @@ class MultipartUploadView(S3View):
         blob_size = 0
         
         # Read body and decode aws-chunked if needed
-        data = await asyncio.to_thread(request.read)
         content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
         decoded_length = request.META.get('HTTP_X_AMZ_DECODED_CONTENT_LENGTH')
-        if 'aws-chunked' in content_encoding or decoded_length:
-            data = decode_aws_chunked(data)
+        is_aws_chunked = 'aws-chunked' in content_encoding or decoded_length
         
         async with aiofiles.open(fs_path, 'wb') as f:
-            await f.write(data)
-            md5_hash.update(data)
-            blob_size = len(data)
+            if is_aws_chunked:
+                data = await asyncio.to_thread(request.read)
+                data = decode_aws_chunked(data)
+                await f.write(data)
+                md5_hash.update(data)
+                blob_size = len(data)
+            else:
+                async for chunk in iter_request_body(request, 4 * 1024 * 1024):
+                    await f.write(chunk)
+                    md5_hash.update(chunk)
+                    blob_size += len(chunk)
                 
         final_md5 = md5_hash.hexdigest()
 
@@ -144,7 +151,8 @@ class MultipartUploadView(S3View):
             valid_parts.append(attr)
             
         blob_uuid = uuid.uuid4().hex
-        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+        from p2.core.storage_path import storage_path
+        dir_path = storage_path("volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
         os.makedirs(dir_path, exist_ok=True)
         final_fs_path = os.path.join(dir_path, blob_uuid)
         internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
@@ -168,7 +176,8 @@ class MultipartUploadView(S3View):
         m_attr = json.loads(meta_str) if meta_str else {}
         engine.delete(f"/.multipart/{upload_id}/_meta")
         try:
-            os.rmdir(os.path.join("/storage", volume.uuid.hex, "parts", upload_id))
+            from p2.core.storage_path import storage_path
+            os.rmdir(storage_path(volume.uuid.hex, "parts", upload_id))
         except OSError: pass
 
         engine.put(path, json.dumps({
@@ -205,7 +214,8 @@ class MultipartUploadView(S3View):
             engine.delete(key)
             
         try:
-            shutil.rmtree(os.path.join("/storage", volume.uuid.hex, "parts", upload_id))
+            from p2.core.storage_path import storage_path
+            shutil.rmtree(storage_path(volume.uuid.hex, "parts", upload_id))
         except OSError: pass
             
         return HttpResponse(status=204)

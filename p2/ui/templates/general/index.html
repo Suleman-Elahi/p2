@@ -13,7 +13,7 @@
   {% for volume in object_list %}
   <div class="col-md-4">
     <div class="card">
-      <form action="{% url 'p2_api:volume-upload' pk=volume.pk %}" class="dz" method="POST">
+      <form action="{% url 'p2_api:api-1.0.0:upload_files' volume_uuid=volume.pk %}" class="dz" method="POST">
         {% csrf_token %}
         <div class="card-body text-white bg-dark">
           <h5 class="card-title">{{ volume.name }}</h5>

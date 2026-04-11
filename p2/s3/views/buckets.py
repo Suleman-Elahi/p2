@@ -387,7 +387,8 @@ class BucketView(S3View):
                     attr = json.loads(meta_json)
                     internal_path = attr.get('internal_path')
                     if internal_path:
-                        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                        from p2.core.storage_path import internal_to_fs
+                        fs_path = internal_to_fs(internal_path)
                         try:
                             os.remove(fs_path)
                         except OSError:

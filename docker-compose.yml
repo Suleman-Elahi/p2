@@ -13,9 +13,22 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
 
+  collectstatic:
+    build: .
+    command: python manage.py collectstatic --noinput
+    env_file: .env
+    volumes:
+      - .:/app
+      - venv:/app/.venv
+    environment:
+      DJANGO_SETTINGS_MODULE: p2.core.settings
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
   web:
     build: .
-    command: ["uvicorn", "p2.core.asgi:application", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--workers", "8", "--lifespan", "off"]
+    command: ["granian", "--interface", "asginl", "--host", "0.0.0.0", "--port", "8000", "--loop", "uvloop", "--workers", "8", "--runtime-mode", "mt", "--runtime-threads", "2", "--backpressure", "2048", "--no-ws", "--log", "--log-level", "error", "p2.core.asgi:application"]
     env_file: .env
     volumes:
       - .:/app
@@ -26,14 +39,15 @@ services:
       - "8000:8000"
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
+      P2_REDIS__HOST: redis
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
-      P2_STORAGE__USE_X_ACCEL_REDIRECT: "false"
     depends_on:
-      migrate:
+      collectstatic:
         condition: service_completed_successfully
       redis:
         condition: service_started
+
 
   worker:
     build: .
@@ -46,10 +60,11 @@ services:
       - ./storage:/storage
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
+      P2_REDIS__HOST: redis
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
-      migrate:
+      collectstatic:
         condition: service_completed_successfully
       redis:
         condition: service_started
@@ -67,10 +82,11 @@ services:
       - "50051:50051"
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
+      P2_REDIS__HOST: redis
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
-      migrate:
+      collectstatic:
         condition: service_completed_successfully
       redis:
         condition: service_started

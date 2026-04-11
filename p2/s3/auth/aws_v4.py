@@ -1,6 +1,7 @@
 """p2 s3 authentication mixin"""
 import hashlib
 import hmac
+import time
 from typing import Any, List, Optional
 from urllib.parse import quote
 
@@ -25,6 +26,9 @@ except ImportError:
     _rust_crypto = None
     _RUST_AVAILABLE = False
 
+_SIGNING_KEY_CACHE: dict[tuple[str, str, str, str], tuple[bytes, float]] = {}
+_SIGNING_KEY_TTL_SECONDS = 900.0
+
 
 def _hmac_sign(key: bytes, msg: str) -> bytes:
     if _RUST_AVAILABLE:
@@ -33,12 +37,27 @@ def _hmac_sign(key: bytes, msg: str) -> bytes:
 
 
 def _derive_signing_key(secret_key: str, date: str, region: str, service: str) -> bytes:
+    cache_key = (secret_key, date, region, service)
+    cached = _SIGNING_KEY_CACHE.get(cache_key)
+    now_mono = time.monotonic()
+    if cached and cached[1] > now_mono:
+        return cached[0]
+
     if _RUST_AVAILABLE:
-        return bytes(_rust_crypto.derive_signing_key(secret_key, date, region, service))
+        key = bytes(_rust_crypto.derive_signing_key(secret_key, date, region, service))
+        _SIGNING_KEY_CACHE[cache_key] = (key, now_mono + _SIGNING_KEY_TTL_SECONDS)
+        return key
     k_date = _hmac_sign(('AWS4' + secret_key).encode('utf-8'), date)
     k_region = _hmac_sign(k_date, region)
     k_service = _hmac_sign(k_region, service)
-    return _hmac_sign(k_service, 'aws4_request')
+    key = _hmac_sign(k_service, 'aws4_request')
+    _SIGNING_KEY_CACHE[cache_key] = (key, now_mono + _SIGNING_KEY_TTL_SECONDS)
+    # Simple bounded cache eviction to avoid unbounded growth.
+    if len(_SIGNING_KEY_CACHE) > 2048:
+        for k, (_, exp) in list(_SIGNING_KEY_CACHE.items()):
+            if exp <= now_mono:
+                _SIGNING_KEY_CACHE.pop(k, None)
+    return key
 
 
 class SignatureMismatch(Exception):

@@ -12,14 +12,13 @@ from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
                                ATTR_BLOB_STAT_CTIME)
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX,
                              XML_NAMESPACE)
-from p2.s3.checksum import verify_request_checksum
 from p2.s3.cors import apply_cors_headers, find_matching_rule, get_cors_rules
 from p2.s3.errors import AWSAccessDenied, AWSBadDigest, AWSNoSuchKey
 from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
-from p2.s3.utils import decode_aws_chunked
+from p2.s3.utils import decode_aws_chunked, iter_request_body
 from p2.s3.cache import get_cached_metadata, set_cached_metadata, invalidate_metadata
 import json
 import asyncio
@@ -29,13 +28,14 @@ from django.http import StreamingHttpResponse
 USE_ACCEL_REDIRECT = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
 
 
-def _format_http_date(mtime_str: str) -> str:
-    """Convert stored mtime string to RFC 7231 HTTP date format."""
+def _format_http_date(mtime_str: str) -> str | None:
+    """Convert stored mtime string to RFC 7231 HTTP date format.
+    Returns None when mtime_str is absent so callers can skip the header."""
     if not mtime_str:
-        return ''
+        return None
     dt = parse_datetime(mtime_str)
     if dt is None:
-        return mtime_str
+        return None
     return format_datetime(dt, usegmt=True)
 
 
@@ -51,6 +51,14 @@ _CANNED_ACL_PERMS = {
     "bucket-owner-read":        ["read"],
     "bucket-owner-full-control":["read", "write", "delete"],
 }
+
+
+def _log_event_publish_result(task: asyncio.Task) -> None:
+    """Surface background publish failures without affecting request latency."""
+    try:
+        task.result()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Failed to publish blob event (background): %s", exc)
 
 
 
@@ -100,6 +108,28 @@ def _user_tags_from_blob(blob: dict) -> dict:
         for k, v in tags.items()
         if k.startswith(TAG_S3_USER_TAG_PREFIX)
     }
+
+
+def _validate_checksum_headers(request, *, crc32_b64: str | None = None,
+                               crc32c_b64: str | None = None,
+                               sha256_hex: str | None = None,
+                               sha1_b64: str | None = None):
+    """Validate x-amz-checksum-* headers if present.
+
+    Only validates algorithms that were computed by the caller.
+    """
+    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32')
+    if expected and crc32_b64 and expected != crc32_b64:
+        raise AWSBadDigest
+    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32C')
+    if expected and crc32c_b64 and expected != crc32c_b64:
+        raise AWSBadDigest
+    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA256')
+    if expected and sha256_hex and expected != sha256_hex:
+        raise AWSBadDigest
+    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA1')
+    if expected and sha1_b64 and expected != sha1_b64:
+        raise AWSBadDigest
 
 
 def _parse_tagging_xml(body: bytes) -> dict:
@@ -206,7 +236,9 @@ class ObjectView(S3View):
         response = HttpResponse(status=200)
         response['Content-Length'] = attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
         response['Content-Type'] = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-        response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+        last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+        if last_mod:
+            response['Last-Modified'] = last_mod
         etag = attributes.get('blob.p2.io/hash/md5', '')
         if etag:
             response['ETag'] = f'"{etag}"'
@@ -236,6 +268,7 @@ class ObjectView(S3View):
             engine = await self.get_engine(volume)
             metadata_json = engine.get(path)
             if not metadata_json:
+                LOGGER.warning("GET 404: bucket=%s path=%r", bucket, path)
                 return HttpResponse(status=404)
             attributes = json.loads(metadata_json)
             set_cached_metadata(volume.uuid.hex, path, attributes)
@@ -255,7 +288,8 @@ class ObjectView(S3View):
 
         # X-Accel-Redirect: Django hands off to Nginx sendfile() — zero-copy.
         internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{volume.uuid.hex}{path}")
-        fs_path = internal_path.replace('/internal-storage/', '/storage/')
+        from p2.core.storage_path import internal_to_fs
+        fs_path = internal_to_fs(internal_path)
 
         if USE_ACCEL_REDIRECT:
             # X-Accel-Redirect to Nginx — zero-copy sendfile path.
@@ -263,8 +297,11 @@ class ObjectView(S3View):
             # perspective. Nginx reads the file and sets the correct length itself.
             response = HttpResponse()
             response['X-Accel-Redirect'] = internal_path
+            response['X-P2-Accel'] = '1'
             response['Content-Type'] = content_type
-            response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            if last_mod:
+                response['Last-Modified'] = last_mod
             response['ETag'] = etag
             response['Accept-Ranges'] = 'bytes'
             if 'response-content-type' in request.GET:
@@ -274,26 +311,24 @@ class ObjectView(S3View):
             return await self._apply_cors(request, response, volume)
         else:
             # Pure Python file serving — no Nginx dependency.
-            #
-            # The OS page cache handles hot-object caching automatically and is
-            # shared across all 8 Uvicorn workers, so we don't duplicate it in
-            # Python memory. We only choose the right async strategy per size.
-            #
-            # Tier 1: tiny file (≤64KiB) — sync read.
-            #   Page-cached reads complete in ~1µs and never actually block the
-            #   event loop. Avoids thread-pool submission overhead.
-            # Tier 2: medium file (≤1MiB) — thread pool read.
-            #   Large enough that blocking the event loop is a real risk.
-            # Tier 3: large file (>1MiB) — aiofiles streaming.
-            #   Avoids allocating a single large buffer in process memory.
-            if total_size <= 65536:
+            # Tiered strategy to reduce threadpool overhead for small objects
+            # and avoid loading large objects fully into memory.
+            SMALL_SYNC_MAX = 64 * 1024
+            MEDIUM_THREAD_MAX = 1024 * 1024
+            STREAM_CHUNK_SIZE = 4 * 1024 * 1024
+
+            import os
+            if not os.path.exists(fs_path):
+                return HttpResponse(status=404)
+
+            if total_size <= SMALL_SYNC_MAX:
                 try:
                     with open(fs_path, 'rb') as f:
                         data = f.read()
                     response = HttpResponse(data, content_type=content_type, status=200)
                 except OSError:
                     return HttpResponse(status=404)
-            elif total_size <= 1048576:
+            elif total_size <= MEDIUM_THREAD_MAX:
                 try:
                     data = await asyncio.to_thread(lambda: open(fs_path, 'rb').read())
                     response = HttpResponse(data, content_type=content_type, status=200)
@@ -302,18 +337,22 @@ class ObjectView(S3View):
             else:
                 import aiofiles
 
-                async def _stream():
+                async def _file_stream():
                     async with aiofiles.open(fs_path, 'rb') as f:
-                        chunk = await f.read(1 << 20)  # 1 MB
-                        while chunk:
+                        while True:
+                            chunk = await f.read(STREAM_CHUNK_SIZE)
+                            if not chunk:
+                                break
                             yield chunk
-                            chunk = await f.read(1 << 20)
 
-                response = StreamingHttpResponse(_stream(), content_type=content_type, status=200)
+                response = StreamingHttpResponse(_file_stream(), content_type=content_type, status=200)
 
             response['Content-Length'] = total_size
-            response['Last-Modified'] = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            if last_mod:
+                response['Last-Modified'] = last_mod
             response['ETag'] = etag
+            response['Accept-Ranges'] = 'bytes'
             response['Accept-Ranges'] = 'bytes'
             if 'response-content-type' in request.GET:
                 response['Content-Type'] = request.GET['response-content-type']
@@ -344,15 +383,11 @@ class ObjectView(S3View):
             return await self._copy_object(request, bucket, path, copy_source)
 
         volume = await self.get_volume(request.user, bucket, 'write')
-        import os
         import uuid
         import json
-        import aiofiles
         from django.utils.timezone import now
         
         engine = await self.get_engine(volume)
-        metadata_json = engine.get(path)
-        existing_attributes = json.loads(metadata_json) if metadata_json else {}
 
         # Honour Content-Type from the client
         client_ct = request.META.get('CONTENT_TYPE', 'application/octet-stream')
@@ -360,58 +395,158 @@ class ObjectView(S3View):
         # Read body — decode aws-chunked if present
         # AWS SDKs use x-amz-decoded-content-length when sending chunked payloads
         import asyncio
-        body = await asyncio.to_thread(request.read)
         content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
         decoded_length = request.META.get('HTTP_X_AMZ_DECODED_CONTENT_LENGTH')
-
-        # Detect aws-chunked: either explicit header or decoded-length hint
-        if 'aws-chunked' in content_encoding or decoded_length:
-            body = decode_aws_chunked(body)
-            LOGGER.debug("PUT %s: decoded aws-chunked %d -> %d bytes", path, len(body) + 175, len(body))
+        is_aws_chunked = 'aws-chunked' in content_encoding or decoded_length
+        content_length_raw = request.META.get('CONTENT_LENGTH', '')
+        try:
+            content_length = int(content_length_raw) if content_length_raw else -1
+        except (TypeError, ValueError):
+            content_length = -1
+        small_put_fast_path = (
+            not is_aws_chunked and
+            content_length >= 0 and
+            content_length <= 64 * 1024
+        )
 
         # Streaming high-throughput write
         blob_uuid = uuid.uuid4().hex
-        dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
-        os.makedirs(dir_path, exist_ok=True)
-        fs_path = os.path.join(dir_path, blob_uuid)
-        internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+        from p2.core.storage_path import blob_dir, blob_fs_path, blob_internal_path, ensure_dir
+        dir_path = blob_dir(volume.uuid.hex, blob_uuid)
+        ensure_dir(dir_path)
+        fs_path = blob_fs_path(volume.uuid.hex, blob_uuid)
+        internal_path = blob_internal_path(volume.uuid.hex, blob_uuid)
 
-        # Use Rust checksum extension for inline hashing (releases GIL, ~3x faster)
-        try:
-            from p2.s3 import p2_s3_checksum as _rust_cs
-            final_md5 = _rust_cs.md5_hex(body)
-            final_sha256 = _rust_cs.sha256_hex(body)
-        except (ImportError, AttributeError):
-            import hashlib
-            final_md5 = hashlib.md5(body).hexdigest()
-            final_sha256 = hashlib.sha256(body).hexdigest()
+        import binascii
+        import base64
+        import hashlib
 
-        blob_size = len(body)
+        expected_crc32 = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32')
+        expected_crc32c = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32C')
+        expected_sha256 = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA256')
+        expected_sha1 = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA1')
 
-        async with aiofiles.open(fs_path, 'wb') as f:
-            await f.write(body)
+        md5_hasher = hashlib.md5()
+        sha256_hasher = hashlib.sha256()
+        sha1_hasher = hashlib.sha1() if expected_sha1 else None
+        crc32_val = 0
 
-        # Update and save attributes in redb
-        existing_attributes.update({
+        # CRC32C: only validate if Rust extension is available
+        crc32c_buf = None
+        _rust_cs = None
+        if expected_crc32c:
+            try:
+                from p2.s3 import p2_s3_checksum as _rust_cs
+                crc32c_buf = []
+            except (ImportError, AttributeError):
+                _rust_cs = None
+                crc32c_buf = None
+
+        blob_size = 0
+        final_md5 = ""
+        final_sha256 = ""
+        md5_digest = b""
+
+        if small_put_fast_path:
+            # Hot path for tiny uploads: offload file IO and hashing entirely to Rust 
+            # bypasses python context-switching and hashes concurrently.
+            body = request.body
+            blob_size = len(body)
+            from p2.s3 import p2_s3_crypto
+            # Drops the GIL and executes in Rust natively.
+            final_md5, final_sha256 = await asyncio.to_thread(p2_s3_crypto.write_and_hash_small, fs_path, body)
+            md5_digest = binascii.unhexlify(final_md5)
+            
+            if sha1_hasher:
+                sha1_hasher.update(body)
+            if expected_crc32:
+                crc32_val = binascii.crc32(body, crc32_val)
+            if crc32c_buf is not None:
+                crc32c_buf.append(body)
+        else:
+            import aiofiles
+            async with aiofiles.open(fs_path, 'wb') as f:
+                if is_aws_chunked:
+                    body = await asyncio.to_thread(request.read)
+                    body = decode_aws_chunked(body)
+                    await f.write(body)
+                    blob_size = len(body)
+                    md5_hasher.update(body)
+                    sha256_hasher.update(body)
+                    if sha1_hasher:
+                        sha1_hasher.update(body)
+                    if expected_crc32:
+                        crc32_val = binascii.crc32(body, crc32_val)
+                    if crc32c_buf is not None:
+                        crc32c_buf.append(body)
+                else:
+                    async for chunk in iter_request_body(request, 4 * 1024 * 1024):
+                        await f.write(chunk)
+                        blob_size += len(chunk)
+                        md5_hasher.update(chunk)
+                        sha256_hasher.update(chunk)
+                        if sha1_hasher:
+                            sha1_hasher.update(chunk)
+                        if expected_crc32:
+                            crc32_val = binascii.crc32(chunk, crc32_val)
+                        if crc32c_buf is not None:
+                            crc32c_buf.append(chunk)
+
+            md5_digest = md5_hasher.digest()
+            final_md5 = md5_hasher.hexdigest()
+            final_sha256 = sha256_hasher.hexdigest()
+
+        expected_md5 = request.META.get('HTTP_CONTENT_MD5')
+        if expected_md5:
+            computed_md5_b64 = base64.b64encode(md5_digest).decode('ascii')
+            if computed_md5_b64 != expected_md5:
+                raise AWSBadDigest
+
+        crc32_b64 = None
+        if expected_crc32:
+            crc32_b64 = base64.b64encode(
+                (crc32_val & 0xFFFFFFFF).to_bytes(4, byteorder='big', signed=False)
+            ).decode('ascii')
+
+        sha1_b64 = None
+        if sha1_hasher:
+            sha1_b64 = base64.b64encode(sha1_hasher.digest()).decode('ascii')
+
+        crc32c_b64 = None
+        if expected_crc32c and _rust_cs is not None and crc32c_buf is not None:
+            crc32c_b64 = _rust_cs.compute_crc32c(b"".join(crc32c_buf))
+
+        _validate_checksum_headers(
+            request,
+            crc32_b64=crc32_b64,
+            crc32c_b64=crc32c_b64,
+            sha256_hex=final_sha256 if expected_sha256 else None,
+            sha1_b64=sha1_b64,
+        )
+
+        # Update and save attributes in LMDB (single put, no read-modify-write).
+        now_ts = str(now())
+        metadata_payload = {
             ATTR_BLOB_MIME: client_ct,
             ATTR_BLOB_SIZE_BYTES: str(blob_size),
             ATTR_BLOB_IS_FOLDER: False,
-            ATTR_BLOB_STAT_MTIME: str(now()),
+            ATTR_BLOB_STAT_MTIME: now_ts,
+            ATTR_BLOB_STAT_CTIME: now_ts,
             'blob.p2.io/hash/md5': final_md5,
             'blob.p2.io/hash/sha256': final_sha256,
             'internal_path': internal_path
-        })
-        
-        if not metadata_json:
-            existing_attributes[ATTR_BLOB_STAT_CTIME] = str(now())
+        }
 
-        engine.put(path, json.dumps(existing_attributes))
+        metadata_json = json.dumps(metadata_payload)
+        from p2.s3.meta_write import write_metadata
+        await write_metadata(engine, path, metadata_json)
         
         # Invalidate metadata cache after write
         from p2.s3.cache import invalidate_metadata
         invalidate_metadata(volume.uuid.hex, path)
 
-        # Publish event to Dragonfly for background processing (webhooks, EXIF, etc.)
+        # Publish event for background processing (webhooks, EXIF, etc.).
+        # Optional non-blocking mode removes publish latency from the PUT critical path.
         try:
             from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
             event = make_event(
@@ -421,12 +556,19 @@ class ObjectView(S3View):
             )
             event['blob_path'] = path
             event['mime'] = client_ct
-            await publish_event(STREAM_BLOB_POST_SAVE, event)
+            event['internal_path'] = internal_path
+            if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
+                task = asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
+                task.add_done_callback(_log_event_publish_result)
+            else:
+                await publish_event(STREAM_BLOB_POST_SAVE, event)
         except Exception as e:
             LOGGER.warning("Failed to publish blob event: %s", e)
 
         response = HttpResponse(status=200)
         response['ETag'] = f'"{final_md5}"'
+        response['X-P2-Put-FastPath'] = '1' if small_put_fast_path else '0'
+        response['X-P2-Put-MetaQueue'] = '1' if getattr(settings, 'S3_METADATA_WRITE_QUEUE_ENABLED', False) else '0'
         return await self._apply_cors(request, response, volume)
 
     async def delete(self, request, bucket, path):
@@ -442,7 +584,8 @@ class ObjectView(S3View):
             attributes = json.loads(metadata_json)
             internal_path = attributes.get('internal_path')
             if internal_path:
-                fs_path = internal_path.replace('/internal-storage/', '/storage/')
+                from p2.core.storage_path import internal_to_fs
+                fs_path = internal_to_fs(internal_path)
                 try:
                     os.remove(fs_path)
                 except OSError:
@@ -547,7 +690,9 @@ class ObjectView(S3View):
         src_fs = src_internal_path.replace('/internal-storage/', '/storage/')
         
         blob_uuid = uuid.uuid4().hex
-        dir_path = os.path.join("/storage", dest_volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+        from p2.core.storage_path import storage_path, internal_to_fs
+        src_fs = internal_to_fs(src_internal_path)
+        dir_path = storage_path("volumes", dest_volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
         os.makedirs(dir_path, exist_ok=True)
         dest_fs = os.path.join(dir_path, blob_uuid)
         dest_internal_path = f"/internal-storage/volumes/{dest_volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"

@@ -5,23 +5,28 @@ bucket/key combinations. TTL is short (60s) to balance freshness vs performance.
 """
 import time
 from typing import Optional, Tuple, Dict, Any
+from django.conf import settings
 
 # Simple TTL cache for API keys: access_key -> (secret_key, user_id, username, is_superuser, expires_at)
 _apikey_cache: dict[str, Tuple[str, int, str, bool, float]] = {}
-_APIKEY_TTL = 60.0  # seconds
+_APIKEY_TTL = float(getattr(settings, "S3_CACHE_APIKEY_TTL_SECONDS", 600.0))
 
 # Volume cache: bucket_name -> (Volume, expires_at)
 _volume_cache: dict[str, Tuple[Any, float]] = {}
-_VOLUME_TTL = 300.0  # 5 minutes — volumes rarely change
+_VOLUME_TTL = float(getattr(settings, "S3_CACHE_VOLUME_TTL_SECONDS", 600.0))
 
 # ACL cache: (user_id, volume_pk, permission) -> (allowed, expires_at)
 _acl_cache: dict[Tuple[int, str, str], Tuple[bool, float]] = {}
-_ACL_TTL = 30.0
+_ACL_TTL = float(getattr(settings, "S3_CACHE_ACL_TTL_SECONDS", 600.0))
 
 # Metadata cache: (volume_uuid_hex, path) -> (attributes_dict, expires_at)
 _metadata_cache: dict[Tuple[str, str], Tuple[Dict[str, Any], float]] = {}
-_METADATA_TTL = 60.0  # 60s — safe for read-heavy workloads; invalidated on write
+_METADATA_TTL = float(getattr(settings, "S3_CACHE_METADATA_TTL_SECONDS", 60.0))
 _METADATA_MAX_SIZE = 10000  # Max entries to prevent memory bloat
+
+# Volume permission cache: (user_id, bucket_name, permission) -> (allowed, expires_at)
+_volume_perm_cache: dict[Tuple[int, str, str], Tuple[bool, float]] = {}
+_VOLUME_PERM_TTL = float(getattr(settings, "S3_CACHE_VOLUME_PERMISSION_TTL_SECONDS", 600.0))
 
 
 def get_cached_apikey(access_key: str) -> Optional[Tuple[str, int, str, bool]]:
@@ -118,3 +123,17 @@ def clear_all_caches():
     _volume_cache.clear()
     _acl_cache.clear()
     _metadata_cache.clear()
+    _volume_perm_cache.clear()
+
+
+def get_cached_volume_permission(user_id: int, bucket_name: str, permission: str) -> Optional[bool]:
+    """Return cached bucket permission result if available and not expired."""
+    entry = _volume_perm_cache.get((user_id, bucket_name, permission))
+    if entry and entry[1] > time.monotonic():
+        return entry[0]
+    return None
+
+
+def set_cached_volume_permission(user_id: int, bucket_name: str, permission: str, allowed: bool):
+    """Cache bucket permission result for a user."""
+    _volume_perm_cache[(user_id, bucket_name, permission)] = (allowed, time.monotonic() + _VOLUME_PERM_TTL)

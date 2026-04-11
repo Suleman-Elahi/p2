@@ -1,5 +1,0 @@
----
-- version: v1alpha1
-  group: k8s.beryju.org
-  kind: P2
-  chart: /opt/helm/helm-charts/p2

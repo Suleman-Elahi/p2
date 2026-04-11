@@ -1,6 +1,0 @@
-apiVersion: v1
-appVersion: 0.8.0-rc2
-description: A Helm chart for p2.
-icon: https://git.beryju.org/uploads/-/system/project/avatar/111/icon_2x.png
-name: p2
-version: 0.8.0-rc2

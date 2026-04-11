@@ -54,7 +54,8 @@ async def complete_multipart(ctx, upload_id: str, user_pk: int, volume_pk: str, 
         return
 
     blob_uuid = __import__('uuid').uuid4().hex
-    dir_path = os.path.join("/storage/volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
+    from p2.core.storage_path import storage_path
+    dir_path = storage_path("volumes", volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
     os.makedirs(dir_path, exist_ok=True)
     final_fs_path = os.path.join(dir_path, blob_uuid)
     internal_path = (f"/internal-storage/volumes/{volume.uuid.hex}"

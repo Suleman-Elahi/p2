@@ -70,6 +70,9 @@ class S3View(View):
 
     def _check_content_md5(self):
         """Validate Content-MD5 Header (length and validity)"""
+        # For streaming uploads, validation is handled in the PUT handler
+        if self.request.method in ('PUT', 'POST'):
+            return
         if CONTENT_MD5_HEADER in self.request.META:
             if self.request.META.get(CONTENT_MD5_HEADER) == '':
                 raise AWSInvalidDigest
@@ -94,10 +97,16 @@ class S3View(View):
     async def get_volume(self, user, bucket_name: str, permission: str,
                          object_key: str = '') -> Volume:
         """Look up a Volume by name and verify the user has the given permission."""
-        from p2.s3.cache import get_cached_volume, set_cached_volume
+        from p2.s3.cache import (
+            get_cached_volume,
+            set_cached_volume,
+            get_cached_volume_permission,
+            set_cached_volume_permission,
+        )
 
         # Use the S3-authenticated user if available
         actual_user = getattr(self.request, '_s3_authenticated_user', user)
+        user_id = getattr(actual_user, 'id', None)
 
         # Try cache first — works for both public and private volumes
         volume = get_cached_volume(bucket_name)
@@ -106,14 +115,27 @@ class S3View(View):
             if getattr(self.request, '_presigned_validated', False):
                 return volume
 
+            if user_id is not None:
+                cached_perm = get_cached_volume_permission(user_id, bucket_name, permission)
+                if cached_perm:
+                    return volume
+                if cached_perm is False:
+                    raise AWSNoSuchBucket
+
             # has_volume_permission has its own ACL cache — O(1) on warm path
             if await has_volume_permission(actual_user, volume, permission):
+                if user_id is not None:
+                    set_cached_volume_permission(user_id, bucket_name, permission, True)
                 return volume
 
             # Public volumes: also check bucket policy
             if volume.public_read and permission in ("read", "list"):
+                if user_id is not None:
+                    set_cached_volume_permission(user_id, bucket_name, permission, True)
                 return volume
 
+            if user_id is not None:
+                set_cached_volume_permission(user_id, bucket_name, permission, False)
             LOGGER.warning("get_volume(cache): user '%s' denied '%s' on '%s'",
                            getattr(actual_user, 'username', '?'), permission, bucket_name)
             raise AWSNoSuchBucket
@@ -129,13 +151,26 @@ class S3View(View):
         if getattr(self.request, '_presigned_validated', False):
             return volume
 
+        if user_id is not None:
+            cached_perm = get_cached_volume_permission(user_id, bucket_name, permission)
+            if cached_perm:
+                return volume
+            if cached_perm is False:
+                raise AWSNoSuchBucket
+
         allowed = await has_volume_permission(actual_user, volume, permission)
         if allowed:
+            if user_id is not None:
+                set_cached_volume_permission(user_id, bucket_name, permission, True)
             return volume
 
         if await _policy_allows(volume, permission, bucket_name, object_key):
+            if user_id is not None:
+                set_cached_volume_permission(user_id, bucket_name, permission, True)
             return volume
 
+        if user_id is not None:
+            set_cached_volume_permission(user_id, bucket_name, permission, False)
         LOGGER.warning("get_volume: user '%s' denied '%s' on '%s'",
                        getattr(actual_user, 'username', '?'), permission, bucket_name)
         raise AWSNoSuchBucket

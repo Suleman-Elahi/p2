@@ -38,7 +38,7 @@
           Re-Index all blobs in this Volume. Use this after you've changed a component which updates new blobs to apply changes to existing blobs.
           {% endblocktrans %}
         </h6>
-        <button data-api-url="{% url 'p2_api:volume-re-index' pk=volume.pk %}" class="card-link btn btn-outline btn-sm btn-primary">{% trans 'Re-Index' %}</button>
+        <button data-api-url="{% url 'p2_api:api-1.0.0:re_index' volume_uuid=volume.pk %}" class="card-link btn btn-outline btn-sm btn-primary">{% trans 'Re-Index' %}</button>
       </div>
     </div>
   </div>

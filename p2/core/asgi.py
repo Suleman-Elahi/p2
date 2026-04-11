@@ -17,3 +17,10 @@ if os.environ.get("OTEL_SDK_DISABLED", "false").lower() != "true":
     setup_telemetry()
 
 application = get_asgi_application()
+
+try:
+    from p2.s3.asgi_handler import S3ProxyASGIApp
+    application = S3ProxyASGIApp(application)
+except ImportError as e:
+    import logging
+    logging.getLogger(__name__).warning("Failed to load S3 ASGI protocol fastpath, defaulting to Django: %s", e)

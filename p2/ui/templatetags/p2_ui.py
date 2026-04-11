@@ -92,7 +92,8 @@ def blob_string(blob):
     if hasattr(blob, 'attributes'):
         internal_path = blob.attributes.get('internal_path')
         if internal_path:
-            fs_path = internal_path.replace('/internal-storage/', '/storage/')
+            from p2.core.storage_path import internal_to_fs
+            fs_path = internal_to_fs(internal_path)
             try:
                 with open(fs_path, 'rb') as f:
                     return f.read().decode('utf-8')
