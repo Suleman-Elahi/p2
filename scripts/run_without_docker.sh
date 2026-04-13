@@ -11,6 +11,16 @@ die()  { echo -e "\033[0;31mERROR:${NC} $*" >&2; exit 1; }
 
 cd "$REPO_ROOT"
 
+# ── Environment Setup ─────────────────────────────────────────────────────────
+if [[ ! -f "$REPO_ROOT/.env" ]]; then
+    if [[ -f "$REPO_ROOT/.env.example" ]]; then
+        info "No .env file found. Creating one automatically from .env.example..."
+        cp "$REPO_ROOT/.env.example" "$REPO_ROOT/.env"
+    else
+        die "No .env file found, and .env.example is missing!"
+    fi
+fi
+
 # ── Resolve storage root ────────────────────────────────────────────────────────
 _resolve_storage_root() {
     local env_file="$REPO_ROOT/.env"
@@ -37,18 +47,54 @@ STATIC_ROOT="$REPO_ROOT/static"
 info "Creating required directories..."
 mkdir -p "$STORAGE_ROOT/volumes" static
 
+# ── Port ───────────────────────────────────────────────────────────────────────
+PORT=8787
+
 # ── Nginx config (regenerate from template so paths are always correct) ─────────
+if ! command -v nginx &>/dev/null; then
+    warn "nginx not found. Installing..."
+    sudo apt-get update && sudo apt-get install -y nginx
+fi
+
 if command -v nginx &>/dev/null; then
-    TEMPLATE="$REPO_ROOT/deploy/nginx-host.conf"
     DEV_CONF="$REPO_ROOT/nginx-p2.conf"
-    if [[ -f "$TEMPLATE" ]]; then
-        info "Regenerating nginx-p2.conf from template..."
-        sed \
-            -e "s|__STORAGE_PATH__|${STORAGE_ROOT}|g" \
-            -e "s|__STATIC_PATH__|${STATIC_ROOT}|g" \
-            "$TEMPLATE" > "$DEV_CONF"
-        info "nginx-p2.conf written (storage=$STORAGE_ROOT)"
-    fi
+    info "Generating nginx-p2.conf inline..."
+    cat > "$DEV_CONF" <<EOF
+server {
+    listen 80;
+    server_name localhost _;
+
+    client_max_body_size 2G;
+
+    location /static/ {
+        alias ${STATIC_ROOT}/;
+        expires 7d;
+        access_log off;
+    }
+
+    location /internal-storage/ {
+        internal;
+        alias ${STORAGE_ROOT}/;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:${PORT};
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_redirect off;
+    }
+}
+EOF
+    info "nginx-p2.conf written (storage=\$STORAGE_ROOT, port=\$PORT)"
+
+    info "Replacing nginx config and reloading (may require sudo password)..."
+    sudo cp "$DEV_CONF" "/etc/nginx/sites-available/p2.conf"
+    sudo ln -sf "/etc/nginx/sites-available/p2.conf" "/etc/nginx/sites-enabled/p2.conf"
+    # Remove stale legacy symlinks that may point to old configs (e.g. port 8000)
+    sudo rm -f "/etc/nginx/sites-enabled/default" "/etc/nginx/sites-enabled/p2"
+    sudo systemctl reload nginx
 else
     warn "nginx not found — X-Accel-Redirect will not work."
     warn "Set P2_STORAGE__USE_X_ACCEL_REDIRECT=false in .env to use pure-Python serving."
@@ -56,11 +102,8 @@ fi
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 info "Syncing dependencies..."
-uv sync
+uv sync --python 3.12
 
-export P2_REDIS__HOST="127.0.0.1"
-export REDIS_URL="redis://127.0.0.1:6379/0"
-export ARQ_REDIS_URL="redis://127.0.0.1:6379/1"
 export HOST="127.0.0.1"
 export P2_STORAGE__ROOT="$STORAGE_ROOT"
 
@@ -80,7 +123,9 @@ info "Starting arq worker..."
 uv run --env-file .env python -m arq p2.core.worker.WorkerSettings &
 WORKER_PID=$!
 
-info "Starting granian (4 workers)..."
+CORES=$(nproc)
+WORKERS=$((CORES * 2 + 1))
+info "Starting granian (${WORKERS} workers based on ${CORES} CPU cores)..."
 IS_DEBUG=false
 if grep -iq '^P2_DEBUG=true' .env 2>/dev/null; then
     IS_DEBUG=true
@@ -88,10 +133,10 @@ fi
 
 GRANIAN_ARGS=(
     --interface asginl
-    --workers 4
+    --workers "$WORKERS"
     --loop uvloop
     --host 0.0.0.0
-    --port 8000
+    --port "$PORT"
     --env-files .env
     --no-ws
     --working-dir "$REPO_ROOT"
@@ -109,5 +154,5 @@ SERVER_PID=$!
 # ── Cleanup on exit ────────────────────────────────────────────────────────────
 trap "info 'Shutting down...'; kill $WORKER_PID $SERVER_PID 2>/dev/null; wait" SIGINT SIGTERM
 
-info "p2 running at http://localhost:8000 — Ctrl+C to stop"
+info "p2 running at http://localhost:$PORT — Ctrl+C to stop"
 wait

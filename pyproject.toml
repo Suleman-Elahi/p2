@@ -63,7 +63,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-django>=4.8",
     "hypothesis>=6.100",
-    "fakeredis[aioredis]>=2.21",
+    "fakeredis>=2.21",
     "moto[s3]>=5.0",
 
     # Coverage
@@ -91,7 +91,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-django>=4.8",
     "hypothesis>=6.100",
-    "fakeredis[aioredis]>=2.21",
+    "fakeredis>=2.21",
     "moto[s3]>=5.0",
     "coverage>=7.0",
     "isort>=5.13",
