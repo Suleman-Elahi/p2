@@ -2,7 +2,10 @@
 
 Architecture
 ------------
-Each Granian worker process runs exactly one ``_write_worker`` asyncio Task.
+Each Granian worker process runs exactly one ``_write_worker`` asyncio Task
+backed by a dedicated thread for LMDB commits (avoids shared threadpool
+contention that adds 2-3ms of dispatch latency under concurrency).
+
 When a PUT request calls ``write_metadata``:
 
 1. A ``asyncio.Future`` (ack) is created and the item is pushed onto the
@@ -25,6 +28,7 @@ the queue is full, the write falls back to a direct ``asyncio.to_thread`` call
 
 import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from django.conf import settings
 
@@ -34,6 +38,9 @@ logger = logging.getLogger(__name__)
 _WRITE_QUEUE: asyncio.Queue | None = None
 _WRITE_WORKER_TASK: asyncio.Task | None = None
 _WRITE_INIT_LOCK: asyncio.Lock | None = None
+# Dedicated single-thread executor for LMDB commits — avoids contention
+# with the shared asyncio threadpool used by to_thread().
+_LMDB_EXECUTOR: ThreadPoolExecutor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +70,7 @@ def _batch_window_ms() -> float:
 
 async def _ensure_write_worker() -> None:
     """Start the batching write worker task if not already running."""
-    global _WRITE_QUEUE, _WRITE_WORKER_TASK, _WRITE_INIT_LOCK
+    global _WRITE_QUEUE, _WRITE_WORKER_TASK, _WRITE_INIT_LOCK, _LMDB_EXECUTOR
 
     # Fast path — worker already running.
     if _WRITE_WORKER_TASK is not None and not _WRITE_WORKER_TASK.done():
@@ -76,6 +83,8 @@ async def _ensure_write_worker() -> None:
     async with _WRITE_INIT_LOCK:
         if _WRITE_QUEUE is None:
             _WRITE_QUEUE = asyncio.Queue(maxsize=_queue_max_size())
+        if _LMDB_EXECUTOR is None:
+            _LMDB_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lmdb-writer")
         if _WRITE_WORKER_TASK is None or _WRITE_WORKER_TASK.done():
             if _WRITE_WORKER_TASK is not None and _WRITE_WORKER_TASK.done():
                 exc = _WRITE_WORKER_TASK.exception()
@@ -96,36 +105,65 @@ async def _write_worker() -> None:
     max_batch = _batch_size()
     window_s = _batch_window_ms() / 1000.0
 
-    while True:
-        # Block until at least one item arrives.
-        batch: list[tuple] = []
-        try:
-            first = await _WRITE_QUEUE.get()
-            batch.append(first)
-        except asyncio.CancelledError:
-            return
-
-        # Collect additional items up to max_batch within the window.
-        # asyncio.wait_for with timeout=0 drains whatever is already queued
-        # without sleeping; a positive window gives stragglers time to arrive.
-        deadline = asyncio.get_event_loop().time() + window_s
-        while len(batch) < max_batch:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                break
+    try:
+        while True:
+            # Block until at least one item arrives.
+            batch: list[tuple] = []
             try:
-                item = await asyncio.wait_for(
-                    _WRITE_QUEUE.get(),
-                    timeout=remaining,
-                )
-                batch.append(item)
-            except asyncio.TimeoutError:
+                first = await _WRITE_QUEUE.get()
+                batch.append(first)
+            except asyncio.CancelledError:
                 break
 
-        # All items in the batch share the *same* engine (same volume).
-        # If a batch mixes engines (unlikely at low concurrency), we group by
-        # engine to keep each LMDB transaction scoped to one environment.
-        await _flush_batch(batch)
+            # Drain everything already queued without waiting — this is the key
+            # optimization. Under concurrency, multiple PUTs queue items while
+            # we're in to_thread() doing the previous commit. Draining them all
+            # immediately means we batch N items into 1 fsync instead of paying
+            # the window delay per batch.
+            while len(batch) < max_batch:
+                try:
+                    batch.append(_WRITE_QUEUE.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            # If we only got 1 item and the window is positive, wait briefly
+            # for stragglers — but only when there's nothing queued yet.
+            if len(batch) == 1 and window_s > 0:
+                deadline = asyncio.get_event_loop().time() + window_s
+                while len(batch) < max_batch:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(
+                            _WRITE_QUEUE.get(),
+                            timeout=remaining,
+                        )
+                        batch.append(item)
+                        # Once we got a second item, drain the rest immediately
+                        while len(batch) < max_batch:
+                            try:
+                                batch.append(_WRITE_QUEUE.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        break
+                    except asyncio.TimeoutError:
+                        break
+
+            await _flush_batch(batch)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # Drain any remaining items in the queue so no writes are lost.
+        remaining_batch: list[tuple] = []
+        while not _WRITE_QUEUE.empty():
+            try:
+                remaining_batch.append(_WRITE_QUEUE.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if remaining_batch:
+            logger.info("metadata write worker draining %d remaining items on shutdown", len(remaining_batch))
+            await _flush_batch(remaining_batch)
 
 
 async def _flush_batch(batch: list[tuple]) -> None:
@@ -147,7 +185,7 @@ async def _flush_batch(batch: list[tuple]) -> None:
         resolved: list[tuple] = []
         try:
             # Run the entire group as a single synchronous LMDB transaction
-            # in a thread — one commit for N objects.
+            # on the dedicated LMDB thread — avoids shared threadpool contention.
             def _commit(items=items, engine=engine):
                 with engine.env.begin(write=True, db=engine.db) as txn:
                     for path, metadata_json, _ in items:
@@ -156,7 +194,8 @@ async def _flush_batch(batch: list[tuple]) -> None:
                             metadata_json.encode("utf-8"),
                         )
 
-            await asyncio.to_thread(_commit)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_LMDB_EXECUTOR, _commit)
             resolved = [(path, metadata_json, fut, None) for path, metadata_json, fut in items]
         except Exception as exc:  # noqa: BLE001
             logger.error(

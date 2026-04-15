@@ -22,7 +22,7 @@ from p2.lib.config import CONFIG
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SECRET_KEY = CONFIG.y('secret_key', '48e9z8tw=_z0e#m*x70&)u%cgo8#=16uzdze&i8q=*#**)@cp&')  # noqa
+SECRET_KEY = CONFIG.y('secret_key', '')  # Must be set in .env
 
 DEBUG = CONFIG.y_bool('debug')
 TEST = any('test' in arg for arg in sys.argv)

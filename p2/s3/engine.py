@@ -109,3 +109,22 @@ def get_engine(volume) -> LMDbEngine:
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         _cache[db_path] = LMDbEngine(db_path)
         return _cache[db_path]
+
+
+def close_engine(volume_uuid_hex: str) -> None:
+    """Close and remove the cached LMDB engine for a volume.
+
+    Call this when a volume is deleted to release the mmap, file descriptors,
+    and reader table slots. Safe to call if the engine was never opened.
+    """
+    global _storage_root_cache
+    if _storage_root_cache is None:
+        return
+    db_path = os.path.join(_storage_root_cache, "volumes", volume_uuid_hex, "metadata.lmdb")
+    with _lock:
+        engine = _cache.pop(db_path, None)
+        if engine is not None:
+            try:
+                engine.env.close()
+            except Exception:
+                pass

@@ -1,9 +1,11 @@
-"""In-memory LRU caches for hot S3 auth/metadata paths.
+"""In-memory LRU+TTL caches for hot S3 auth/metadata paths.
 
 These caches eliminate database round-trips for repeated requests to the same
 bucket/key combinations. TTL is short (60s) to balance freshness vs performance.
+Metadata cache uses an OrderedDict for O(1) LRU eviction instead of O(n log n) sort.
 """
 import time
+from collections import OrderedDict
 from typing import Optional, Tuple, Dict, Any
 from django.conf import settings
 
@@ -20,7 +22,8 @@ _acl_cache: dict[Tuple[int, str, str], Tuple[bool, float]] = {}
 _ACL_TTL = float(getattr(settings, "S3_CACHE_ACL_TTL_SECONDS", 600.0))
 
 # Metadata cache: (volume_uuid_hex, path) -> (attributes_dict, expires_at)
-_metadata_cache: dict[Tuple[str, str], Tuple[Dict[str, Any], float]] = {}
+# OrderedDict preserves insertion order for O(1) LRU eviction (move_to_end + popitem).
+_metadata_cache: OrderedDict[Tuple[str, str], Tuple[Dict[str, Any], float]] = OrderedDict()
 _METADATA_TTL = float(getattr(settings, "S3_CACHE_METADATA_TTL_SECONDS", 60.0))
 _METADATA_MAX_SIZE = 10000  # Max entries to prevent memory bloat
 
@@ -85,36 +88,52 @@ def invalidate_acl(volume_pk: str):
         _acl_cache.pop(k, None)
 
 
+# Reverse index: volume_uuid_hex -> set of (volume_uuid_hex, path) keys in _metadata_cache.
+# Allows O(1) per-entry invalidation of all metadata for a volume instead of O(n) scan.
+_metadata_by_volume: dict[str, set[tuple[str, str]]] = {}
+
+
 def get_cached_metadata(volume_uuid_hex: str, path: str) -> Optional[Dict[str, Any]]:
     """Return cached metadata dict if available and not expired."""
-    entry = _metadata_cache.get((volume_uuid_hex, path))
+    key = (volume_uuid_hex, path)
+    entry = _metadata_cache.get(key)
     if entry and entry[1] > time.monotonic():
+        _metadata_cache.move_to_end(key)  # mark as recently used
         return entry[0]
     return None
 
 
 def set_cached_metadata(volume_uuid_hex: str, path: str, attributes: Dict[str, Any]):
-    """Cache metadata for a blob."""
-    # Simple size limit - evict oldest entries if too large
-    if len(_metadata_cache) >= _METADATA_MAX_SIZE:
-        # Remove ~10% of entries (oldest by expiry)
-        to_remove = sorted(_metadata_cache.items(), key=lambda x: x[1][1])[:_METADATA_MAX_SIZE // 10]
-        for key, _ in to_remove:
-            _metadata_cache.pop(key, None)
-    
-    _metadata_cache[(volume_uuid_hex, path)] = (attributes, time.monotonic() + _METADATA_TTL)
+    """Cache metadata for a blob. O(1) LRU eviction via OrderedDict."""
+    key = (volume_uuid_hex, path)
+    if key in _metadata_cache:
+        _metadata_cache.move_to_end(key)
+    else:
+        # Track in reverse index for per-volume invalidation
+        _metadata_by_volume.setdefault(volume_uuid_hex, set()).add(key)
+    _metadata_cache[key] = (attributes, time.monotonic() + _METADATA_TTL)
+    # Evict oldest entry when over capacity — O(1)
+    if len(_metadata_cache) > _METADATA_MAX_SIZE:
+        evicted_key, _ = _metadata_cache.popitem(last=False)
+        vol_set = _metadata_by_volume.get(evicted_key[0])
+        if vol_set:
+            vol_set.discard(evicted_key)
 
 
 def invalidate_metadata(volume_uuid_hex: str, path: str):
     """Invalidate cached metadata for a specific blob."""
-    _metadata_cache.pop((volume_uuid_hex, path), None)
+    key = (volume_uuid_hex, path)
+    _metadata_cache.pop(key, None)
+    vol_set = _metadata_by_volume.get(volume_uuid_hex)
+    if vol_set:
+        vol_set.discard(key)
 
 
 def invalidate_volume_metadata(volume_uuid_hex: str):
-    """Invalidate all cached metadata for a volume."""
-    to_remove = [k for k in _metadata_cache if k[0] == volume_uuid_hex]
-    for k in to_remove:
-        _metadata_cache.pop(k, None)
+    """Invalidate all cached metadata for a volume. O(k) where k = entries for this volume."""
+    keys = _metadata_by_volume.pop(volume_uuid_hex, set())
+    for key in keys:
+        _metadata_cache.pop(key, None)
 
 
 def clear_all_caches():
@@ -123,6 +142,7 @@ def clear_all_caches():
     _volume_cache.clear()
     _acl_cache.clear()
     _metadata_cache.clear()
+    _metadata_by_volume.clear()
     _volume_perm_cache.clear()
 
 

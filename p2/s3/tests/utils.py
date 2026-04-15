@@ -9,6 +9,7 @@ from p2.api.models import APIKey
 from p2.core.acl import VolumeACL
 from p2.core.models import Volume
 from p2.core.tests.utils import get_test_storage
+from p2.s3.cache import clear_all_caches
 from p2.s3.constants import TAG_S3_DEFAULT_STORAGE
 
 
@@ -17,6 +18,7 @@ class S3TestCase(LiveServerTestCase):
 
     def setUp(self):
         super().setUp()
+        clear_all_caches()
         self.user = User.objects.create_user(
             username='p2_unittest',
             email='test@test.test',
@@ -40,3 +42,15 @@ class S3TestCase(LiveServerTestCase):
             aws_secret_access_key=self.access_key.decrypt_secret_key(),
             endpoint_url=self.live_server_url,
         )
+
+    @staticmethod
+    def _close_lmdb_engines():
+        """Close all cached LMDB engines to prevent cross-test locking."""
+        from p2.s3.engine import _cache, _lock
+        with _lock:
+            for eng in _cache.values():
+                try:
+                    eng.env.close()
+                except Exception:
+                    pass
+            _cache.clear()

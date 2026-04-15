@@ -1,5 +1,7 @@
 # p2 Storage Engine
 
+> **⚠️ This project is a Proof of Concept / MVP and is a work in progress. No production usage is recommended. Running it straighforward is not guaranted so fix minor config env and other issues yourself or let me know in the discussion**
+
 p2 is a blistering-fast, S3-compatible object storage server built on Python, rigorously accelerated by natively compiled Rust extensions and asynchronous event loops.
 
 It is designed to cleanly handle petabyte-scale metadata via LMDB and process concurrent data payloads reaching thousands of objects per second by sidestepping traditional framework bottlenecks.
@@ -30,7 +32,7 @@ Core `PUT` and `GET` S3 transaction traffic goes through a hyper-optimized sub-a
 
 ## 🚀 Running the Server
 
-### Option A: Running with Docker (Recommended)
+### Running with Docker
 
 You can instantiate the complete engine, including `redis` brokers and background arq workers, sequentially over Docker containers.
 
@@ -38,10 +40,10 @@ You can instantiate the complete engine, including `redis` brokers and backgroun
 docker compose up -d --build
 ```
 
-- **Web Server:** Binds implicitly to `localhost:8000`.
+- **Web Server:** Binds implicitly to `localhost:8787`.
 - **Storage Directory:** Dynamically generates and syncs project-root `./storage/` into the central orchestrator mapped volume path.
 
-### Option B: Running Natively (Without Docker)
+### Running Natively
 
 For local development, manual benchmarking, or specific UNIX integrations. There is a native bootloader provided that gracefully binds necessary environmental proxies straight to your Linux localhost structure seamlessly.
 
@@ -53,14 +55,15 @@ bash scripts/run_without_docker.sh
 - Constructs and binds `P2_STORAGE__ROOT` to your project structure to prevent root system corruption.
 - Triggers `granian` asynchronously to evaluate socket requests natively without the Docker Network overhead.
 - By default, verbose Web UI and `granian` access logs are **disabled** for maximized performance profiling. You can temporarily enable debug tracing by pushing `P2_DEBUG=true` safely into your `.env` manifest before launch.
+- **Memory footprint:** ~586 MiB total across 4 Granian workers at idle.
 
 ## 🔧 Nginx Configuration (X-Accel-Redirect)
 
 To trigger the `Zero-Copy` streaming architecture for GET operations, `p2` expects you to pair your deployment with Nginx natively forwarding traffic using proxy configurations.
 
-If you are using **Option B (Native Deployment)**, `run_without_docker.sh` is programmed to intelligently ingest `deploy/nginx-host.conf` and output a strictly accurate and localized `nginx-p2.conf` built seamlessly for your exact host path architecture.
+The `run_without_docker.sh` script is programmed to intelligently ingest `deploy/nginx-host.conf` and output a strictly accurate and localized `nginx-p2.conf` built seamlessly for your exact host path architecture.
 
-- You must deploy Nginx directing traffic pointing explicitly to `http://127.0.0.1:8000` (Granian process pipeline).
+- You must deploy Nginx directing traffic pointing explicitly to `http://127.0.0.1:8787` (Granian process pipeline).
 - Ensure `.env` sets `P2_STORAGE__USE_X_ACCEL_REDIRECT=true`
 
 Once successfully mapped, Granian emits a specialized `0-byte` header interceptor payload commanding the Nginx Daemon daemon to rapidly broadcast and close out file chunks direct from file system IO mapping, achieving near-hardware network saturation limitations!

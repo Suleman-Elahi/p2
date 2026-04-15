@@ -7,8 +7,17 @@ can wrap the middleware stack at import time.
 """
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "p2.core.settings")
+
+# Expand the default threadpool so asyncio.to_thread() calls (LMDB reads,
+# file writes) don't queue behind each other under concurrent load.
+# Each uvicorn worker process gets its own pool — this sets it per-worker.
+import asyncio
+_loop = asyncio.new_event_loop()
+_loop.set_default_executor(ThreadPoolExecutor(max_workers=32))
+asyncio.set_event_loop(_loop)
 
 from django.core.asgi import get_asgi_application  # noqa: E402
 

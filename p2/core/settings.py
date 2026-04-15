@@ -19,6 +19,7 @@ import sys
 
 from p2 import __version__
 from p2.lib.config import CONFIG
+from django.core.exceptions import ImproperlyConfigured
 
 # Compat shim removed since we are no longer using django.contrib.postgres.
 
@@ -32,7 +33,12 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # Security
 # ---------------------------------------------------------------------------
 
-SECRET_KEY = CONFIG.y('secret_key', '48e9z8tw=_z0e#m*x70&)u%cgo8#=16uzdze&i8q=*#**)@cp&')  # noqa
+SECRET_KEY = CONFIG.y('secret_key', '')
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "SECRET_KEY is not set. Add SECRET_KEY=<random-string> to your .env file. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+    )
 
 # Fernet key for reversible encryption of API key secrets (used in AWS v4 HMAC auth).
 # Must be a URL-safe base64-encoded 32-byte key. Generate with:

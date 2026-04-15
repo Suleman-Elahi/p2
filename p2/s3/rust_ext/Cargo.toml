@@ -11,13 +11,14 @@ crate-type = ["cdylib"]
 # pyo3: Python bindings for Rust — zero-overhead FFI
 pyo3 = { version = "0.23", features = ["extension-module"] }
 # hmac + sha2: pure-Rust, constant-time HMAC-SHA256
+# sha2/asm enables AVX2 assembly backend (sha256 ~3x faster on AVX2 CPUs)
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 hex = "0.4"
 # md5: fast MD5 for ETag computation
 md-5 = "0.10"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "fat"
 codegen-units = 1

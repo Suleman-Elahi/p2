@@ -453,8 +453,9 @@ class ObjectView(S3View):
             body = request.body
             blob_size = len(body)
             from p2.s3 import p2_s3_crypto
-            # Drops the GIL and executes in Rust natively.
-            final_md5, final_sha256 = await asyncio.to_thread(p2_s3_crypto.write_and_hash_small, fs_path, body)
+            # Rust extension releases the GIL — run synchronously for small objects
+            # to avoid asyncio.to_thread dispatch overhead (~3ms under contention).
+            final_md5, final_sha256 = p2_s3_crypto.write_and_hash_small(fs_path, body)
             md5_digest = binascii.unhexlify(final_md5)
             
             if sha1_hasher:

@@ -108,6 +108,7 @@ class AWSv4AuthenticationRequest:
             if required_parameter not in get_dict:
                 return None
         auth_request = AWSv4AuthenticationRequest()
+        auth_request.algorithm = 'AWS4-HMAC-SHA256'
         auth_request.credentials = get_dict.get('X-Amz-Credential')
         auth_request.signed_headers = get_dict.get('X-Amz-SignedHeaders')
         auth_request.date_long = get_dict.get('X-Amz-Date')
@@ -145,11 +146,14 @@ class AWSV4Authentication(BaseAuth):
         return _derive_signing_key(key, auth_request.date, auth_request.region, auth_request.service)
 
     def _make_query_string(self) -> str:
-        """Parse existing Querystring, URI-encode them and sort them and put them back together"""
+        """Parse existing Querystring, URI-encode them and sort them and put them back together.
+        X-Amz-Signature is excluded per the AWS SigV4 spec (the signature cannot sign itself)."""
         pairs = []
         if self.request.META['QUERY_STRING'] == '':
             return self.request.META['QUERY_STRING']
         for kv_pair in self.request.META['QUERY_STRING'].split('&'):
+            if kv_pair.startswith('X-Amz-Signature='):
+                continue
             if '=' not in kv_pair:
                 kv_pair = kv_pair + '='
             pairs.append(kv_pair)
@@ -274,9 +278,14 @@ class AWSV4Authentication(BaseAuth):
     async def validate(self) -> Optional[User]:
         """Check Authorization Header in AWS Compatible format"""
         auth_request = AWSv4AuthenticationRequest.from_header(self.request.META)
-        if not auth_request:
+        is_presigned = auth_request is None
+        if is_presigned:
             auth_request = AWSv4AuthenticationRequest.from_querystring(self.request.GET)
         auth_request.hash = self.request.META.get('HTTP_X_AMZ_CONTENT_SHA256')
+        # Presigned URLs have no X-Amz-Content-SHA256 header; AWS spec requires UNSIGNED-PAYLOAD.
+        if auth_request.hash is None and is_presigned:
+            auth_request.hash = UNSIGNED_PAYLOAD
+            auth_request.hash = UNSIGNED_PAYLOAD
 
         # Verify given Hash with request body.
         # HMAC computation is CPU-bound and completes in microseconds; no async wrapping needed.

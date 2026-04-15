@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>p2 — Blistering-Fast S3-Compatible Object Storage</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a href="#" class="logo">p2</a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#tests">Tests</a>
+      <a href="#usage">Usage</a>
+      <a href="https://github.com/ilfs/p2" class="btn-nav">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <h1>p2 Storage Engine</h1>
+  <div class="warning-banner">⚠️ This project is a <strong>Proof of Concept / MVP</strong> and is a work in progress. No production usage is recommended.</div>
+  <p class="tagline">Blistering-fast, S3-compatible object storage built on Python + Rust</p>
+  <p class="sub">Petabyte-scale metadata via LMDB. Thousands of objects per second. Zero-copy reads. No framework overhead.</p>
+  <div class="hero-btns">
+    <a href="#usage" class="btn">Get Started</a>
+    <a href="#benchmarks" class="btn btn-outline">See Benchmarks</a>
+  </div>
+</header>
+
+<section id="features">
+  <h2>Key Features</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="card-icon">🔌</div>
+      <h3>S3 API Compatible</h3>
+      <p>Drop-in replacement for S3. Works with AWS SDKs, MinIO warp, Cyberduck, and any standard REST tooling.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">⚡</div>
+      <h3>Microsecond Cryptography</h3>
+      <p>MD5 and SHA256 hashing offloaded to <code>p2_s3_crypto</code>, a custom Rust extension that releases the Python GIL.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">📡</div>
+      <h3>Zero-Copy Reads</h3>
+      <p>GET operations use Nginx <code>X-Accel-Redirect</code> to serve files via kernel-level <code>sendfile()</code>, bypassing Python entirely.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🚀</div>
+      <h3>Framework-less Writes</h3>
+      <p>PUT traffic is intercepted at the raw ASGI layer before Django loads — matching compiled Rust backend performance.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🗄️</div>
+      <h3>LMDB Metadata</h3>
+      <p>Petabyte-scale metadata stored in LMDB with lock-free reads, batched writes, and zero-copy memory-mapped access.</p>
+    </div>
+    <div class="card">
+      <div class="card-icon">🎛️</div>
+      <h3>Control Plane UI</h3>
+      <p>Modern management interface with Django Ninja, fully typed OpenAPI docs, bucket policies, CORS, ACLs, and lifecycle rules.</p>
+    </div>
+  </div>
+</section>
+
+<section id="architecture" class="alt">
+  <h2>Architecture</h2>
+  <div class="arch-container">
+    <div class="arch-plane">
+      <h3>Control Plane</h3>
+      <p class="arch-tech">Django Ninja + Pydantic</p>
+      <ul>
+        <li>Account provisioning &amp; API keys</li>
+        <li>Bucket creation, CORS, ACLs</li>
+        <li>Bucket policies &amp; lifecycle rules</li>
+        <li>Multipart upload orchestration</li>
+        <li>Presigned URL generation</li>
+        <li>Web UI &amp; OpenAPI docs</li>
+      </ul>
+    </div>
+    <div class="arch-divider">
+      <div class="arch-arrow">→</div>
+      <span>S3 traffic detected</span>
+      <div class="arch-arrow">→</div>
+    </div>
+    <div class="arch-plane highlight">
+      <h3>Data Plane</h3>
+      <p class="arch-tech">Raw ASGI + Rust Extensions</p>
+      <ul>
+        <li>ASGI interceptor steals raw bytes off Granian sockets</li>
+        <li>Bypasses Django middleware completely</li>
+        <li><code>p2_s3_crypto</code> computes hashes without stalling the event loop</li>
+        <li>Payload streamed directly to disk</li>
+        <li>Metadata pushed to LMDB via batched async queue</li>
+        <li>Nginx sendfile() for zero-copy GET responses</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="benchmarks">
+  <h2>Benchmarks</h2>
+  <p class="bench-note">MinIO <code>warp</code> tool — 4 KiB objects, 20 concurrent connections, 30s duration, localhost, no TLS.</p>
+
+  <div class="bench-grid">
+    <div class="bench-table-wrap">
+      <table>
+        <thead>
+          <tr><th>Operation</th><th>Metric</th><th class="p2-col">p2</th><th>RustFS</th></tr>
+        </thead>
+        <tbody>
+          <tr><td rowspan="4"><strong>GET</strong></td><td>Avg Throughput</td><td class="p2-col win">23.56 MiB/s</td><td>19.22 MiB/s</td></tr>
+          <tr><td>Avg Obj/s</td><td class="p2-col win">6,031</td><td>4,922</td></tr>
+          <tr><td>p50 Latency</td><td class="p2-col win">3.0 ms</td><td>3.8 ms</td></tr>
+          <tr><td>p99 Latency</td><td class="p2-col win">14.8 ms</td><td>18.1 ms</td></tr>
+          <tr class="sep"><td rowspan="4"><strong>PUT</strong></td><td>Avg Throughput</td><td class="p2-col">5.05 MiB/s</td><td class="win">10.11 MiB/s</td></tr>
+          <tr><td>Avg Obj/s</td><td class="p2-col">1,293</td><td class="win">2,588</td></tr>
+          <tr><td>p50 Latency</td><td class="p2-col">18.5 ms</td><td class="win">8.2 ms</td></tr>
+          <tr><td>p99 Latency</td><td class="p2-col">56.8 ms</td><td class="win">22.2 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="bench-summary">p2 delivers <strong>22% faster GET throughput</strong> than RustFS thanks to Nginx zero-copy sendfile(). PUT throughput trades off against Python's write path — the raw ASGI interceptor + Rust hashing keeps it competitive at <strong>1,293 obj/s</strong>.</p>
+
+  <div class="bench-screenshot">
+    <img src="Screenshot_2026-04-15_18-58-33.png" alt="p2 vs RustFS warp benchmark terminal output" loading="lazy">
+    <p class="caption">Side-by-side warp benchmark: p2 (left) vs RustFS (right)</p>
+  </div>
+</section>
+
+<section id="usage" class="alt">
+  <h2>Getting Started</h2>
+
+  <div class="usage-grid">
+    <div class="usage-block">
+      <h3>🐧 Native Linux</h3>
+      <pre><code>bash scripts/run_without_docker.sh</code></pre>
+      <ul>
+        <li>Auto-installs dependencies</li>
+        <li>Binds Granian to <code>localhost:8787</code></li>
+        <li>Generates Nginx config from <code>deploy/nginx-host.conf</code></li>
+        <li>Set <code>P2_DEBUG=true</code> in <code>.env</code> for verbose logs</li>
+        <li>~586 MiB RAM across 4 Granian workers at idle</li>
+      </ul>
+    </div>
+
+    <div class="usage-block">
+      <h3>🐳 Docker</h3>
+      <pre><code>docker compose up -d --build</code></pre>
+      <ul>
+        <li>Web server on <code>localhost:8787</code></li>
+        <li>Includes Redis broker + arq workers</li>
+        <li>Storage auto-mounted at <code>./storage/</code></li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Nginx Zero-Copy Setup</h3>
+  <p>For maximum GET performance, pair with Nginx:</p>
+  <pre><code># .env
+P2_STORAGE__USE_X_ACCEL_REDIRECT=true</code></pre>
+  <p>Point Nginx at <code>http://127.0.0.1:8787</code> (Granian). The <code>run_without_docker.sh</code> script generates the config automatically.</p>
+
+  <h3>Use with AWS CLI</h3>
+  <pre><code>aws configure set default.s3.signature_version s3v4
+aws --endpoint-url http://localhost s3 mb s3://my-bucket
+aws --endpoint-url http://localhost s3 cp file.txt s3://my-bucket/
+aws --endpoint-url http://localhost s3 ls s3://my-bucket/
+aws --endpoint-url http://localhost s3 presign s3://my-bucket/file.txt</code></pre>
+</section>
+
+<section id="tests">
+  <h2>Test Suite</h2>
+  <p class="bench-note">57 tests — all passing. Run with: <code>.venv/bin/python manage.py test p2.s3.tests.test_unit p2.s3.tests.test_integration</code></p>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Unit Tests (35)</h3>
+      <ul class="test-list">
+        <li><strong>Presigned Tokens</strong> — roundtrip, wrong bucket/key/method, expired, tampered signature, malformed, max expiry clamping</li>
+        <li><strong>CORS</strong> — origin matching, wildcard/subdomain, rule matching, header application, XML parse/build roundtrip</li>
+        <li><strong>Bucket Policy Engine</strong> — parse valid/invalid JSON, allow/deny evaluation, deny-overrides-allow, wildcard actions, resource matching</li>
+        <li><strong>AWS SigV4 Auth</strong> — query string parsing, header parsing, missing params, HMAC key derivation, signing key determinism</li>
+        <li><strong>Error Classes</strong> — HTTP status codes and S3 error code strings</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Integration Tests (22)</h3>
+      <ul class="test-list">
+        <li><strong>Bucket Ops</strong> — head, delete, versioning, location, list empty, ACL get/put, CORS put/get, policy CRUD, lifecycle CRUD, invalid policy rejection</li>
+        <li><strong>Object Lifecycle</strong> — PUT with ETag/MD5 verification, HEAD (content-type, size, etag), copy object, list after put, presigned URL generation, delete</li>
+        <li><strong>Object Not Found</strong> — head 404, get 404, no-such-bucket, tagging 404, ACL 404, copy missing source, multi-delete nonexistent</li>
+        <li><strong>Authentication</strong> — invalid credentials rejected, wrong secret key → SignatureDoesNotMatch, multi-user isolation (cross-bucket access denied)</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <p>p2 Storage Engine — MIT License</p>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

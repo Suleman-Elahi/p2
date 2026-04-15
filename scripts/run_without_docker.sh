@@ -60,30 +60,44 @@ if command -v nginx &>/dev/null; then
     DEV_CONF="$REPO_ROOT/nginx-p2.conf"
     info "Generating nginx-p2.conf inline..."
     cat > "$DEV_CONF" <<EOF
+upstream granian {
+    server 127.0.0.1:${PORT};
+    keepalive 128;
+}
+
 server {
     listen 80;
     server_name localhost _;
 
     client_max_body_size 2G;
+    access_log off;
 
     location /static/ {
         alias ${STATIC_ROOT}/;
         expires 7d;
-        access_log off;
     }
 
     location /internal-storage/ {
         internal;
         alias ${STORAGE_ROOT}/;
+        sendfile on;
+        tcp_nopush on;
+        aio threads;
     }
 
     location / {
-        proxy_pass http://127.0.0.1:${PORT};
+        proxy_pass http://granian;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
         proxy_set_header Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_redirect off;
+
+        # Stream request body directly to granian without buffering to disk.
+        proxy_request_buffering off;
+        proxy_buffering off;
     }
 }
 EOF
@@ -124,7 +138,7 @@ uv run --env-file .env python -m arq p2.core.worker.WorkerSettings &
 WORKER_PID=$!
 
 CORES=$(nproc)
-WORKERS=$((CORES * 2 + 1))
+WORKERS=$((CORES * 1))
 info "Starting granian (${WORKERS} workers based on ${CORES} CPU cores)..."
 IS_DEBUG=false
 if grep -iq '^P2_DEBUG=true' .env 2>/dev/null; then
@@ -154,5 +168,5 @@ SERVER_PID=$!
 # ── Cleanup on exit ────────────────────────────────────────────────────────────
 trap "info 'Shutting down...'; kill $WORKER_PID $SERVER_PID 2>/dev/null; wait" SIGINT SIGTERM
 
-info "p2 running at http://localhost:$PORT — Ctrl+C to stop"
+info "p2 running at http://localhost:$PORT (granian) — Ctrl+C to stop"
 wait

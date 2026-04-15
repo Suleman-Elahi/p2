@@ -1,0 +1,5 @@
+[build]
+# Compile for the exact CPU this machine has — enables AVX2, AES-NI, SHA-NI,
+# PCLMULQDQ and any other extensions reported by /proc/cpuinfo.
+# The resulting .so is NOT portable to older CPUs (fine for a single-host deploy).
+rustflags = ["-C", "target-cpu=native"]
