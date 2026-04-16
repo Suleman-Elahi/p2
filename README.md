@@ -2,7 +2,7 @@
 
 > **⚠️ This project is a Proof of Concept / MVP and is a work in progress. No production usage is recommended. Running it straighforward is not guaranted so fix minor config env and other issues yourself or let me know in the discussion**
 
-p2 is a blistering-fast, S3-compatible object storage server built on Python, rigorously accelerated by natively compiled Rust extensions and asynchronous event loops.
+p2 (fork of archived https://github.com/BeryJu/p2) is a blistering-fast, S3-compatible object storage server built on Python, rigorously accelerated by natively compiled Rust extensions and asynchronous event loops.
 
 It is designed to cleanly handle petabyte-scale metadata via LMDB and process concurrent data payloads reaching thousands of objects per second by sidestepping traditional framework bottlenecks.
 
