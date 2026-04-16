@@ -6,6 +6,8 @@ p2 is a blistering-fast, S3-compatible object storage server built on Python, ri
 
 It is designed to cleanly handle petabyte-scale metadata via LMDB and process concurrent data payloads reaching thousands of objects per second by sidestepping traditional framework bottlenecks.
 
+[![Youtube Video](docs/p2_banner.jpg)](https://youtu.be/AFO3vRxm_O4)
+
 ## 🌟 Key Features
 
 - **S3 API Compatibility:** Plugs seamlessly into AWS SDKs, MinIO tools (`warp`), Cyberduck, and standard REST tooling.
@@ -89,7 +91,7 @@ Once successfully mapped, Granian emits a specialized `0-byte` header intercepto
 
 ## 📊 Benchmark Results (Native Execution)
 
-Below are the audited `warp` benchmark metrics captured locally bypassing Docker (reflects real-world Nginx/Granian saturation on localhost testing):
+Below are the audited `warp` benchmark on quite a powerful machine, metrics captured locally bypassing Docker (reflects real-world Nginx/Granian saturation on localhost testing):
 
 - **GET Throughput:** `~8,799 Objects/sec` (Avg: 34.37 MiB/s)
 - **PUT Throughput:** `~2,140 Objects/sec` (Avg: 8.36 MiB/s)
