@@ -171,6 +171,15 @@ class MultipartUploadView(S3View):
                 engine.delete(f"/.multipart/{upload_id}/{part['number']}")
                 
         final_etag = f"multipart-{len(valid_parts)}"
+
+        existing_json = await asyncio.to_thread(engine.get, path)
+        existing_size = 0
+        existing_counted = False
+        if existing_json:
+            existing_attr = json.loads(existing_json)
+            if not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
+                existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                existing_counted = True
         
         meta_str = engine.get(f"/.multipart/{upload_id}/_meta")
         m_attr = json.loads(meta_str) if meta_str else {}
@@ -180,7 +189,7 @@ class MultipartUploadView(S3View):
             os.rmdir(storage_path(volume.uuid.hex, "parts", upload_id))
         except OSError: pass
 
-        engine.put(path, json.dumps({
+        await asyncio.to_thread(engine.put, path, json.dumps({
             ATTR_BLOB_MIME: m_attr.get('content_type', 'application/octet-stream'),
             ATTR_BLOB_SIZE_BYTES: str(total_size),
             ATTR_BLOB_IS_FOLDER: False,
@@ -189,6 +198,12 @@ class MultipartUploadView(S3View):
             'blob.p2.io/hash/md5': final_etag,
             'internal_path': internal_path
         }))
+        from p2.core.volume_stats import adjust_volume_stats
+        await adjust_volume_stats(
+            volume,
+            object_delta=0 if existing_counted else 1,
+            bytes_delta=total_size - existing_size,
+        )
         
         res = ElementTree.Element("{%s}CompleteMultipartUploadResult" % XML_NAMESPACE)
         ElementTree.SubElement(res, "Location").text = f"http://{request.get_host()}/{bucket}{path}"

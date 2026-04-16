@@ -30,6 +30,7 @@ class Volume(UUIDModel, TagModel):
 
     name = models.SlugField(unique=True, max_length=63)
     storage = models.ForeignKey('Storage', on_delete=models.CASCADE)
+    object_count = models.BigIntegerField(default=0)
     space_used_bytes = models.BigIntegerField(default=0)
     public_read = models.BooleanField(default=False)
 

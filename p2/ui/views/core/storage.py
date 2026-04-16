@@ -13,6 +13,7 @@ from p2.core.forms import StorageForm
 from p2.core.models import Storage
 from p2.lib.reflection import path_to_class
 from p2.lib.views import CreateAssignPermView
+from p2.ui.stats import get_volume_stats
 
 
 class StorageListView(LoginRequiredMixin, ListView):
@@ -32,8 +33,15 @@ class StorageDetailView(PermissionRequiredMixin, DetailView):
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context['total_blobs'] = 0
-        context['total_space'] = sum(x.space_used_bytes for x in self.object.volume_set.all())
+        total_blobs = 0
+        total_space = 0
+        for volume in self.object.volume_set.all():
+            stats = get_volume_stats(volume)
+            total_blobs += stats['object_count']
+            total_space += stats['total_bytes']
+
+        context['total_blobs'] = total_blobs
+        context['total_space'] = total_space
         return context
 
 

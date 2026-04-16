@@ -144,9 +144,11 @@
       <h3>🐧 Native Linux</h3>
       <pre><code>bash scripts/run_without_docker.sh</code></pre>
       <ul>
-        <li>Auto-installs dependencies</li>
+        <li>Review or create <code>.env</code> before first run</li>
+        <li>Install and run Dragonfly or another Redis-compatible server first</li>
+        <li>Auto-installs Python dependencies</li>
         <li>Binds Granian to <code>localhost:8787</code></li>
-        <li>Generates Nginx config from <code>deploy/nginx-host.conf</code></li>
+        <li>Generates the host Nginx config for your local storage path</li>
         <li>Set <code>P2_DEBUG=true</code> in <code>.env</code> for verbose logs</li>
         <li>~586 MiB RAM across 4 Granian workers at idle</li>
       </ul>
@@ -154,20 +156,28 @@
 
     <div class="usage-block">
       <h3>🐳 Docker</h3>
-      <pre><code>docker compose up -d --build</code></pre>
+      <pre><code>bash scripts/setup.sh</code></pre>
       <ul>
+        <li>Use this for the first Docker setup</li>
+        <li>Creates or updates <code>.env</code>, installs Nginx config, and starts the stack</li>
         <li>Web server on <code>localhost:8787</code></li>
-        <li>Includes Redis broker + arq workers</li>
+        <li>Includes Dragonfly/Redis-compatible broker + arq workers</li>
         <li>Storage auto-mounted at <code>./storage/</code></li>
+        <li>After setup, manage containers with normal <code>docker compose</code> commands</li>
       </ul>
     </div>
   </div>
+
+  <h3>After First Docker Setup</h3>
+  <pre><code>docker compose up -d
+docker compose down
+docker compose logs -f web</code></pre>
 
   <h3>Nginx Zero-Copy Setup</h3>
   <p>For maximum GET performance, pair with Nginx:</p>
   <pre><code># .env
 P2_STORAGE__USE_X_ACCEL_REDIRECT=true</code></pre>
-  <p>Point Nginx at <code>http://127.0.0.1:8787</code> (Granian). The <code>run_without_docker.sh</code> script generates the config automatically.</p>
+  <p>Point Nginx at <code>http://127.0.0.1:8787</code> (Granian). The setup scripts generate the host config automatically.</p>
 
   <h3>Use with AWS CLI</h3>
   <pre><code>aws configure set default.s3.signature_version s3v4

@@ -18,6 +18,7 @@ from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
                                 ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_CTIME,
                                 ATTR_BLOB_STAT_MTIME)
 from p2.core.models import Storage, Volume
+from p2.core.volume_stats import adjust_volume_stats_sync
 from p2.s3.engine import get_engine as _get_engine
 
 LOGGER = logging.getLogger(__name__)
@@ -75,6 +76,13 @@ def upload_files(request, volume_uuid: str, prefix: str = "", file: List[Uploade
         final_md5 = md5_hash.hexdigest()
         engine = _get_engine(volume)
         existing_json = engine.get(key)
+        existing_size = 0
+        existing_counted = False
+        if existing_json:
+            existing_attr = json.loads(existing_json)
+            if not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
+                existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                existing_counted = True
         attrs = json.loads(existing_json) if existing_json else {}
         attrs.update({
             ATTR_BLOB_MIME: uploaded_file.content_type or 'application/octet-stream',
@@ -87,6 +95,11 @@ def upload_files(request, volume_uuid: str, prefix: str = "", file: List[Uploade
         if not existing_json:
             attrs[ATTR_BLOB_STAT_CTIME] = str(now())
         engine.put(key, json.dumps(attrs))
+        adjust_volume_stats_sync(
+            volume,
+            object_delta=0 if existing_counted else 1,
+            bytes_delta=blob_size - existing_size,
+        )
 
         try:
             from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event

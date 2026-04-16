@@ -17,6 +17,7 @@ from asgiref.sync import sync_to_async
 from p2.core.acl import has_volume_permission
 from p2.core.constants import ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME
 from p2.core.models import Volume
+from p2.core.volume_stats import adjust_volume_stats
 from p2.s3.engine import get_engine as _get_engine
 
 LOGGER = logging.getLogger(__name__)
@@ -233,6 +234,11 @@ class BlobDeleteView(View):
         metadata_json = await sync_to_async(engine.get)(blob_path)
         if metadata_json:
             attributes = json.loads(metadata_json)
+            bytes_delta = 0
+            object_delta = 0
+            if not attributes.get(ATTR_BLOB_IS_FOLDER, False):
+                bytes_delta = -int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                object_delta = -1
             internal_path = attributes.get('internal_path')
             if internal_path:
                 from p2.core.storage_path import internal_to_fs
@@ -242,6 +248,7 @@ class BlobDeleteView(View):
                 except OSError:
                     pass
             await sync_to_async(engine.delete)(blob_path)
+            await adjust_volume_stats(volume, object_delta=object_delta, bytes_delta=bytes_delta)
         prefix = '/'.join(blob_path.split('/')[:-1])
         qs = f'?prefix={prefix}/' if prefix else ''
         return redirect(
@@ -349,11 +356,16 @@ class FolderDeleteView(View):
             LOGGER.error("Failed to list for delete: %s", e)
             items = []
 
+        deleted_objects = 0
+        deleted_bytes = 0
         for key, json_val in items:
             if not key.startswith(prefix):
                 continue
             try:
                 attr = json.loads(json_val)
+                if not attr.get(ATTR_BLOB_IS_FOLDER, False):
+                    deleted_objects += 1
+                    deleted_bytes += int(attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
                 internal_path = attr.get('internal_path', '')
                 if internal_path:
                     from p2.core.storage_path import internal_to_fs
@@ -365,6 +377,9 @@ class FolderDeleteView(View):
                 await sync_to_async(engine.delete)(key)
             except Exception as e:
                 LOGGER.warning("Error deleting %s: %s", key, e)
+
+        if deleted_objects or deleted_bytes:
+            await adjust_volume_stats(volume, object_delta=-deleted_objects, bytes_delta=-deleted_bytes)
 
         parent = '/'.join(prefix.strip('/').split('/')[:-1])
         parent_qs = ('?prefix=' + parent + '/') if parent else ''

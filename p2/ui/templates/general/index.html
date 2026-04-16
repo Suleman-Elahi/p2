@@ -23,6 +23,10 @@
             {% endblocktrans %}
           </h6>
           <p class="card-text">
+            {% blocktrans with count=volume.object_count %}
+            {{ count }} object{{ count|pluralize }}.
+            {% endblocktrans %}
+            <br>
             {% blocktrans with usage=volume.space_used_bytes|filesizeformat %}
             Using {{ usage }} space.
             {% endblocktrans %}

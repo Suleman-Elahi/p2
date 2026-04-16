@@ -34,25 +34,42 @@ Core `PUT` and `GET` S3 transaction traffic goes through a hyper-optimized sub-a
 
 ### Running with Docker
 
-You can instantiate the complete engine, including `redis` brokers and background arq workers, sequentially over Docker containers.
+For the first Docker boot, use the setup script instead of calling `docker compose up` directly. It creates or updates `.env`, prepares storage paths, installs the host nginx config, runs the Docker stack, and recalculates persisted volume stats.
 
 ```bash
-docker compose up -d --build
+bash scripts/setup.sh
+```
+
+- After the first setup, use normal Docker commands to manage the stack:
+
+```bash
+docker compose up -d
+docker compose down
+docker compose logs -f web
 ```
 
 - **Web Server:** Binds implicitly to `localhost:8787`.
 - **Storage Directory:** Dynamically generates and syncs project-root `./storage/` into the central orchestrator mapped volume path.
+- **Included services:** Dragonfly/Redis-compatible broker, web, grpc, migrations, static collection, and background workers.
 
 ### Running Natively
 
-For local development, manual benchmarking, or specific UNIX integrations. There is a native bootloader provided that gracefully binds necessary environmental proxies straight to your Linux localhost structure seamlessly.
+For local development, manual benchmarking, or specific UNIX integrations.
+
+Before starting the native flow:
+
+- Copy `.env.example` to `.env` and review the values if you want custom secrets, storage paths, or hostnames.
+- Ensure a local Dragonfly or Redis-compatible server is installed and reachable for cache + ARQ. The native script does not provision it for you.
+- Ensure nginx can be installed or is already available if you want `X-Accel-Redirect`.
+
+Then use the native bootloader:
 
 ```bash
 bash scripts/run_without_docker.sh
 ```
 
-- Automatically installs dependency configurations.
-- Constructs and binds `P2_STORAGE__ROOT` to your project structure to prevent root system corruption.
+- Creates `.env` from `.env.example` if it is missing.
+- Constructs and binds `P2_STORAGE__ROOT` to your project structure.
 - Triggers `granian` asynchronously to evaluate socket requests natively without the Docker Network overhead.
 - By default, verbose Web UI and `granian` access logs are **disabled** for maximized performance profiling. You can temporarily enable debug tracing by pushing `P2_DEBUG=true` safely into your `.env` manifest before launch.
 - **Memory footprint:** ~586 MiB total across 4 Granian workers at idle.
@@ -61,7 +78,7 @@ bash scripts/run_without_docker.sh
 
 To trigger the `Zero-Copy` streaming architecture for GET operations, `p2` expects you to pair your deployment with Nginx natively forwarding traffic using proxy configurations.
 
-The `run_without_docker.sh` script is programmed to intelligently ingest `deploy/nginx-host.conf` and output a strictly accurate and localized `nginx-p2.conf` built seamlessly for your exact host path architecture.
+The setup scripts generate the host nginx config for you based on the local storage path and expected Granian upstream.
 
 - You must deploy Nginx directing traffic pointing explicitly to `http://127.0.0.1:8787` (Granian process pipeline).
 - Ensure `.env` sets `P2_STORAGE__USE_X_ACCEL_REDIRECT=true`

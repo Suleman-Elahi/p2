@@ -143,6 +143,8 @@ function readDirectoryEntries(dirEntry, pathPrefix) {
 $(document).ready(function () {
     if ($('.dz').length === 0) return;
 
+    var defaultDropHandler = Dropzone.prototype.defaultOptions.drop;
+
     // Folder button (uses the first .dz element's URL)
     var primaryDz = $('.dz').first();
     var primaryUrl = primaryDz.data('upload-url') || primaryDz.attr('action');
@@ -197,8 +199,8 @@ $(document).ready(function () {
                     }
                 });
 
-                // Let Dropzone handle plain files via addedfile
-                Dropzone.prototype.drop.call(self, e);
+                // Let Dropzone handle plain files via its built-in drop handler.
+                defaultDropHandler.call(self, e);
             },
             init: function () {
                 var self = this;

@@ -68,6 +68,23 @@ async def _policy_allows(volume, permission: str, bucket_name: str, object_key: 
 class S3View(View):
     """Base View for all S3 Views. Checks for common Headers and does database lookups."""
 
+    async def _get_actual_user(self, fallback_user=None):
+        """Resolve the current user safely inside async views.
+
+        Django's AuthenticationMiddleware stores request.user as a lazy object.
+        Touching its attributes directly in async code can trigger a synchronous
+        DB lookup and raise SynchronousOnlyOperation.
+        """
+        user = getattr(self.request, '_s3_authenticated_user', None)
+        if user is not None:
+            return user
+
+        auser = getattr(self.request, 'auser', None)
+        if callable(auser):
+            return await auser()
+
+        return fallback_user
+
     def _check_content_md5(self):
         """Validate Content-MD5 Header (length and validity)"""
         # For streaming uploads, validation is handled in the PUT handler
@@ -105,7 +122,7 @@ class S3View(View):
         )
 
         # Use the S3-authenticated user if available
-        actual_user = getattr(self.request, '_s3_authenticated_user', user)
+        actual_user = await self._get_actual_user(user)
         user_id = getattr(actual_user, 'id', None)
 
         # Try cache first — works for both public and private volumes

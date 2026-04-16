@@ -526,6 +526,15 @@ class ObjectView(S3View):
         )
 
         # Update and save attributes in LMDB (single put, no read-modify-write).
+        existing_metadata_json = await asyncio.to_thread(engine.get, path)
+        existing_size = 0
+        existing_counted = False
+        if existing_metadata_json:
+            existing_attr = json.loads(existing_metadata_json)
+            if not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
+                existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                existing_counted = True
+
         now_ts = str(now())
         metadata_payload = {
             ATTR_BLOB_MIME: client_ct,
@@ -545,6 +554,12 @@ class ObjectView(S3View):
         # Invalidate metadata cache after write
         from p2.s3.cache import invalidate_metadata
         invalidate_metadata(volume.uuid.hex, path)
+        from p2.core.volume_stats import adjust_volume_stats
+        await adjust_volume_stats(
+            volume,
+            object_delta=0 if existing_counted else 1,
+            bytes_delta=blob_size - existing_size,
+        )
 
         # Publish event for background processing (webhooks, EXIF, etc.).
         # Optional non-blocking mode removes publish latency from the PUT critical path.
@@ -578,11 +593,16 @@ class ObjectView(S3View):
         volume = await self.get_volume(request.user, bucket, 'delete')
         
         engine = await self.get_engine(volume)
-        metadata_json = engine.get(path)
+        metadata_json = await asyncio.to_thread(engine.get, path)
         
         if metadata_json:
             import json, os
             attributes = json.loads(metadata_json)
+            bytes_delta = 0
+            object_delta = 0
+            if not attributes.get(ATTR_BLOB_IS_FOLDER, False):
+                bytes_delta = -int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                object_delta = -1
             internal_path = attributes.get('internal_path')
             if internal_path:
                 from p2.core.storage_path import internal_to_fs
@@ -591,7 +611,9 @@ class ObjectView(S3View):
                     os.remove(fs_path)
                 except OSError:
                     pass
-            engine.delete(path)
+            await asyncio.to_thread(engine.delete, path)
+            from p2.core.volume_stats import adjust_volume_stats
+            await adjust_volume_stats(volume, object_delta=object_delta, bytes_delta=bytes_delta)
             
         return HttpResponse(status=204)
 
@@ -675,7 +697,7 @@ class ObjectView(S3View):
         src_engine = await self.get_engine(src_volume)
         dest_engine = await self.get_engine(dest_volume)
         
-        src_json = src_engine.get(src_path)
+        src_json = await asyncio.to_thread(src_engine.get, src_path)
         if not src_json:
             return HttpResponse(status=404)
             
@@ -709,7 +731,22 @@ class ObjectView(S3View):
         dest_attr[ATTR_BLOB_STAT_MTIME] = str(now())
         dest_attr[ATTR_BLOB_STAT_CTIME] = str(now())
         
-        dest_engine.put(dest_path, json.dumps(dest_attr))
+        existing_dest_json = await asyncio.to_thread(dest_engine.get, dest_path)
+        existing_dest_size = 0
+        existing_dest_counted = False
+        if existing_dest_json:
+            existing_dest_attr = json.loads(existing_dest_json)
+            if not existing_dest_attr.get(ATTR_BLOB_IS_FOLDER, False):
+                existing_dest_size = int(existing_dest_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                existing_dest_counted = True
+
+        await asyncio.to_thread(dest_engine.put, dest_path, json.dumps(dest_attr))
+        from p2.core.volume_stats import adjust_volume_stats
+        await adjust_volume_stats(
+            dest_volume,
+            object_delta=0 if existing_dest_counted else 1,
+            bytes_delta=int(dest_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0) - existing_dest_size,
+        )
         
         root = ElementTree.Element("{%s}CopyObjectResult" % XML_NAMESPACE)
         ElementTree.SubElement(root, "LastModified").text = dest_attr[ATTR_BLOB_STAT_MTIME]

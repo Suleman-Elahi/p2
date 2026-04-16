@@ -28,17 +28,14 @@ COPY p2/ ./p2/
 ENV PATH="/app/.venv/bin:$PATH"
 ENV DJANGO_SETTINGS_MODULE=p2.core.settings
 
-# Bake static files into the image at build time
-RUN python manage.py collectstatic --noinput
-
 RUN chmod +x /entrypoint.sh \
     && useradd --create-home --shell /bin/false p2 \
-    && mkdir -p /storage \
+    && mkdir -p /storage /app/static \
     && chown -R p2:p2 /storage /app/static \
     && chown p2:p2 /app /entrypoint.sh \
     && chown -R p2:p2 /app/p2 /app/manage.py /app/pyproject.toml
 
 USER p2
 
-EXPOSE 8000
+EXPOSE 8787
 ENTRYPOINT ["/entrypoint.sh"]

@@ -1,10 +1,9 @@
 """p2 UI Index view"""
 from django.contrib.auth.mixins import LoginRequiredMixin
-from django.core.cache import cache
 from django.views.generic import ListView
 
 from p2.core.models import Volume
-from p2.ui.constants import CACHE_KEY_BLOB_COUNT
+from p2.ui.stats import get_volume_stats
 
 
 class IndexView(LoginRequiredMixin, ListView):
@@ -19,12 +18,17 @@ class IndexView(LoginRequiredMixin, ListView):
     def get_queryset(self, *args, **kwrags):
         return super().get_queryset(*args, **kwrags).select_related('storage')
 
-    def get_blob_count(self):
-        return 0
-
     def get_context_data(self, **kwargs):
         data = super().get_context_data(**kwargs)
-        data['count'] = self.get_blob_count()
+        total_objects = 0
+
+        for volume in data['object_list']:
+            stats = get_volume_stats(volume)
+            volume.object_count = stats['object_count']
+            volume.space_used_bytes = stats['total_bytes']
+            total_objects += stats['object_count']
+
+        data['count'] = total_objects
         return data
 
 class SearchView(LoginRequiredMixin, ListView):

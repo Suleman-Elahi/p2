@@ -6,6 +6,7 @@ Run the worker with:
     arq p2.core.worker.WorkerSettings
 """
 import logging
+import os
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -15,6 +16,8 @@ from opentelemetry.trace import StatusCode
 from p2.core.telemetry import tracer
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "p2.core.settings")
 
 
 async def complete_multipart(ctx, upload_id: str, user_pk: int, volume_pk: str, path: str):

@@ -332,8 +332,7 @@ class BucketView(S3View):
             await storage.asave(update_fields=['tags'])
             LOGGER.info("Auto-marked storage '%s' as default for S3.", storage.name)
         
-        # Use S3-authenticated user (Django auth middleware may have overwritten request.user)
-        actual_user = getattr(request, '_s3_authenticated_user', request.user)
+        actual_user = await self._get_actual_user(request.user)
         is_superuser = getattr(actual_user, 'is_superuser', False)
         if not is_superuser and not await actual_user.ahas_perm('p2_core.add_volume'):
             raise AWSAccessDenied
@@ -379,12 +378,17 @@ class BucketView(S3View):
         result = ElementTree.Element(f'{{{XML_NAMESPACE}}}DeleteResult')
         quiet = root.find(f'{{{XML_NAMESPACE}}}Quiet') or root.find('Quiet')
         is_quiet = quiet is not None and (quiet.text or '').lower() == 'true'
+        deleted_objects = 0
+        deleted_bytes = 0
 
         for key in keys:
             try:
                 meta_json = await asyncio.to_thread(engine.get, key)
                 if meta_json:
                     attr = json.loads(meta_json)
+                    if not attr.get(ATTR_BLOB_IS_FOLDER, False):
+                        deleted_objects += 1
+                        deleted_bytes += int(attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
                     internal_path = attr.get('internal_path')
                     if internal_path:
                         from p2.core.storage_path import internal_to_fs
@@ -403,6 +407,10 @@ class BucketView(S3View):
                 ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Key').text = key
                 ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Code').text = 'InternalError'
                 ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Message').text = str(exc)
+
+        if deleted_objects or deleted_bytes:
+            from p2.core.volume_stats import adjust_volume_stats
+            await adjust_volume_stats(volume, object_delta=-deleted_objects, bytes_delta=-deleted_bytes)
 
         return XMLResponse(result)
 
@@ -436,8 +444,9 @@ class BucketView(S3View):
 
     async def _get_acl(self, request, bucket):
         volume = await self.get_volume(request.user, bucket, 'read')
-        owner_id = str(request.user.pk)
-        owner_name = request.user.username
+        actual_user = await self._get_actual_user(request.user)
+        owner_id = str(actual_user.pk)
+        owner_name = actual_user.username
         canned = volume.tags.get(TAG_S3_ACL, 'private')
 
         root = ElementTree.Element("{%s}AccessControlPolicy" % XML_NAMESPACE)
