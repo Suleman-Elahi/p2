@@ -12,6 +12,9 @@ services:
       - venv:/app/.venv
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
+      P2_REDIS__HOST: redis
+      P2_REDIS__URL: redis://redis:6379/0
+      P2_REDIS__ARQ_URL: redis://redis:6379/1
 
   collectstatic:
     build: .
@@ -22,6 +25,9 @@ services:
       - venv:/app/.venv
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
+      P2_REDIS__HOST: redis
+      P2_REDIS__URL: redis://redis:6379/0
+      P2_REDIS__ARQ_URL: redis://redis:6379/1
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -40,6 +46,8 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
       P2_REDIS__HOST: redis
+      P2_REDIS__URL: redis://redis:6379/0
+      P2_REDIS__ARQ_URL: redis://redis:6379/1
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
@@ -61,6 +69,8 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
       P2_REDIS__HOST: redis
+      P2_REDIS__URL: redis://redis:6379/0
+      P2_REDIS__ARQ_URL: redis://redis:6379/1
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:
@@ -83,6 +93,8 @@ services:
     environment:
       DJANGO_SETTINGS_MODULE: p2.core.settings
       P2_REDIS__HOST: redis
+      P2_REDIS__URL: redis://redis:6379/0
+      P2_REDIS__ARQ_URL: redis://redis:6379/1
       REDIS_URL: redis://redis:6379/0
       ARQ_REDIS_URL: redis://redis:6379/1
     depends_on:

@@ -1,16 +1,18 @@
 """p2 S3 Presigned URL view — generates presigned GET/PUT URLs via REST API."""
+import json
 import logging
 
 from django.http import JsonResponse
 from django.views import View
-from django.contrib.auth.mixins import LoginRequiredMixin
+from ninja_jwt.authentication import JWTAuth
+from ninja_jwt.exceptions import InvalidToken
 
 from p2.s3.presign import generate_presigned_url
 
 LOGGER = logging.getLogger(__name__)
 
 
-class PresignedURLView(LoginRequiredMixin, View):
+class PresignedURLView(View):
     """Generate a presigned URL for GET or PUT on a blob.
 
     POST /_/api/v1/s3/presign/
@@ -21,13 +23,35 @@ class PresignedURLView(LoginRequiredMixin, View):
         "expires_in": 3600,       # seconds, default 3600, max 604800
         "base_url": "http://localhost:8000"
     }
+
+    Accepts either Django session auth or JWT Bearer token.
     """
 
+    def _authenticate(self, request):
+        """Try JWT first, then fall back to session auth."""
+        # Try JWT Bearer token
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            try:
+                jwt_auth = JWTAuth()
+                user = jwt_auth.authenticate(request, auth_header[7:])
+                if user:
+                    request.user = user
+                    return True
+            except InvalidToken:
+                pass
+        # Fall back to Django session
+        if request.user and request.user.is_authenticated:
+            return True
+        return False
+
     def post(self, request):
-        import json
+        if not self._authenticate(request):
+            return JsonResponse({"error": "authentication required"}, status=401)
+
         try:
             body = json.loads(request.body)
-        except (ValueError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValueError):
             return JsonResponse({"error": "invalid JSON"}, status=400)
 
         bucket = body.get("bucket", "")

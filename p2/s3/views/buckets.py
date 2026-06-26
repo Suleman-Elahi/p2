@@ -12,6 +12,7 @@ from p2.core.constants import (ATTR_BLOB_HASH_MD5, ATTR_BLOB_IS_FOLDER,
 from p2.core.models import Storage, Volume
 from p2.s3.constants import (TAG_S3_ACL, TAG_S3_DEFAULT_STORAGE,
                              TAG_S3_STORAGE_CLASS, XML_NAMESPACE)
+from p2.s3.cache import invalidate_volume_global, invalidate_acl
 from p2.s3.cors import (apply_cors_headers, build_cors_xml,
                         find_matching_rule, get_cors_rules, parse_cors_xml)
 from p2.s3.errors import AWSAccessDenied, AWSNoSuchKey
@@ -61,7 +62,7 @@ class BucketView(S3View):
     async def get(self, request, *args, **kwargs):
         bucket = kwargs.get('bucket', '')
         if 'versioning' in request.GET:
-            return self._handler_versioning()
+            return await self._handler_versioning(request, bucket)
         if 'uploads' in request.GET:
             return await self._list_multipart_uploads(request, bucket)
         if 'cors' in request.GET:
@@ -80,6 +81,8 @@ class BucketView(S3View):
             return self._get_encryption()
         if 'policy' in request.GET:
             return await self._get_bucket_policy(request, bucket)
+        if 'versions' in request.GET:
+            return await self._list_object_versions(request, bucket)
         return await self.handler_list(request, bucket)
 
     async def head(self, request, bucket):
@@ -91,6 +94,8 @@ class BucketView(S3View):
             return HttpResponse(status=404)
 
     async def put(self, request, bucket):
+        if 'versioning' in request.GET:
+            return await self._put_versioning(request, bucket)
         if 'cors' in request.GET:
             return await self._put_cors(request, bucket)
         if 'acl' in request.GET:
@@ -221,9 +226,74 @@ class BucketView(S3View):
 
         return XMLResponse(root)
 
-    def _handler_versioning(self):
+    async def _handler_versioning(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'read')
+        is_versioned = volume.tags.get('versioning') == 'true' or volume.tags.get('versioning') is True
         root = ElementTree.Element("{%s}VersioningConfiguration" % XML_NAMESPACE)
-        ElementTree.SubElement(root, "Status").text = "Disabled"
+        if is_versioned:
+            ElementTree.SubElement(root, "Status").text = "Enabled"
+        else:
+            ElementTree.SubElement(root, "Status").text = "Disabled"
+        return XMLResponse(root)
+
+    async def _put_versioning(self, request, bucket):
+        volume = await self.get_volume(request.user, bucket, 'admin')
+        try:
+            body = request.body
+            root = ElementTree.fromstring(body)
+            status_el = None
+            for el in root.iter():
+                if el.tag.endswith('Status'):
+                    status_el = el
+                    break
+            if status_el is not None and status_el.text in ('Enabled', 'Suspended', 'Disabled'):
+                status = status_el.text
+                tags = volume.tags or {}
+                tags['versioning'] = 'true' if status == 'Enabled' else 'false'
+                volume.tags = tags
+                await volume.asave(update_fields=['tags'])
+                # Invalidate across ALL workers via Redis generation counter
+                invalidate_volume_global(volume.name)
+                invalidate_acl(str(volume.pk))
+                return HttpResponse(status=200)
+        except Exception as e:
+            LOGGER.error("Failed to parse/save versioning config: %s", e)
+        return HttpResponse(status=400)
+
+    async def _list_object_versions(self, request, bucket):
+        """ListObjectVersions — S3 GET /?versions API.
+
+        Returns all stored versions (including delete markers) for objects
+        in the bucket. Fully async, dispatches the LMDB scan to a thread.
+        """
+        volume = await self.get_volume(request.user, bucket, 'read')
+        engine = await self.get_engine(volume)
+
+        prefix = request.GET.get('prefix', '')
+        max_keys = min(int(request.GET.get('max-keys', 1000)), 1000)
+        key_marker = request.GET.get('key-marker', '')
+        version_id_marker = request.GET.get('version-id-marker', '')
+
+        from p2.s3.versioning import list_versions, build_list_versions_xml
+        versions = await list_versions(
+            engine,
+            prefix=prefix,
+            max_keys=max_keys + 1,  # fetch one extra to detect truncation
+            key_marker=key_marker,
+            version_id_marker=version_id_marker,
+        )
+
+        is_truncated = len(versions) > max_keys
+        if is_truncated:
+            versions = versions[:max_keys]
+
+        root = build_list_versions_xml(
+            bucket=bucket,
+            prefix=prefix,
+            versions=versions,
+            is_truncated=is_truncated,
+            namespace=XML_NAMESPACE,
+        )
         return XMLResponse(root)
 
     # -------------------------------------------------------------------------
@@ -284,12 +354,16 @@ class BucketView(S3View):
             rules.append(rule)
         volume.tags[self.TAG_LIFECYCLE] = json.dumps(rules)
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=200)
 
     async def _delete_lifecycle(self, request, bucket):
         volume = await self.get_volume(request.user, bucket, 'write')
         volume.tags.pop(self.TAG_LIFECYCLE, None)
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=204)
 
     def _get_notification(self):
@@ -430,12 +504,16 @@ class BucketView(S3View):
         rules = parse_cors_xml(request.body)
         volume.tags['s3.p2.io/cors/rules'] = rules
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=200)
 
     async def _delete_cors(self, request, bucket):
         volume = await self.get_volume(request.user, bucket, 'write')
         volume.tags.pop('s3.p2.io/cors/rules', None)
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=204)
 
     # -------------------------------------------------------------------------
@@ -479,6 +557,8 @@ class BucketView(S3View):
         volume.tags[TAG_S3_ACL] = canned
         volume.public_read = 'public-read' in canned
         await volume.asave(update_fields=['tags', 'public_read'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=200)
 
     # -------------------------------------------------------------------------
@@ -520,6 +600,8 @@ class BucketView(S3View):
         for k, v in new_tags.items():
             volume.tags[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=200)
 
     async def _delete_bucket_tagging(self, request, bucket):
@@ -528,6 +610,8 @@ class BucketView(S3View):
         volume.tags = {k: v for k, v in volume.tags.items()
                        if not k.startswith(TAG_S3_USER_TAG_PREFIX)}
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=204)
 
     # -------------------------------------------------------------------------
@@ -564,10 +648,14 @@ class BucketView(S3View):
             return response
         volume.tags[self.TAG_BUCKET_POLICY] = request.body.decode('utf-8')
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=204)
 
     async def _delete_bucket_policy(self, request, bucket):
         volume = await self.get_volume(request.user, bucket, 'admin')
         volume.tags.pop(self.TAG_BUCKET_POLICY, None)
         await volume.asave(update_fields=['tags'])
+        invalidate_volume_global(volume.name)
+        invalidate_acl(str(volume.pk))
         return HttpResponse(status=204)

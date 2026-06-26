@@ -12,8 +12,9 @@ class ObjectTests(S3TestCase):
     """Test Object-related operations"""
 
     def _volume_storage_dir(self):
+        from p2.core.storage_path import storage_path
         volume = Volume.objects.get(name='test-1')
-        return f"/storage/volumes/{volume.uuid.hex}"
+        return storage_path("volumes", volume.uuid.hex)
 
     def _put_and_list_files(self, key, data):
         """Put an object and return the files in the volume storage dir before/after."""
@@ -21,7 +22,7 @@ class ObjectTests(S3TestCase):
         before_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
         self.boto3.put_object(Body=data, Bucket='test-1', Key=key)
         after_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
-        new_files = [f for f in after_files - before_files if os.path.isfile(f)]
+        new_files = [f for f in after_files - before_files if os.path.isfile(f) and '.lmdb' not in f]
         return new_files
 
     def test_no_such_bucket(self):

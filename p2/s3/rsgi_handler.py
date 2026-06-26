@@ -13,8 +13,8 @@ Falls back to Django for: multipart, ACL, tagging, bucket ops, non-S3.
 import asyncio
 import json
 import logging
+import os
 import time
-import uuid
 import urllib.parse
 
 from django.conf import settings
@@ -196,11 +196,17 @@ def S3ProxyRSGIApp(django_fallback):
             )
 
             from email.utils import format_datetime
-            from django.utils.dateparse import parse_datetime
             last_mod_str = attributes.get(ATTR_BLOB_STAT_MTIME, '')
             last_mod = ''
             if last_mod_str:
+                from django.utils.dateparse import parse_datetime
+                import datetime as _dt
                 dt = parse_datetime(last_mod_str)
+                if dt is None:
+                    try:
+                        dt = _dt.datetime.fromtimestamp(float(last_mod_str), tz=_dt.UTC)
+                    except (ValueError, OverflowError):
+                        pass
                 if dt:
                     last_mod = format_datetime(dt, usegmt=True)
 
@@ -214,8 +220,10 @@ def S3ProxyRSGIApp(django_fallback):
             if last_mod:
                 resp_headers.append(('last-modified', last_mod))
 
-            if getattr(settings, 'USE_X_ACCEL_REDIRECT', False):
-                # Let nginx serve the file via X-Accel-Redirect.
+            if getattr(settings, 'USE_X_ACCEL_REDIRECT', False) and 'x-real-ip' in hdrs:
+                # Only use X-Accel-Redirect when Nginx is actually proxying.
+                # Nginx sets X-Real-IP; if absent the request is direct and
+                # we must serve the file body ourselves.
                 resp_headers.append(('x-accel-redirect', internal_path))
                 resp_headers.append(('x-p2-accel', '1'))
                 proto.response_empty(status=200, headers=resp_headers)
@@ -251,7 +259,7 @@ def S3ProxyRSGIApp(django_fallback):
                 from p2.s3.utils import decode_aws_chunked
                 body = decode_aws_chunked(body)
 
-            blob_uuid = uuid.uuid4().hex
+            blob_uuid = os.urandom(16).hex()
             dir_path = blob_dir(volume.uuid.hex, blob_uuid)
             ensure_dir(dir_path)
             fs_path = blob_fs_path(volume.uuid.hex, blob_uuid)
@@ -267,8 +275,8 @@ def S3ProxyRSGIApp(django_fallback):
                 final_md5 = hashlib.md5(body).hexdigest()
                 final_sha256 = hashlib.sha256(body).hexdigest()
 
-            from django.utils.timezone import now
-            now_iso = str(now())
+            import datetime as _dt
+            now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             client_ct = hdrs.get('content-type', 'application/octet-stream')
             metadata_payload = {
                 ATTR_BLOB_MIME: client_ct,

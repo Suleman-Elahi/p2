@@ -1,6 +1,0 @@
-{% load p2_ui %}
-<audio controls preload="metadata" style="width:100%;">
-  <source src="{% url 'p2_ui:core-blob-inline' volume_pk=object.volume.pk blob_path=object.path %}"
-          type="{{ object.attributes|get_item:'blob.p2.io/mime'|default:'audio/mpeg' }}">
-  Your browser does not support the audio element.
-</audio>

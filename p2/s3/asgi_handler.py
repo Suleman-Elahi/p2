@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import time
-import uuid
 import urllib.parse
 
 from django.conf import settings
@@ -40,6 +39,19 @@ ATTR_BLOB_STAT_CTIME = "blob.p2.io/stat/ctime"
 
 # Cache the S3 base domain at module level — never changes at runtime.
 _S3_BASE_DOMAIN: str | None = None
+
+def _parse_stored_timestamp(ts_str: str):
+    """Parse a stored mtime/ctime value, handling both ISO 8601 (current)
+    and legacy Unix epoch floats from objects written before the timestamp fix."""
+    from django.utils.dateparse import parse_datetime
+    import datetime as _dt
+    dt = parse_datetime(ts_str)
+    if dt is None:
+        try:
+            dt = _dt.datetime.fromtimestamp(float(ts_str), tz=_dt.UTC)
+        except (ValueError, OverflowError):
+            return None
+    return dt
 
 def _get_s3_base_domain() -> str:
     global _S3_BASE_DOMAIN
@@ -84,7 +96,7 @@ def S3ProxyASGIApp(django_app):
         method = scope['method']
 
         # Fast reject non-S3 paths without parsing headers.
-        if path.startswith('/_/') or path == '/favicon.ico' or path.startswith('/.well-known/'):
+        if path.startswith('/_/') or path.startswith('/api/') or path == '/favicon.ico' or path.startswith('/.well-known/'):
             return await django_app(scope, receive, send)
 
         # ── Parse headers ONCE ────────────────────────────────────────────
@@ -197,15 +209,17 @@ def S3ProxyASGIApp(django_app):
             ipath = attributes.get('internal_path', f"/internal-storage/volumes/{vol_hex}/{key}")
 
             from email.utils import format_datetime
-            from django.utils.dateparse import parse_datetime
             lm = b""
             lm_str = attributes.get(ATTR_BLOB_STAT_MTIME, '')
             if lm_str:
-                dt = parse_datetime(lm_str)
+                dt = _parse_stored_timestamp(lm_str)
                 if dt:
                     lm = format_datetime(dt, usegmt=True).encode('ascii')
 
-            if use_accel:
+            if use_accel and 'x-real-ip' in hdrs:
+                # Only use X-Accel-Redirect when Nginx is actually proxying.
+                # Nginx sets X-Real-IP; if absent the request is direct and
+                # we must serve the file body ourselves.
                 resp_h = [
                     (b'x-accel-redirect', ipath.encode('utf-8')),
                     (b'x-p2-accel', b'1'),
@@ -244,6 +258,12 @@ def S3ProxyASGIApp(django_app):
 
         # ── PUT ───────────────────────────────────────────────────────────
         if method == 'PUT':
+            # If versioning is enabled, fall through to Django view which has
+            # full version-aware archive/metadata logic. This keeps the fast
+            # path simple for the common non-versioned case.
+            if (volume.tags or {}).get('versioning') == 'true':
+                return await django_app(scope, receive, send)
+
             client_ct = hdrs.get('content-type', 'application/octet-stream')
             content_length = int(hdrs.get('content-length', '-1'))
             is_aws_chunked = (
@@ -271,7 +291,7 @@ def S3ProxyASGIApp(django_app):
                 from p2.s3.utils import decode_aws_chunked
                 body = decode_aws_chunked(body)
 
-            blob_uuid = uuid.uuid4().hex
+            blob_uuid = os.urandom(16).hex()
             dir_path = blob_dir(vol_hex, blob_uuid)
             ensure_dir(dir_path)
             fs_path = blob_fs_path(vol_hex, blob_uuid)
@@ -282,6 +302,8 @@ def S3ProxyASGIApp(django_app):
             SYNC_THRESHOLD = 262144  # 256KB
             if p2_s3_crypto:
                 if blob_size <= SYNC_THRESHOLD:
+                    # Safe to call directly: the Rust extension releases the GIL
+                    # during file I/O via py.allow_threads().
                     final_md5, final_sha256 = p2_s3_crypto.write_and_hash_small(fs_path, body)
                 else:
                     final_md5, final_sha256 = await asyncio.to_thread(
@@ -298,9 +320,9 @@ def S3ProxyASGIApp(django_app):
                     final_md5 = hashlib.md5(body).hexdigest()
                     final_sha256 = hashlib.sha256(body).hexdigest()
 
-            # Metadata
-            from django.utils.timezone import now
-            now_iso = str(now())
+            # Metadata — use stdlib datetime for ISO 8601 without Django timezone overhead.
+            import datetime as _dt
+            now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             metadata_json = json.dumps({
                 ATTR_BLOB_MIME: client_ct,
                 ATTR_BLOB_SIZE_BYTES: str(blob_size),

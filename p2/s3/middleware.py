@@ -42,7 +42,7 @@ def _is_s3(request):
     if 'HTTP_X_AMZ_DATE' in request.META:
         return True
     auth = request.META.get('HTTP_AUTHORIZATION', '')
-    if auth.startswith('AWS') or auth.startswith('Bearer'):
+    if auth.startswith('AWS'):
         return True
     if 'X-Amz-Signature' in request.GET or 'X-P2-Signature' in request.GET:
         return True
@@ -107,13 +107,18 @@ def S3RoutingMiddleware(get_response):
                     handler = AWSV4Authentication(request)
                     request.user = await handler.validate()
                     request._s3_authenticated_user = request.user
+                
+                # Bypass the rest of the middleware stack entirely — go straight to the view.
+                response = await _dispatch_s3(request)
+                if request.method == 'OPTIONS' and response.status_code == 405:
+                    response.status_code = 200
             except AWSError as exc:
-                return _s3_error(exc)
+                response = _s3_error(exc)
 
-            # Bypass the rest of the middleware stack entirely — go straight to the view.
-            response = await _dispatch_s3(request)
-            if request.method == 'OPTIONS' and response.status_code == 405:
-                response.status_code = 200
+            bucket_name = bucket or request.path_info.strip('/').split('/')[0]
+            if bucket_name:
+                from p2.s3.cors import apply_cors_to_response
+                response = await apply_cors_to_response(request, response, bucket_name)
             return response
     else:
         def middleware(request: HttpRequest):
@@ -130,12 +135,16 @@ def S3RoutingMiddleware(get_response):
                     handler = AWSV4Authentication(request)
                     request.user = async_to_sync(handler.validate)()
                     request._s3_authenticated_user = request.user
+                
+                response = get_response(request)
             except AWSError as exc:
-                return _s3_error(exc)
+                response = _s3_error(exc)
 
-            try:
-                return get_response(request)
-            except AWSError as exc:
-                return _s3_error(exc)
+            bucket_name = bucket or request.path_info.strip('/').split('/')[0]
+            if bucket_name:
+                from asgiref.sync import async_to_sync
+                from p2.s3.cors import apply_cors_to_response
+                response = async_to_sync(apply_cors_to_response)(request, response, bucket_name)
+            return response
 
     return middleware

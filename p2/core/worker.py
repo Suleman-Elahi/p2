@@ -93,7 +93,17 @@ async def complete_multipart(ctx, upload_id: str, user_pk: int, volume_pk: str, 
     m_attr = json.loads(meta_str) if meta_str else {}
     await asyncio.to_thread(engine.delete, f"/.multipart/{upload_id}/_meta")
 
-    await asyncio.to_thread(engine.put, path, json.dumps({
+    # Versioning: archive old content and generate new version_id if enabled
+    bucket_versioning = (volume.tags or {}).get('versioning') == 'true'
+    new_version_id = None
+    existing_metadata_json = await asyncio.to_thread(engine.get, path)
+    if bucket_versioning:
+        from p2.s3.versioning import archive_version, new_version_id as _new_vid
+        if existing_metadata_json:
+            await archive_version(engine, path, existing_metadata_json)
+        new_version_id = _new_vid()
+
+    payload = {
         ATTR_BLOB_MIME: m_attr.get('content_type', 'application/octet-stream'),
         ATTR_BLOB_SIZE_BYTES: str(total_size),
         ATTR_BLOB_IS_FOLDER: False,
@@ -101,7 +111,16 @@ async def complete_multipart(ctx, upload_id: str, user_pk: int, volume_pk: str, 
         ATTR_BLOB_STAT_CTIME: str(now()),
         'blob.p2.io/hash/md5': final_etag,
         'internal_path': internal_path,
-    }))
+    }
+    if new_version_id:
+        payload['blob.p2.io/version_id'] = new_version_id
+
+    metadata_json = json.dumps(payload)
+    await asyncio.to_thread(engine.put, path, metadata_json)
+    if new_version_id:
+        from p2.s3.versioning import _version_lmdb_key
+        lmdb_key = _version_lmdb_key(path, new_version_id)
+        await asyncio.to_thread(engine.put_raw, lmdb_key, metadata_json.encode('utf-8'))
     logger.info("complete_multipart: assembled %d parts → %s (%d bytes)",
                 len(parts), path, total_size)
 

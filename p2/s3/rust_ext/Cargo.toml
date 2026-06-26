@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # pyo3: Python bindings for Rust — zero-overhead FFI
-pyo3 = { version = "0.23", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py312"] }
 # hmac + sha2: pure-Rust, constant-time HMAC-SHA256
 # sha2/asm enables AVX2 assembly backend (sha256 ~3x faster on AVX2 CPUs)
 hmac = "0.12"

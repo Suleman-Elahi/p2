@@ -108,6 +108,29 @@ STATIC_ROOT="$REPO_ROOT/static"
 info "Creating required directories..."
 mkdir -p "$STORAGE_ROOT/volumes" static
 
+# ── Build Frappe UI SPA ────────────────────────────────────────────────────────
+UI_DIR="$REPO_ROOT/ui"
+if [ -f "$UI_DIR/package.json" ]; then
+    if [ -d "$UI_DIR/dist" ]; then
+        info "Frappe UI build directory already exists ($UI_DIR/dist) — skipping SPA build."
+    else
+        info "Building Frappe UI SPA..."
+        cd "$UI_DIR"
+        if [ ! -d "node_modules" ]; then
+            npm install --silent 2>/dev/null || warn "npm install had warnings; continuing."
+        fi
+        npm run build 2>&1 | grep -E '(error|built|✓|✗)' || true
+        cd "$REPO_ROOT"
+        if [ -f "$UI_DIR/dist/index.html" ]; then
+            info "Frappe UI build complete: $(du -sh "$UI_DIR/dist" | cut -f1)"
+        else
+            warn "Frappe UI build may have failed — check $UI_DIR for errors"
+        fi
+    fi
+else
+    warn "Frappe UI not found at $UI_DIR — skipping SPA build"
+fi
+
 info "Updating .env for native mode..."
 _ensure_generated_secret "P2_SECRET_KEY"
 _ensure_generated_secret "P2_FERNET_KEY"
@@ -128,6 +151,7 @@ fi
 if command -v nginx &>/dev/null; then
     DEV_CONF="$REPO_ROOT/nginx-p2.conf"
     info "Generating nginx-p2.conf inline..."
+    UI_DIST="$REPO_ROOT/ui/dist"
     cat > "$DEV_CONF" <<EOF
 upstream granian {
     server 127.0.0.1:${PORT};
@@ -141,11 +165,20 @@ server {
     client_max_body_size 2G;
     access_log off;
 
-    location /static/ {
+    # ── Frappe UI SPA assets (served directly by nginx) ────────────────
+    location /assets/ {
+        alias ${UI_DIST}/assets/;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # ── Django static files ────────────────────────────────────────────
+    location /_/static/ {
         alias ${STATIC_ROOT}/;
         expires 7d;
     }
 
+    # ── Internal storage (X-Accel-Redirect) ────────────────────────────
     location /internal-storage/ {
         internal;
         alias ${STORAGE_ROOT}/;
@@ -154,6 +187,7 @@ server {
         aio threads;
     }
 
+    # ── Everything else → Granian (S3 data plane + Django SPA) ─────────
     location / {
         proxy_pass http://granian;
         proxy_http_version 1.1;
@@ -163,8 +197,6 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_redirect off;
-
-        # Stream request body directly to granian without buffering to disk.
         proxy_request_buffering off;
         proxy_buffering off;
     }

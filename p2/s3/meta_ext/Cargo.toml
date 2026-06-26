@@ -8,7 +8,7 @@ name = "p2_s3_meta"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.20", features = ["extension-module"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py312"] }
 redb = "2.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

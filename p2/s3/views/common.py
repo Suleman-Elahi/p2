@@ -223,11 +223,15 @@ class S3View(View):
             response = await super().dispatch(request, *args, **kwargs)
         except AWSError as exc:
             response = AWSErrorView(exc)
-        finally:
-            latency_ms = (time.monotonic() - start) * 1000
-            attrs = {"method": method, "bucket": bucket}
-            s3_request_counter.add(1, attrs)
-            s3_latency_histogram.record(latency_ms, attrs)
+
+        if bucket:
+            from p2.s3.cors import apply_cors_to_response
+            response = await apply_cors_to_response(request, response, bucket)
+
+        latency_ms = (time.monotonic() - start) * 1000
+        attrs = {"method": method, "bucket": bucket}
+        s3_request_counter.add(1, attrs)
+        s3_latency_histogram.record(latency_ms, attrs)
 
         return response
 

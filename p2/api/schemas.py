@@ -1,6 +1,6 @@
 """p2 API Schemas (Django Ninja)"""
 from typing import Optional
-from ninja import ModelSchema
+from ninja import ModelSchema, Schema
 from django.contrib.auth.models import User
 from p2.api.models import APIKey
 
@@ -8,6 +8,12 @@ class UserSchema(ModelSchema):
     class Meta:
         model = User
         fields = "__all__"
+
+class UserCreateSchema(Schema):
+    username: str
+    password: str
+    email: str = ""
+    is_superuser: bool = False
 
 class APIKeySchema(ModelSchema):
     secret_key: str
@@ -21,7 +27,9 @@ class APIKeySchema(ModelSchema):
         fields = ['id', 'name', 'user', 'access_key']
 
 class APIKeyCreateSchema(ModelSchema):
+    user: Optional[int] = None  # auto-set from request.user
+
     class Meta:
         model = APIKey
         fields = ['name', 'user', 'access_key']
-        optional_fields = ['access_key']
+        optional_fields = ['access_key', 'user']

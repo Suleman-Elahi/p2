@@ -61,9 +61,48 @@ class BucketMetadataTests(S3TestCase):
 
     def test_cors(self):
         self.boto3.put_bucket_cors(Bucket='test-1', CORSConfiguration={
-            'CORSRules': [{'AllowedOrigins': ['*'], 'AllowedMethods': ['GET']}]})
+            'CORSRules': [{'AllowedOrigins': ['http://localhost:9000'], 'AllowedMethods': ['GET']}]})
         rules = self.boto3.get_bucket_cors(Bucket='test-1')['CORSRules']
         self.assertEqual(len(rules), 1)
+
+        # 1. Matching origin -> header present
+        def add_matching_origin(request, **kwargs):
+            request.headers['Origin'] = 'http://localhost:9000'
+        
+        self.boto3.meta.events.register('before-send.s3.*', add_matching_origin)
+        resp = self.boto3.list_objects_v2(Bucket='test-1')
+        headers = resp['ResponseMetadata']['HTTPHeaders']
+        self.assertEqual(headers.get('access-control-allow-origin'), 'http://localhost:9000')
+
+        # 2. Non-matching origin -> header absent
+        import boto3
+        session = boto3.session.Session()
+        client_bad = session.client(
+            service_name='s3',
+            aws_access_key_id=self.access_key.access_key,
+            aws_secret_access_key=self.access_key.decrypt_secret_key(),
+            endpoint_url=self.live_server_url,
+        )
+        def add_bad_origin(request, **kwargs):
+            request.headers['Origin'] = 'http://hacker.com'
+        client_bad.meta.events.register('before-send.s3.*', add_bad_origin)
+        resp_bad = client_bad.list_objects_v2(Bucket='test-1')
+        headers_bad = resp_bad['ResponseMetadata']['HTTPHeaders']
+        self.assertNotIn('access-control-allow-origin', headers_bad)
+
+        # 3. Bad authentication but matching origin -> header still present on error response
+        client_bad_auth = session.client(
+            service_name='s3',
+            aws_access_key_id='BADKEY',
+            aws_secret_access_key='BADSECRET',
+            endpoint_url=self.live_server_url,
+        )
+        client_bad_auth.meta.events.register('before-send.s3.*', add_matching_origin)
+        try:
+            client_bad_auth.list_objects_v2(Bucket='test-1')
+        except ClientError as e:
+            err_headers = e.response['ResponseMetadata']['HTTPHeaders']
+            self.assertEqual(err_headers.get('access-control-allow-origin'), 'http://localhost:9000')
 
     def test_policy(self):
         import json
@@ -155,6 +194,63 @@ class ObjectWriteTests(S3TestCase):
 
         # Delete (async DB thread limitation may prevent actual deletion in test env)
         self.boto3.delete_object(Bucket='test-1', Key='obj.txt')
+
+    def test_versioning_lifecycle(self):
+        # 1. Enable versioning
+        self.boto3.put_bucket_versioning(
+            Bucket='test-1', VersioningConfiguration={'Status': 'Enabled'})
+        status = self.boto3.get_bucket_versioning(Bucket='test-1')
+        self.assertEqual(status.get('Status'), 'Enabled')
+
+        # 2. Put V1
+        r1 = self.boto3.put_object(Body=b'content-v1', Bucket='test-1', Key='vobj.txt')
+        v1_id = r1.get('VersionId')
+        self.assertIsNotNone(v1_id)
+
+        # 3. Put V2
+        r2 = self.boto3.put_object(Body=b'content-v2', Bucket='test-1', Key='vobj.txt')
+        v2_id = r2.get('VersionId')
+        self.assertIsNotNone(v2_id)
+        self.assertNotEqual(v1_id, v2_id)
+
+        # 4. GET latest (should be V2)
+        resp_latest = self.boto3.get_object(Bucket='test-1', Key='vobj.txt')
+        self.assertEqual(resp_latest['Body'].read(), b'content-v2')
+
+        # 5. GET V1 explicitly
+        resp_v1 = self.boto3.get_object(Bucket='test-1', Key='vobj.txt', VersionId=v1_id)
+        self.assertEqual(resp_v1['Body'].read(), b'content-v1')
+
+        # 6. List versions
+        list_resp = self.boto3.list_object_versions(Bucket='test-1', Prefix='vobj.txt')
+        versions = list_resp.get('Versions', [])
+        self.assertEqual(len(versions), 2)
+        self.assertEqual(versions[0]['VersionId'], v2_id)  # latest first
+        self.assertEqual(versions[1]['VersionId'], v1_id)
+
+        # 7. Delete (creates DeleteMarker)
+        del_resp = self.boto3.delete_object(Bucket='test-1', Key='vobj.txt')
+        dm_id = del_resp.get('VersionId')
+        self.assertIsNotNone(dm_id)
+
+        # GET should now return 404
+        with self.assertRaises(ClientError):
+            self.boto3.get_object(Bucket='test-1', Key='vobj.txt')
+
+        # List should show DeleteMarker and 2 versions
+        list_resp = self.boto3.list_object_versions(Bucket='test-1', Prefix='vobj.txt')
+        dms = list_resp.get('DeleteMarkers', [])
+        versions = list_resp.get('Versions', [])
+        self.assertEqual(len(dms), 1)
+        self.assertEqual(dms[0]['VersionId'], dm_id)
+        self.assertEqual(len(versions), 2)
+
+        # 8. Delete specific version
+        self.boto3.delete_object(Bucket='test-1', Key='vobj.txt', VersionId=v1_id)
+        list_resp = self.boto3.list_object_versions(Bucket='test-1', Prefix='vobj.txt')
+        versions = list_resp.get('Versions', [])
+        self.assertEqual(len(versions), 1)
+        self.assertEqual(versions[0]['VersionId'], v2_id)
 
 
 # ── Multipart tests ──────────────────────────────────────────────────────

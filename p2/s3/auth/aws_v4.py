@@ -307,12 +307,25 @@ class AWSV4Authentication(BaseAuth):
         ])
         our_signature = self._sign(signing_key, string_to_sign).hex()
         if auth_request.signature != our_signature:
-            LOGGER.debug("Signature mismatch debug: path=%s, method=%s, query=%s, signed_headers=%s",
+            if auth_request.hash == UNSIGNED_PAYLOAD:
+                # Fallback: try empty body SHA256 as some client libraries sign GET/presigned requests this way
+                auth_request.hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                canonical_request = self._get_canonical_request(auth_request)
+                string_to_sign = '\n'.join([
+                    auth_request.algorithm,
+                    auth_request.date_long,
+                    auth_request.credentials,
+                    self._get_sha256(canonical_request.encode('utf-8')),
+                ])
+                our_signature = self._sign(signing_key, string_to_sign).hex()
+
+        if auth_request.signature != our_signature:
+            LOGGER.warning("Signature mismatch debug: path=%s, method=%s, query=%s, signed_headers=%s",
                         self.request.META.get('PATH_INFO'), self.request.META.get('REQUEST_METHOD'),
                         self.request.META.get('QUERY_STRING'), auth_request.signed_headers)
-            LOGGER.debug("Canonical request:\n%s", canonical_request)
-            LOGGER.debug("String to sign:\n%s", string_to_sign)
-            LOGGER.debug("Their sig: %s, Our sig: %s", auth_request.signature, our_signature)
+            LOGGER.warning("Canonical request:\n%s", canonical_request)
+            LOGGER.warning("String to sign:\n%s", string_to_sign)
+            LOGGER.warning("Their sig: %s, Our sig: %s", auth_request.signature, our_signature)
             LOGGER.warning("Signature mismatch for access_key=%s", auth_request.access_key)
             raise AWSSignatureMismatch
         return secret_key.user

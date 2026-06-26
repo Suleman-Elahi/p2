@@ -16,6 +16,7 @@ Replaces p2/root/settings.py with modernized configuration:
 
 import os
 import sys
+from datetime import timedelta
 
 from p2 import __version__
 from p2.lib.config import CONFIG
@@ -44,6 +45,18 @@ if not SECRET_KEY:
 # Must be a URL-safe base64-encoded 32-byte key. Generate with:
 #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 FERNET_KEY = CONFIG.y('fernet_key', '')
+
+# ── Ninja JWT Configuration ────────────────────────────────────────────────
+# ninja-jwt is used for the REST API (/api/v1/*) authentication.
+# Without this, JWTAuth() cannot validate tokens and returns 401.
+NINJA_JWT = {
+    'SIGNING_KEY': SECRET_KEY,
+    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'AUTH_HEADER_TYPES': ('Bearer',),
+    'USER_ID_FIELD': 'id',
+    'USER_ID_CLAIM': 'user_id',
+}
 
 DEBUG = CONFIG.y_bool('debug')
 TEST = any('test' in arg for arg in sys.argv)
@@ -130,6 +143,7 @@ MIDDLEWARE = [
     'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.http.ConditionalGetMiddleware',
+    'p2.api.middleware.ApiCSRFExemptMiddleware',  # skip CSRF for JWT-based API paths
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -140,9 +154,7 @@ ROOT_URLCONF = 'p2.root.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [
-            os.path.join(BASE_DIR, 'p2/ui/templates/'),
-        ],
+        'DIRS': [],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -150,7 +162,6 @@ TEMPLATES = [
                 'django.template.context_processors.request',
                 'django.contrib.auth.context_processors.auth',
                 'django.contrib.messages.context_processors.messages',
-                'p2.ui.context_processors.version',
             ],
         },
     },
@@ -348,7 +359,7 @@ LOGGING = {
 # ---------------------------------------------------------------------------
 
 if TEST:
-    LOGGING = {'version': 1, 'disable_existing_loggers': True}
+    pass
 
 # ---------------------------------------------------------------------------
 # Debug toolbar (dev only)

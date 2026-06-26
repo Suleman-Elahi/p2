@@ -1,42 +1,65 @@
-"""p2 UI Index view"""
-from django.contrib.auth.mixins import LoginRequiredMixin
-from django.views.generic import ListView
+"""p2 UI views — Frappe SPA index"""
+import os
 
-from p2.core.models import Volume
-from p2.ui.stats import get_volume_stats
+from django.http import HttpResponse, FileResponse
+from django.views.generic import View
 
 
-class IndexView(LoginRequiredMixin, ListView):
-    """Show overview of volumes"""
+# ── Frappe UI SPA catch-all ─────────────────────────────────────────────
 
-    model = Volume
-    permission_required = 'p2_core.view_volume'
-    template_name = 'general/index.html'
-    ordering = 'name'
-    paginate_by = 9
+_SPA_DIST = os.path.join(os.path.dirname(__file__), '..', '..', '..', 'ui', 'dist')
 
-    def get_queryset(self, *args, **kwrags):
-        return super().get_queryset(*args, **kwrags).select_related('storage')
+class SpaIndexView(View):
+    """Serve the Frappe UI SPA.
 
-    def get_context_data(self, **kwargs):
-        data = super().get_context_data(**kwargs)
-        total_objects = 0
+    - /assets/* paths → serve the actual static file from ui/dist/
+    - all other paths → serve ui/dist/index.html (Vue Router handles routing)
+    """
 
-        for volume in data['object_list']:
-            stats = get_volume_stats(volume)
-            volume.object_count = stats['object_count']
-            volume.space_used_bytes = stats['total_bytes']
-            total_objects += stats['object_count']
+    def get(self, request, *args, **kwargs):
+        asset_path = kwargs.get('asset_path', '')
+        if asset_path:
+            # Serve a specific asset file
+            file_path = os.path.join(_SPA_DIST, 'assets', asset_path)
+            if os.path.isfile(file_path) and not _is_unsafe_path(file_path, _SPA_DIST):
+                content_type = _guess_mime(file_path)
+                return FileResponse(open(file_path, 'rb'), content_type=content_type)
+            return HttpResponse(status=404)
 
-        data['count'] = total_objects
-        return data
+        # Serve index.html for SPA routing
+        index_path = os.path.join(_SPA_DIST, 'index.html')
+        if not os.path.isfile(index_path):
+            return HttpResponse(
+                '<html><body style="font-family:sans-serif;padding:2rem">'
+                '<h1>p2 UI not built</h1>'
+                '<p>Run <code>cd ui && npm run build</code> to build the Frappe UI.</p>'
+                '<p><a href="/_/admin/">Django Admin</a> | '
+                '<a href="/_/api/v1/docs">API Docs</a></p>'
+                '</body></html>',
+                content_type='text/html',
+            )
+        return FileResponse(open(index_path, 'rb'), content_type='text/html')
 
-class SearchView(LoginRequiredMixin, ListView):
-    """Search Blobs by their key - currently disabled"""
 
-    model = Volume
-    ordering = 'name'
-    template_name = 'search/results.html'
+def _is_unsafe_path(file_path, base_dir):
+    """Prevent directory traversal attacks."""
+    real_path = os.path.realpath(file_path)
+    real_base = os.path.realpath(base_dir)
+    return not real_path.startswith(real_base)
 
-    def get_queryset(self):
-        return Volume.objects.none()
+
+def _guess_mime(path):
+    """Guess MIME type from file extension."""
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        '.js': 'application/javascript',
+        '.css': 'text/css',
+        '.html': 'text/html',
+        '.json': 'application/json',
+        '.svg': 'image/svg+xml',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.woff2': 'font/woff2',
+        '.woff': 'font/woff',
+    }.get(ext, 'application/octet-stream')

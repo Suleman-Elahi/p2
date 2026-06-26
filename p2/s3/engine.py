@@ -16,6 +16,12 @@ _lock = threading.Lock()
 class LMDbEngine:
     """Wrapper that acts as the S3 meta engine matching the old redb API natively."""
     def __init__(self, db_path: str):
+        # Extract volume UUID hex from db_path
+        try:
+            self.volume_uuid_hex = os.path.basename(os.path.dirname(db_path))
+        except Exception:
+            self.volume_uuid_hex = None
+
         lmdb_sync = bool(getattr(settings, "S3_METADATA_LMDB_SYNC", True))
         lmdb_metasync = bool(getattr(settings, "S3_METADATA_LMDB_METASYNC", True))
         # map_size is the maximum virtual mapping size (1TB map limit here).
@@ -34,10 +40,30 @@ class LMDbEngine:
         )
         self.db = self.env.open_db(b"objects")
 
+    def invalidate_cache(self, path: str) -> None:
+        if not self.volume_uuid_hex:
+            return
+        try:
+            from django.core.cache import cache
+            parts = path.split('/')
+            prefix = ""
+            for part in parts[:-1]:
+                prefix += part + "/"
+                cache_key = f"folder_stats:{self.volume_uuid_hex}:{prefix}"
+                cache.delete(cache_key)
+        except Exception:
+            pass
+
     def put(self, path: str, json_metadata: str) -> None:
         """Write key-value to LMDB."""
         with self.env.begin(write=True, db=self.db) as txn:
             txn.put(path.encode('utf-8'), json_metadata.encode('utf-8'))
+        self.invalidate_cache(path)
+
+    def put_raw(self, key: bytes, value: bytes) -> None:
+        """Write raw bytes key-value to LMDB."""
+        with self.env.begin(write=True, db=self.db) as txn:
+            txn.put(key, value)
 
     def get(self, path: str) -> str | None:
         """Retrieve key-value from LMDB using lock-free read."""
@@ -45,10 +71,16 @@ class LMDbEngine:
             val = txn.get(path.encode('utf-8'))
             return val.decode('utf-8') if val else None
 
+    def get_raw(self, key: bytes) -> bytes | None:
+        """Retrieve raw bytes key-value from LMDB."""
+        with self.env.begin(db=self.db) as txn:
+            return txn.get(key)
+
     def delete(self, path: str) -> None:
         """Delete key from LMDB."""
         with self.env.begin(write=True, db=self.db) as txn:
             txn.delete(path.encode('utf-8'))
+        self.invalidate_cache(path)
 
     def list(self, prefix: str, start_after: str | None = None, max_keys: int | None = 1000) -> list[tuple[str, str]]:
         """Scan keys matching `prefix` in LMDB B-Tree efficiently."""
@@ -63,6 +95,8 @@ class LMDbEngine:
             check_start_after = True
             
         start_key_bytes = start_key.encode('utf-8')
+        if not start_key_bytes:
+            start_key_bytes = b"\x01"
 
         with self.env.begin(db=self.db) as txn:
             cursor = txn.cursor()
@@ -71,6 +105,9 @@ class LMDbEngine:
                     if not key.startswith(prefix_bytes):
                         break
                     
+                    if key.startswith(b'\x00'):
+                        continue
+                    
                     if check_start_after and key == start_after.encode('utf-8'):
                         continue # start_after is exclusive in S3
                         
@@ -78,6 +115,77 @@ class LMDbEngine:
                     if len(results) >= limit:
                         break
         return results
+
+    def list_dir(self, prefix: str, delimiter: str = "/", start_after: str | None = None, max_keys: int = 1000) -> 'tuple[list[tuple[str, str]], list[str]]':
+        """List direct files and subdirectories under `prefix` using cursor jumping.
+        
+        Returns:
+            (objects, common_prefixes)
+            where objects is a list of (key, metadata_json) tuples
+            and common_prefixes is a list of folder prefix strings.
+        """
+        prefix_bytes = prefix.encode('utf-8')
+        start_key = prefix
+        check_start_after = False
+        if start_after and start_after > start_key:
+            if start_after.endswith('/'):
+                start_key = start_after[:-1] + chr(ord('/') + 1)
+            else:
+                start_key = start_after
+                check_start_after = True
+            
+        start_key_bytes = start_key.encode('utf-8')
+        if not start_key_bytes:
+            start_key_bytes = b"\x01"
+        
+        objects = []
+        common_prefixes = set()
+        plen = len(prefix)
+        
+        with self.env.begin(db=self.db) as txn:
+            cursor = txn.cursor()
+            if not cursor.set_range(start_key_bytes):
+                return [], []
+            
+            while True:
+                key_bytes = cursor.key()
+                if not key_bytes:
+                    break
+                if not key_bytes.startswith(prefix_bytes):
+                    break
+                
+                if key_bytes.startswith(b'\x00'):
+                    if not cursor.next():
+                        break
+                    continue
+                
+                key = key_bytes.decode('utf-8')
+                if check_start_after and key == start_after:
+                    if not cursor.next():
+                        break
+                    continue
+                
+                remainder = key[plen:]
+                if delimiter and delimiter in remainder:
+                    # Subdirectory found
+                    dir_name = remainder[:remainder.index(delimiter) + 1]
+                    sub_prefix = prefix + dir_name
+                    common_prefixes.add(sub_prefix)
+                    
+                    # Jump past this subdirectory
+                    jump_key = sub_prefix[:-1] + chr(ord(delimiter) + 1)
+                    if not cursor.set_range(jump_key.encode('utf-8')):
+                        break
+                else:
+                    # Direct object
+                    value_bytes = cursor.value()
+                    objects.append((key, value_bytes.decode('utf-8')))
+                    if len(objects) + len(common_prefixes) >= max_keys:
+                        break
+                    if not cursor.next():
+                        break
+                        
+        return objects, sorted(list(common_prefixes))
 
 _storage_root_cache: str | None = None
 

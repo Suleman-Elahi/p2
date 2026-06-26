@@ -68,18 +68,25 @@ fn md5_bytes<'py>(py: Python<'py>, data: &[u8]) -> Bound<'py, PyBytes> {
 }
 
 /// Write small payload to disk and compute hashes sequentially in C/Rust speed.
+/// Releases the Python GIL during file I/O so callers can invoke this
+/// synchronously from async contexts without blocking the event loop.
 #[pyfunction]
-fn write_and_hash_small(path: &str, data: &[u8]) -> pyo3::PyResult<(String, String)> {
+fn write_and_hash_small(py: Python<'_>, path: &str, data: &[u8]) -> pyo3::PyResult<(String, String)> {
     use std::fs::File;
     use std::io::Write;
-    
-    // Write directly
-    let mut f = File::create(path)?;
-    f.write_all(data)?;
-    
-    // Hash
-    let md5_hex = hex::encode(Md5::digest(data));
-    let sha256_hex = hex::encode(Sha256::digest(data));
+
+    let data_copy = data.to_vec();
+    let path_owned = path.to_string();
+
+    let (md5_hex, sha256_hex) = py.allow_threads(move || {
+        let mut f = File::create(&path_owned)?;
+        f.write_all(&data_copy)?;
+
+        let md5_hex = hex::encode(Md5::digest(&data_copy));
+        let sha256_hex = hex::encode(Sha256::digest(&data_copy));
+        Ok::<(String, String), std::io::Error>((md5_hex, sha256_hex))
+    })?;
+
     Ok((md5_hex, sha256_hex))
 }
 

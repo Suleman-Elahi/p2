@@ -22,8 +22,8 @@ class MultipartTests(S3TestCase):
             use_threads=False,
         )
         expected_size = 1024 * 1024  # 1 MB
-        volume = Volume.objects.get(name='test-1')
-        storage_dir = f"/storage/volumes/{volume.uuid.hex}"
+        from p2.core.storage_path import storage_path
+        storage_dir = storage_path("volumes", self.volume.uuid.hex)
 
         before_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
 
@@ -35,7 +35,7 @@ class MultipartTests(S3TestCase):
             )
 
         after_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
-        new_files = [f for f in after_files - before_files if os.path.isfile(f)]
+        new_files = [f for f in after_files - before_files if os.path.isfile(f) and '.lmdb' not in f]
 
         # The merged result file must exist
         self.assertTrue(len(new_files) >= 1, f"Expected at least 1 new file, got: {new_files}")

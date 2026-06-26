@@ -117,7 +117,7 @@ impl MetaEngine {
 }
 
 #[pymodule]
-fn p2_s3_meta(_py: Python, m: &PyModule) -> PyResult<()> {
+fn p2_s3_meta(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MetaEngine>()?;
     Ok(())
 }

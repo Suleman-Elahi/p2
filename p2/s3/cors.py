@@ -107,3 +107,31 @@ def parse_cors_xml(body: bytes) -> list:
             rule["MaxAgeSeconds"] = int(max_age_els[0].text)
         rules.append(rule)
     return rules
+
+
+async def apply_cors_to_response(request, response, bucket_name: str) -> HttpResponse:
+    origin = request.META.get("HTTP_ORIGIN", "")
+    if not origin or not bucket_name:
+        return response
+    
+    if "Access-Control-Allow-Origin" in response:
+        return response
+
+    from p2.s3.cache import get_cached_volume, set_cached_volume
+    from p2.core.models import Volume
+    
+    volume = get_cached_volume(bucket_name)
+    if not volume:
+        try:
+            volume = await Volume.objects.aget(name=bucket_name)
+            set_cached_volume(bucket_name, volume)
+        except Exception:
+            volume = None
+            
+    if volume:
+        rules = get_cors_rules(volume)
+        rule = find_matching_rule(rules, origin, request.method)
+        if rule:
+            apply_cors_headers(response, rule, origin)
+            
+    return response

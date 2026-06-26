@@ -34,6 +34,17 @@ class AuthenticationTests(LiveServerTestCase):
 
     def test_querystring(self):
         """Test a request with a querystring"""
+        from p2.core.models import Volume
+        from p2.core.tests.utils import get_test_storage
+        from p2.core.acl import VolumeACL
+        storage = get_test_storage()
+        volume = Volume.objects.create(name='test', storage=storage)
+        VolumeACL.objects.create(
+            volume=volume,
+            user=self.user,
+            permissions=['read', 'write', 'delete', 'list', 'admin'],
+        )
+
         boto3 = self.session.client(
             service_name='s3',
             aws_access_key_id=self.access_key.access_key,

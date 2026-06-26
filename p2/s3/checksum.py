@@ -23,6 +23,40 @@ except ImportError:
     LOGGER.debug("Rust p2_s3_checksum not available, using Python fallback")
 
 
+def _py_compute_crc32c(data: bytes) -> str:
+    """Pure-Python CRC32C (Castagnoli) using binascii with polynomial 0x1EDC6F41.
+
+    CRC32C is the same as CRC32 but with a different polynomial.
+    Python's binascii.crc32 only supports the standard CRC32 polynomial,
+    so we fall back to the crc32c algorithm implemented manually.
+    """
+    # CRC32C lookup table (Castagnoli polynomial 0x1EDC6F41)
+    _crc32c_table = None
+
+    def _make_crc32c_table():
+        nonlocal _crc32c_table
+        if _crc32c_table is not None:
+            return _crc32c_table
+        table = []
+        for i in range(256):
+            crc = i
+            for _ in range(8):
+                if crc & 1:
+                    crc = (crc >> 1) ^ 0x82F63B78
+                else:
+                    crc >>= 1
+            table.append(crc)
+        _crc32c_table = table
+        return table
+
+    table = _make_crc32c_table()
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    crc ^= 0xFFFFFFFF
+    return b64encode(struct.pack(">I", crc)).decode()
+
+
 def _py_compute_crc32(data: bytes) -> str:
     import binascii
     return b64encode(struct.pack(">I", binascii.crc32(data) & 0xFFFFFFFF)).decode()
@@ -52,6 +86,7 @@ def _init():
     else:
         _ALGORITHMS = {
             "CRC32": ("HTTP_X_AMZ_CHECKSUM_CRC32", None, _py_compute_crc32),
+            "CRC32C": ("HTTP_X_AMZ_CHECKSUM_CRC32C", None, _py_compute_crc32c),
             "SHA256": ("HTTP_X_AMZ_CHECKSUM_SHA256", None, _py_compute_sha256),
             "SHA1": ("HTTP_X_AMZ_CHECKSUM_SHA1", None, _py_compute_sha1),
         }

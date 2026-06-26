@@ -29,6 +29,7 @@ class MultipartUploadView(S3View):
     """Multipart-Object handling via LSM engine"""
 
     async def dispatch(self, request, bucket, path):
+        self.request = request
         if request.method == 'POST':
             if 'uploads' in request.GET:
                 return await self._create_multipart(request, bucket, path)
@@ -148,6 +149,7 @@ class MultipartUploadView(S3View):
             if not meta_str: return HttpResponse(status=400)
             attr = json.loads(meta_str)
             if attr["md5"] != p["etag"]: return HttpResponse(status=400)
+            attr["number"] = num
             valid_parts.append(attr)
             
         blob_uuid = uuid.uuid4().hex

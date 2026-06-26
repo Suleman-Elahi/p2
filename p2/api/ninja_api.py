@@ -4,7 +4,7 @@ from ninja import NinjaAPI
 from ninja_jwt.authentication import JWTAuth
 from ninja.security import django_auth
 
-from p2.api.endpoints import router_user, router_key
+from p2.api.endpoints import router_user, router_key, router_config
 from p2.core.api.endpoints import router_volume, router_storage
 from p2.serve.api.endpoints import router_serve
 
@@ -26,6 +26,7 @@ api.add_router("/auth/token/verify", verify_router)
 # Register all subsystem routers
 api.add_router("/system/user", router_user)
 api.add_router("/system/key", router_key)
+api.add_router("/system/config", router_config)
 api.add_router("/core/volume", router_volume)
 api.add_router("/core/storage", router_storage)
 api.add_router("/tier0/policy", router_serve)
