@@ -18,6 +18,7 @@ from p2.core.acl import VolumeACL
 from p2.core.constants import ATTR_BLOB_HASH_MD5, ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME, ATTR_BLOB_STAT_CTIME, ATTR_BLOB_MIME, ATTR_BLOB_IS_FOLDER
 from p2.core.prefix_helper import make_absolute_path
 from p2.s3.constants import XML_NAMESPACE
+from p2.s3.fastpath import cleanup_replaced_payload
 from p2.s3.http import XMLResponse
 from p2.s3.views.common import S3View
 from p2.s3.utils import decode_aws_chunked, iter_request_body
@@ -182,6 +183,9 @@ class MultipartUploadView(S3View):
             if not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
                 existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
                 existing_counted = True
+            old_internal_path = existing_attr.get('internal_path')
+        else:
+            old_internal_path = None
         
         meta_str = engine.get(f"/.multipart/{upload_id}/_meta")
         m_attr = json.loads(meta_str) if meta_str else {}
@@ -200,6 +204,11 @@ class MultipartUploadView(S3View):
             'blob.p2.io/hash/md5': final_etag,
             'internal_path': internal_path
         }))
+        from p2.s3.cache import invalidate_metadata, invalidate_volume_global
+        invalidate_metadata(volume.uuid.hex, path)
+        if existing_json:
+            invalidate_volume_global(volume.name)
+            await cleanup_replaced_payload(old_internal_path, internal_path)
         from p2.core.volume_stats import adjust_volume_stats
         await adjust_volume_stats(
             volume,

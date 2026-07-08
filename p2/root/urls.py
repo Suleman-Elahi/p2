@@ -32,7 +32,7 @@ urlpatterns = [
     path('_/auth/password/', views.PasswordChangeView.as_view(), name='auth_password'),
     path('_/auth/login/', P2LoginView.as_view(), name='auth_login'),
     path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),
-    path('favicon.ico', RedirectView.as_view(url='/static/p2/img/icon.png', permanent=True)),
+    re_path(r'^favicon\.ico/?$', RedirectView.as_view(url='/static/p2/img/icon.png', permanent=True)),
     path('', include('p2.s3.urls', namespace='p2_s3')),
 ] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 

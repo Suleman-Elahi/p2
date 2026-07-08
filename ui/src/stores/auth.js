@@ -58,10 +58,12 @@ export function useRefresh() {
     await execute()
     if (error.value) {
       clearTokens()
+      setUser(null)
       return false
     }
     if (data.value?.access) {
       saveTokens(data.value.access, localStorage.getItem('p2_refresh') || '')
+      decodeUserFromToken(data.value.access)
       return true
     }
     return false

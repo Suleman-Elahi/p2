@@ -1,5 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import { isAuthenticated } from './stores/auth'
+import { isAuthenticated, useRefresh } from './stores/auth'
 
 export const router = createRouter({
   history: createWebHistory(),
@@ -40,9 +40,15 @@ export const router = createRouter({
   ],
 })
 
-router.beforeEach((to, from, next) => {
+router.beforeEach(async (to, from, next) => {
   if (to.meta.requiresAuth && !isAuthenticated.value) {
-    next({ name: 'Login' })
+    const { refresh } = useRefresh()
+    const success = await refresh()
+    if (success) {
+      next()
+    } else {
+      next({ name: 'Login' })
+    }
   } else if (to.meta.guest && isAuthenticated.value) {
     next({ name: 'Dashboard' })
   } else {

@@ -130,7 +130,10 @@ async def apply_cors_to_response(request, response, bucket_name: str) -> HttpRes
             
     if volume:
         rules = get_cors_rules(volume)
-        rule = find_matching_rule(rules, origin, request.method)
+        method = request.method
+        if method == "OPTIONS":
+            method = request.META.get("HTTP_ACCESS_CONTROL_REQUEST_METHOD", "GET")
+        rule = find_matching_rule(rules, origin, method)
         if rule:
             apply_cors_headers(response, rule, origin)
             

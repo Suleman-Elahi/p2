@@ -29,7 +29,7 @@ async function handleLogin() {
         <div class="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-xl bg-surface-white border border-outline-gray-1 shadow-sm">
           <FeatherIcon name="hard-drive" class="h-7 w-7 text-ink-gray-7" />
         </div>
-        <h1 class="text-2xl font-semibold text-ink-gray-9">S3 File Manager</h1>
+        <h1 class="text-2xl font-semibold text-ink-gray-9">P2 Storage Manager</h1>
         <p class="mt-1 text-p-sm text-ink-gray-5">Sign in to manage your object storage</p>
       </div>
 

@@ -29,6 +29,13 @@ from p2.s3.cache import (
 )
 from p2.s3.engine import get_engine
 from p2.s3.errors import AWSError
+from p2.s3.fastpath import (
+    cleanup_replaced_payload,
+    existing_object_state,
+    require_volume_permission,
+    update_volume_stats_for_put,
+    validate_fast_put_integrity,
+)
 from p2.s3.meta_write import write_metadata
 from p2.core.storage_path import (
     blob_dir, blob_fs_path, blob_internal_path, ensure_dir, internal_to_fs,
@@ -110,14 +117,41 @@ def _mock_request(scope, hdrs):
     return _R()
 
 
-async def _error(proto, status, code):
+def _apply_rsgi_cors(resp_headers: list, volume, origin: str, method: str) -> None:
+    if not origin or not volume:
+        return
+    try:
+        from p2.s3.cors import get_cors_rules, find_matching_rule
+        rules = get_cors_rules(volume)
+        rule = find_matching_rule(rules, origin, method)
+        if rule:
+            resp_headers.append(('access-control-allow-origin', origin))
+            resp_headers.append(('access-control-allow-methods', ', '.join(rule.get('AllowedMethods', []))))
+            allowed_headers = rule.get('AllowedHeaders', [])
+            if allowed_headers:
+                resp_headers.append(('access-control-allow-headers', ', '.join(allowed_headers)))
+            expose_headers = rule.get('ExposeHeaders', [])
+            if expose_headers:
+                resp_headers.append(('access-control-expose-headers', ', '.join(expose_headers)))
+            max_age = rule.get('MaxAgeSeconds')
+            if max_age:
+                resp_headers.append(('access-control-max-age', str(max_age)))
+            resp_headers.append(('vary', 'Origin'))
+    except Exception as e:
+        LOGGER.error("S3 RSGI CORS error: %s", e)
+
+
+async def _error(proto, status, code, volume=None, origin=''):
     xml = (
         f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<Error><Code>{code}</Code></Error>'
     ).encode('utf-8')
+    headers = [('content-type', 'application/xml')]
+    if volume and origin:
+        _apply_rsgi_cors(headers, volume, origin, 'GET')
     proto.response_bytes(
         status=status,
-        headers=[('content-type', 'application/xml')],
+        headers=headers,
         body=xml,
     )
 
@@ -135,6 +169,7 @@ def S3ProxyRSGIApp(django_fallback):
             return await django_fallback(scope, proto)
 
         hdrs = _headers_dict(scope)
+        origin = hdrs.get('origin', '')
 
         if not _is_s3_request(scope, hdrs):
             return await django_fallback(scope, proto)
@@ -162,7 +197,7 @@ def S3ProxyRSGIApp(django_fallback):
             if not user:
                 return await _error(proto, 403, 'AccessDenied')
         except AWSError as e:
-            return await _error(proto, 403, e.__class__.__name__)
+            return await _error(proto, e.status, e.code)
         except Exception as e:
             LOGGER.error("S3 RSGI auth error: %s", e)
             return await _error(proto, 500, 'InternalError')
@@ -178,12 +213,17 @@ def S3ProxyRSGIApp(django_fallback):
 
         # ── GET ───────────────────────────────────────────────────────────────
         if method == 'GET':
+            try:
+                await require_volume_permission(user, volume, 'read', bucket, key)
+            except AWSError as e:
+                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
+
             attributes = get_cached_metadata(volume.uuid.hex, key)
             if attributes is None:
                 engine = get_engine(volume)
                 metadata_json = await asyncio.to_thread(engine.get, key)
                 if not metadata_json:
-                    return await _error(proto, 404, 'NoSuchKey')
+                    return await _error(proto, 404, 'NoSuchKey', volume=volume, origin=origin)
                 attributes = json.loads(metadata_json)
                 set_cached_metadata(volume.uuid.hex, key, attributes)
 
@@ -220,6 +260,10 @@ def S3ProxyRSGIApp(django_fallback):
             if last_mod:
                 resp_headers.append(('last-modified', last_mod))
 
+            _apply_rsgi_cors(resp_headers, volume, origin, method)
+
+
+
             if getattr(settings, 'USE_X_ACCEL_REDIRECT', False) and 'x-real-ip' in hdrs:
                 # Only use X-Accel-Redirect when Nginx is actually proxying.
                 # Nginx sets X-Real-IP; if absent the request is direct and
@@ -232,13 +276,19 @@ def S3ProxyRSGIApp(django_fallback):
             # Zero-copy file send via Granian's Rust sendfile.
             fs_path = internal_to_fs(internal_path)
             if not await asyncio.to_thread(lambda: __import__('os').path.exists(fs_path)):
-                return await _error(proto, 404, 'NoSuchKey')
+                return await _error(proto, 404, 'NoSuchKey', volume=volume, origin=origin)
             proto.response_file(status=200, headers=resp_headers, file=fs_path)
             return
 
         # ── PUT ───────────────────────────────────────────────────────────────
         if method == 'PUT':
-            content_length = int(hdrs.get('content-length', '-1'))
+            if (volume.tags or {}).get('versioning') == 'true':
+                return await django_fallback(scope, proto)
+
+            try:
+                content_length = int(hdrs.get('content-length', '-1'))
+            except ValueError:
+                return await _error(proto, 400, 'InvalidRequest')
             content_encoding = hdrs.get('content-encoding', '')
             is_aws_chunked = (
                 'aws-chunked' in content_encoding
@@ -248,6 +298,11 @@ def S3ProxyRSGIApp(django_fallback):
             # Only fast-path contiguous uploads ≤ 64 MB
             if content_length > 64 * 1024 * 1024 or content_length == -1:
                 return await django_fallback(scope, proto)
+
+            try:
+                await require_volume_permission(user, volume, 'write', bucket, key)
+            except AWSError as e:
+                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
 
             # Read body via RSGI async iteration
             body_chunks = []
@@ -275,6 +330,15 @@ def S3ProxyRSGIApp(django_fallback):
                 final_md5 = hashlib.md5(body).hexdigest()
                 final_sha256 = hashlib.sha256(body).hexdigest()
 
+            try:
+                validate_fast_put_integrity(hdrs, body, final_md5, final_sha256)
+            except AWSError as e:
+                try:
+                    os.remove(fs_path)
+                except OSError:
+                    pass
+                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
+
             import datetime as _dt
             now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             client_ct = hdrs.get('content-type', 'application/octet-stream')
@@ -290,8 +354,14 @@ def S3ProxyRSGIApp(django_fallback):
             }
 
             engine = get_engine(volume)
+            existing_json, existing_size, existing_counted, old_internal_path = await existing_object_state(engine, key)
             await write_metadata(engine, key, json.dumps(metadata_payload))
             invalidate_metadata(volume.uuid.hex, key)
+            if existing_json:
+                from p2.s3.cache import invalidate_volume_global
+                invalidate_volume_global(bucket)
+            await cleanup_replaced_payload(old_internal_path, internal_path)
+            await update_volume_stats_for_put(volume, existing_counted, existing_size, len(body))
 
             if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
                 event = make_event(
@@ -302,13 +372,15 @@ def S3ProxyRSGIApp(django_fallback):
                 event.update({'blob_path': key, 'mime': client_ct, 'internal_path': internal_path})
                 asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
 
+            put_headers = [
+                ('etag', f'"{final_md5}"'),
+                ('content-length', '0'),
+                ('x-p2-put-fastpath', '1'),
+            ]
+            _apply_rsgi_cors(put_headers, volume, origin, method)
             proto.response_empty(
                 status=200,
-                headers=[
-                    ('etag', f'"{final_md5}"'),
-                    ('content-length', '0'),
-                    ('x-p2-put-fastpath', '1'),
-                ],
+                headers=put_headers,
             )
             return
 

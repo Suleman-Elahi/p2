@@ -20,8 +20,9 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Dict, Any
 from django.conf import settings
 
-# Simple TTL cache for API keys: access_key -> (secret_key, user_id, username, is_superuser, expires_at)
-_apikey_cache: dict[str, Tuple[str, int, str, bool, float]] = {}
+# Simple TTL cache for API keys:
+# access_key -> (secret_key, user_id, username, is_superuser, generation, expires_at)
+_apikey_cache: dict[str, Tuple[str, int, str, bool, int, float]] = {}
 _APIKEY_TTL = float(getattr(settings, "S3_CACHE_APIKEY_TTL_SECONDS", 600.0))
 
 # Volume cache: bucket_name -> (Volume, generation, expires_at)
@@ -42,12 +43,23 @@ _METADATA_MAX_SIZE = 10000  # Max entries to prevent memory bloat
 _volume_perm_cache: dict[Tuple[int, str, str], Tuple[bool, float]] = {}
 _VOLUME_PERM_TTL = float(getattr(settings, "S3_CACHE_VOLUME_PERMISSION_TTL_SECONDS", 600.0))
 
+# Prefix cache: (volume_uuid_hex, prefix, delimiter, start_after) -> (results_list, common_prefixes_set, expires_at)
+# Caches LIST operation results to avoid repeated LMDB scans for the same prefix.
+_prefix_cache: OrderedDict[Tuple[str, str, str, str], Tuple[list, set, float]] = OrderedDict()
+_PREFIX_TTL = float(getattr(settings, "S3_CACHE_PREFIX_TTL_SECONDS", 30.0))
+_PREFIX_MAX_SIZE = 1000  # Max cached prefix results
+
 
 # ─── Cross-worker generation counter (Redis-backed) ─────────────────────────
 
 def _redis_gen_key(bucket_name: str) -> str:
     """Redis key for the volume generation counter."""
     return f"p2:vol_gen:{bucket_name}"
+
+
+def _redis_apikey_gen_key(access_key: str) -> str:
+    """Redis key for the API key generation counter."""
+    return f"p2:apikey_gen:{access_key}"
 
 
 def _get_redis_generation(bucket_name: str) -> int:
@@ -77,19 +89,52 @@ def _bump_redis_generation(bucket_name: str) -> int:
         return 0
 
 
+def _get_redis_apikey_generation(access_key: str) -> int:
+    try:
+        from django.core.cache import cache
+        val = cache.get(_redis_apikey_gen_key(access_key))
+        return int(val) if val is not None else 0
+    except Exception:
+        return 0
+
+
+def _bump_redis_apikey_generation(access_key: str) -> int:
+    try:
+        from django.core.cache import cache
+        key = _redis_apikey_gen_key(access_key)
+        try:
+            return cache.incr(key)
+        except ValueError:
+            cache.set(key, 1, timeout=None)
+            return 1
+    except Exception:
+        return 0
+
+
 # ─── API Key cache ───────────────────────────────────────────────────────────
 
 def get_cached_apikey(access_key: str) -> Optional[Tuple[str, int, str, bool]]:
     """Return (secret_key, user_id, username, is_superuser) if cached and not expired."""
     entry = _apikey_cache.get(access_key)
-    if entry and entry[4] > time.monotonic():
-        return (entry[0], entry[1], entry[2], entry[3])
+    if entry and entry[5] > time.monotonic():
+        redis_gen = _get_redis_apikey_generation(access_key)
+        if entry[4] == redis_gen:
+            return (entry[0], entry[1], entry[2], entry[3])
+        _apikey_cache.pop(access_key, None)
     return None
 
 
 def set_cached_apikey(access_key: str, secret_key: str, user_id: int, username: str, is_superuser: bool):
     """Cache an API key lookup result."""
-    _apikey_cache[access_key] = (secret_key, user_id, username, is_superuser, time.monotonic() + _APIKEY_TTL)
+    gen = _get_redis_apikey_generation(access_key)
+    _apikey_cache[access_key] = (
+        secret_key,
+        user_id,
+        username,
+        is_superuser,
+        gen,
+        time.monotonic() + _APIKEY_TTL,
+    )
 
 
 # ─── Volume cache (with cross-worker generation check) ──────────────────────
@@ -106,6 +151,11 @@ def get_cached_volume(bucket_name: str) -> Optional[Any]:
         if entry[1] == redis_gen:
             return entry[0]
         # Generation mismatch — evict stale entry
+        volume = entry[0]
+        volume_uuid = getattr(getattr(volume, "uuid", None), "hex", None)
+        if volume_uuid:
+            invalidate_volume_metadata(volume_uuid)
+        invalidate_volume_permissions(bucket_name)
         _volume_cache.pop(bucket_name, None)
     return None
 
@@ -135,7 +185,12 @@ def set_cached_acl(user_id: int, volume_pk: str, permission: str, allowed: bool)
 
 def invalidate_volume(bucket_name: str):
     """Invalidate volume in THIS worker only (local eviction)."""
-    _volume_cache.pop(bucket_name, None)
+    entry = _volume_cache.pop(bucket_name, None)
+    if entry:
+        volume_uuid = getattr(getattr(entry[0], "uuid", None), "hex", None)
+        if volume_uuid:
+            invalidate_volume_metadata(volume_uuid)
+    invalidate_volume_permissions(bucket_name)
 
 
 def invalidate_volume_global(bucket_name: str):
@@ -147,11 +202,12 @@ def invalidate_volume_global(bucket_name: str):
     """
     _bump_redis_generation(bucket_name)
     # Also evict locally for immediate effect in this worker
-    _volume_cache.pop(bucket_name, None)
+    invalidate_volume(bucket_name)
 
 
 def invalidate_apikey(access_key: str):
-    """Call when an API key is modified."""
+    """Invalidate an API key in this worker and all other workers."""
+    _bump_redis_apikey_generation(access_key)
     _apikey_cache.pop(access_key, None)
 
 
@@ -212,6 +268,56 @@ def invalidate_volume_metadata(volume_uuid_hex: str):
         _metadata_cache.pop(key, None)
 
 
+# ─── Prefix cache (LIST operation results) ──────────────────────────────────
+
+# Reverse index: volume_uuid_hex -> set of prefix cache keys for this volume
+_prefix_by_volume: dict[str, set[Tuple[str, str, str, str]]] = {}
+
+
+def get_cached_prefix(volume_uuid_hex: str, prefix: str, delimiter: str, start_after: str) -> Optional[Tuple[list, set]]:
+    """Return cached LIST results if available and not expired."""
+    key = (volume_uuid_hex, prefix, delimiter, start_after)
+    entry = _prefix_cache.get(key)
+    if entry and entry[2] > time.monotonic():
+        _prefix_cache.move_to_end(key)
+        return (entry[0], entry[1])
+    return None
+
+
+def set_cached_prefix(volume_uuid_hex: str, prefix: str, delimiter: str, start_after: str,
+                      results: list, common_prefixes: set):
+    """Cache LIST operation results. O(1) LRU eviction."""
+    key = (volume_uuid_hex, prefix, delimiter, start_after)
+    if key in _prefix_cache:
+        _prefix_cache.move_to_end(key)
+    else:
+        _prefix_by_volume.setdefault(volume_uuid_hex, set()).add(key)
+    _prefix_cache[key] = (results, common_prefixes, time.monotonic() + _PREFIX_TTL)
+    if len(_prefix_cache) > _PREFIX_MAX_SIZE:
+        evicted_key, _ = _prefix_cache.popitem(last=False)
+        vol_set = _prefix_by_volume.get(evicted_key[0])
+        if vol_set:
+            vol_set.discard(evicted_key)
+
+
+def invalidate_prefix_cache(volume_uuid_hex: str, prefix: str = ""):
+    """Invalidate cached LIST results for a volume/prefix.
+
+    If prefix is empty, invalidates ALL prefix cache entries for the volume.
+    """
+    if not prefix:
+        keys = _prefix_by_volume.pop(volume_uuid_hex, set())
+        for key in keys:
+            _prefix_cache.pop(key, None)
+    else:
+        keys_to_remove = [k for k in _prefix_cache if k[0] == volume_uuid_hex and k[1].startswith(prefix)]
+        for key in keys_to_remove:
+            _prefix_cache.pop(key, None)
+            vol_set = _prefix_by_volume.get(volume_uuid_hex)
+            if vol_set:
+                vol_set.discard(key)
+
+
 def clear_all_caches():
     """Clear all caches. Useful after major changes like recreating storage/volumes."""
     _apikey_cache.clear()
@@ -220,6 +326,8 @@ def clear_all_caches():
     _metadata_cache.clear()
     _metadata_by_volume.clear()
     _volume_perm_cache.clear()
+    _prefix_cache.clear()
+    _prefix_by_volume.clear()
 
 
 # ─── Volume permission cache ────────────────────────────────────────────────
@@ -235,3 +343,10 @@ def get_cached_volume_permission(user_id: int, bucket_name: str, permission: str
 def set_cached_volume_permission(user_id: int, bucket_name: str, permission: str, allowed: bool):
     """Cache bucket permission result for a user."""
     _volume_perm_cache[(user_id, bucket_name, permission)] = (allowed, time.monotonic() + _VOLUME_PERM_TTL)
+
+
+def invalidate_volume_permissions(bucket_name: str):
+    """Invalidate cached per-user permissions for a bucket in this worker."""
+    to_remove = [k for k in _volume_perm_cache if k[1] == bucket_name]
+    for k in to_remove:
+        _volume_perm_cache.pop(k, None)

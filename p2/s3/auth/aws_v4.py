@@ -190,14 +190,18 @@ class AWSV4Authentication(BaseAuth):
         hasher.update(data)
         return hasher.hexdigest()
 
-    def _get_canonical_request(self, auth_request: AWSv4AuthenticationRequest) -> str:
+    def _get_canonical_request(self, auth_request: AWSv4AuthenticationRequest, quote_path: bool = True) -> str:
         """Create canonical request in AWS format (
         https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html)"""
         signed_headers_keys = auth_request.signed_headers.split(';')
 
+        path = self.request.META.get('PATH_INFO', '')
+        if quote_path:
+            path = quote(path)
+
         canonical_request = [
             self.request.META.get('REQUEST_METHOD', ''),
-            quote(self.request.META.get('PATH_INFO', '')),
+            path,
             self._make_query_string(),
             self._get_canonical_headers(signed_headers_keys),
             auth_request.signed_headers,
@@ -239,11 +243,14 @@ class AWSV4Authentication(BaseAuth):
 
     @staticmethod
     def can_handle(request: HttpRequest) -> bool:
+        if request.method == 'OPTIONS':
+            return False
         if 'HTTP_AUTHORIZATION' in request.META:
             return 'AWS4-HMAC-SHA256' in request.META['HTTP_AUTHORIZATION']
         if 'X-Amz-Signature' in request.GET:
             return True
         return False
+
 
     def verify_content_sha256(self, auth_request: AWSv4AuthenticationRequest):
         """Verify X-Amz-Content-Sha256 Header, if sent.
@@ -285,7 +292,6 @@ class AWSV4Authentication(BaseAuth):
         # Presigned URLs have no X-Amz-Content-SHA256 header; AWS spec requires UNSIGNED-PAYLOAD.
         if auth_request.hash is None and is_presigned:
             auth_request.hash = UNSIGNED_PAYLOAD
-            auth_request.hash = UNSIGNED_PAYLOAD
 
         # Verify given Hash with request body.
         # HMAC computation is CPU-bound and completes in microseconds; no async wrapping needed.
@@ -298,26 +304,49 @@ class AWSV4Authentication(BaseAuth):
         # _get_signature_key and _sign are pure HMAC computations (CPU-bound, microseconds).
         # No async wrapping needed.
         signing_key = self._get_signature_key(secret_key.decrypt_secret_key(), auth_request)
-        canonical_request = self._get_canonical_request(auth_request)
-        string_to_sign = '\n'.join([
-            auth_request.algorithm,
-            auth_request.date_long,
-            auth_request.credentials,
-            self._get_sha256(canonical_request.encode('utf-8')),
-        ])
-        our_signature = self._sign(signing_key, string_to_sign).hex()
-        if auth_request.signature != our_signature:
-            if auth_request.hash == UNSIGNED_PAYLOAD:
-                # Fallback: try empty body SHA256 as some client libraries sign GET/presigned requests this way
-                auth_request.hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-                canonical_request = self._get_canonical_request(auth_request)
+
+        # Try different path quoting and hash representation variations (e.g. quote vs no-quote, empty vs UNSIGNED)
+        our_signature = None
+        matched_quote_path = True
+        matched_hash = auth_request.hash
+
+        # Standard hash and empty body fallback hash
+        candidate_hashes = [auth_request.hash]
+        if auth_request.hash == UNSIGNED_PAYLOAD:
+            candidate_hashes.append("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+
+        for qp in (True, False):
+            for hval in candidate_hashes:
+                # Temporarily swap hash for canonical request construction
+                original_hash = auth_request.hash
+                auth_request.hash = hval
+                canonical_request = self._get_canonical_request(auth_request, quote_path=qp)
+                auth_request.hash = original_hash
+
                 string_to_sign = '\n'.join([
                     auth_request.algorithm,
                     auth_request.date_long,
                     auth_request.credentials,
                     self._get_sha256(canonical_request.encode('utf-8')),
                 ])
-                our_signature = self._sign(signing_key, string_to_sign).hex()
+                sig = self._sign(signing_key, string_to_sign).hex()
+                if auth_request.signature == sig:
+                    our_signature = sig
+                    matched_quote_path = qp
+                    matched_hash = hval
+                    break
+            if our_signature:
+                break
+
+        # Re-canonicalize with the matched settings, or fallback to default settings for the mismatch log
+        auth_request.hash = matched_hash
+        canonical_request = self._get_canonical_request(auth_request, quote_path=matched_quote_path)
+        string_to_sign = '\n'.join([
+            auth_request.algorithm,
+            auth_request.date_long,
+            auth_request.credentials,
+            self._get_sha256(canonical_request.encode('utf-8')),
+        ])
 
         if auth_request.signature != our_signature:
             LOGGER.warning("Signature mismatch debug: path=%s, method=%s, query=%s, signed_headers=%s",

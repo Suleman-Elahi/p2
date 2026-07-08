@@ -14,6 +14,7 @@ from p2.s3.constants import (TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX,
                              XML_NAMESPACE)
 from p2.s3.cors import apply_cors_headers, find_matching_rule, get_cors_rules
 from p2.s3.errors import AWSAccessDenied, AWSBadDigest, AWSNoSuchKey
+from p2.s3.fastpath import cleanup_replaced_payload
 from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
@@ -131,8 +132,12 @@ def _validate_checksum_headers(request, *, crc32_b64: str | None = None,
     if expected and crc32c_b64 and expected != crc32c_b64:
         raise AWSBadDigest
     expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA256')
-    if expected and sha256_hex and expected != sha256_hex:
-        raise AWSBadDigest
+    if expected and sha256_hex:
+        import base64
+        import binascii
+        sha256_b64 = base64.b64encode(binascii.unhexlify(sha256_hex)).decode('ascii')
+        if expected != sha256_b64:
+            raise AWSBadDigest
     expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA1')
     if expected and sha1_b64 and expected != sha1_b64:
         raise AWSBadDigest
@@ -210,7 +215,12 @@ class ObjectView(S3View):
         origin = request.META.get("HTTP_ORIGIN", "")
         req_method = request.META.get("HTTP_ACCESS_CONTROL_REQUEST_METHOD", "GET")
         try:
-            volume = await self.get_volume(request.user, bucket, "read")
+            from p2.s3.cache import get_cached_volume, set_cached_volume
+            from p2.core.models import Volume
+            volume = get_cached_volume(bucket)
+            if not volume:
+                volume = await Volume.objects.aget(name=bucket)
+                set_cached_volume(bucket, volume)
         except Exception:
             return HttpResponse(status=403)
         rules = get_cors_rules(volume)
@@ -219,6 +229,7 @@ class ObjectView(S3View):
             return HttpResponse(status=403)
         from p2.s3.cors import cors_preflight_response
         return cors_preflight_response(rule, origin)
+
 
     async def head(self, request, bucket, path):
         """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html"""
@@ -374,17 +385,22 @@ class ObjectView(S3View):
                 resp['ETag'] = etag
                 return await self._apply_cors(request, resp, volume)
 
-        # X-Accel-Redirect: Django hands off to Nginx sendfile() — zero-copy.
-        # Only use when Nginx is actually proxying (detected via X-Real-IP header).
         internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{volume.uuid.hex}{path}")
         from p2.core.storage_path import internal_to_fs
         fs_path = internal_to_fs(internal_path)
 
+        # Range request support (RFC 7233)
+        range_header = request.META.get('HTTP_RANGE')
+        if range_header and total_size > 0:
+            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
+            etag_str = f'"{etag}"' if etag else None
+            return await self._range_response(
+                request, fs_path, content_type, total_size,
+                etag_str, last_mod, range_header, volume,
+            )
+
         use_accel_redirect = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
         if use_accel_redirect and request.META.get('HTTP_X_REAL_IP'):
-            # X-Accel-Redirect to Nginx — zero-copy sendfile path.
-            # Do NOT set Content-Length here: the body is empty from uvicorn's
-            # perspective. Nginx reads the file and sets the correct length itself.
             response = HttpResponse()
             response['X-Accel-Redirect'] = internal_path
             response['X-P2-Accel'] = '1'
@@ -402,40 +418,61 @@ class ObjectView(S3View):
                 response['x-amz-version-id'] = attributes['blob.p2.io/version_id']
             return await self._apply_cors(request, response, volume)
         else:
-            # Pure Python file serving — no Nginx dependency.
-            # Tiered strategy to reduce threadpool overhead for small objects
-            # and avoid loading large objects fully into memory.
-            SMALL_SYNC_MAX = 64 * 1024
-            MEDIUM_THREAD_MAX = 1024 * 1024
+            # Optimized file serving — fadvise + mmap/pread/streaming
+            from p2.s3.fileio import (
+                fadvise_random, fadvise_sequential, mmap_read,
+                open_noatime, read_file_optimized,
+            )
+            import os
+
+            SMALL_FILE_MAX = 64 * 1024
+            MEDIUM_FILE_MAX = 4 * 1024 * 1024
             STREAM_CHUNK_SIZE = 4 * 1024 * 1024
 
-            import os
             if not os.path.exists(fs_path):
                 return HttpResponse(status=404)
 
-            if total_size <= SMALL_SYNC_MAX:
+            if total_size <= SMALL_FILE_MAX:
+                # Small file: mmap read (zero syscall overhead)
                 try:
-                    with open(fs_path, 'rb') as f:
-                        data = f.read()
+                    data = await asyncio.to_thread(mmap_read, fs_path)
                     response = HttpResponse(data, content_type=content_type, status=200)
                 except OSError:
                     return HttpResponse(status=404)
-            elif total_size <= MEDIUM_THREAD_MAX:
+            elif total_size <= MEDIUM_FILE_MAX:
+                # Medium file: pread with fadvise(RANDOM) — no seek overhead
+                def _read_medium():
+                    fd = open_noatime(fs_path)
+                    try:
+                        fadvise_random(fd)
+                        buf = bytearray(total_size)
+                        os.preadv(fd, [buf], 0)
+                        return buf
+                    finally:
+                        os.close(fd)
                 try:
-                    data = await asyncio.to_thread(lambda: open(fs_path, 'rb').read())
+                    data = await asyncio.to_thread(_read_medium)
                     response = HttpResponse(data, content_type=content_type, status=200)
                 except OSError:
                     return HttpResponse(status=404)
             else:
-                import aiofiles
+                # Large file: streaming with fadvise(SEQUENTIAL) + buffered read
+                def _stream_large():
+                    fd = open_noatime(fs_path)
+                    fadvise_sequential(fd)
+                    return fd
+
+                fd = await asyncio.to_thread(_stream_large)
 
                 async def _file_stream():
-                    async with aiofiles.open(fs_path, 'rb') as f:
+                    try:
                         while True:
-                            chunk = await f.read(STREAM_CHUNK_SIZE)
+                            chunk = await asyncio.to_thread(os.read, fd, STREAM_CHUNK_SIZE)
                             if not chunk:
                                 break
                             yield chunk
+                    finally:
+                        os.close(fd)
 
                 response = StreamingHttpResponse(_file_stream(), content_type=content_type, status=200)
 
@@ -524,16 +561,16 @@ class ObjectView(S3View):
         sha1_hasher = hashlib.sha1() if expected_sha1 else None
         crc32_val = 0
 
-        # CRC32C: only validate if Rust extension is available
-        crc32c_buf = None
+        # CRC32C: incremental computation to avoid buffering all chunks
+        crc32c_val = None
         _rust_cs = None
         if expected_crc32c:
             try:
                 from p2.s3 import p2_s3_checksum as _rust_cs
-                crc32c_buf = []
+                crc32c_val = 0  # will be computed incrementally
             except (ImportError, AttributeError):
                 _rust_cs = None
-                crc32c_buf = None
+                crc32c_val = None
 
         blob_size = 0
         final_md5 = ""
@@ -555,8 +592,8 @@ class ObjectView(S3View):
                 sha1_hasher.update(body)
             if expected_crc32:
                 crc32_val = binascii.crc32(body, crc32_val)
-            if crc32c_buf is not None:
-                crc32c_buf.append(body)
+            if crc32c_val is not None:
+                crc32c_val = binascii.crc32(body, crc32c_val) & 0xFFFFFFFF
         else:
             import aiofiles
             async with aiofiles.open(fs_path, 'wb') as f:
@@ -571,8 +608,8 @@ class ObjectView(S3View):
                         sha1_hasher.update(body)
                     if expected_crc32:
                         crc32_val = binascii.crc32(body, crc32_val)
-                    if crc32c_buf is not None:
-                        crc32c_buf.append(body)
+                    if crc32c_val is not None:
+                        crc32c_val = binascii.crc32(body, crc32c_val) & 0xFFFFFFFF
                 else:
                     async for chunk in iter_request_body(request, 4 * 1024 * 1024):
                         await f.write(chunk)
@@ -583,8 +620,8 @@ class ObjectView(S3View):
                             sha1_hasher.update(chunk)
                         if expected_crc32:
                             crc32_val = binascii.crc32(chunk, crc32_val)
-                        if crc32c_buf is not None:
-                            crc32c_buf.append(chunk)
+                        if crc32c_val is not None:
+                            crc32c_val = binascii.crc32(chunk, crc32c_val) & 0xFFFFFFFF
 
             md5_digest = md5_hasher.digest()
             final_md5 = md5_hasher.hexdigest()
@@ -595,6 +632,16 @@ class ObjectView(S3View):
             computed_md5_b64 = base64.b64encode(md5_digest).decode('ascii')
             if computed_md5_b64 != expected_md5:
                 raise AWSBadDigest
+
+        expected_content_sha256 = request.META.get('HTTP_X_AMZ_CONTENT_SHA256')
+        if (
+            expected_content_sha256
+            and expected_content_sha256 != 'UNSIGNED-PAYLOAD'
+            and not expected_content_sha256.startswith('STREAMING-')
+            and expected_content_sha256 != final_sha256
+        ):
+            from p2.s3.errors import AWSContentSignatureMismatch
+            raise AWSContentSignatureMismatch
 
         crc32_b64 = None
         if expected_crc32:
@@ -607,8 +654,11 @@ class ObjectView(S3View):
             sha1_b64 = base64.b64encode(sha1_hasher.digest()).decode('ascii')
 
         crc32c_b64 = None
-        if expected_crc32c and _rust_cs is not None and crc32c_buf is not None:
-            crc32c_b64 = _rust_cs.compute_crc32c(b"".join(crc32c_buf))
+        if expected_crc32c and _rust_cs is not None and crc32c_val is not None:
+            # Convert incremental CRC32C to base64
+            crc32c_b64 = base64.b64encode(
+                (crc32c_val & 0xFFFFFFFF).to_bytes(4, byteorder='big', signed=False)
+            ).decode("ascii")
 
         _validate_checksum_headers(
             request,
@@ -668,6 +718,11 @@ class ObjectView(S3View):
         # Invalidate metadata cache after write
         from p2.s3.cache import invalidate_metadata
         invalidate_metadata(volume.uuid.hex, path)
+        if existing_metadata_json:
+            from p2.s3.cache import invalidate_volume_global
+            invalidate_volume_global(volume.name)
+        if existing_metadata_json and not bucket_versioning:
+            await cleanup_replaced_payload(existing_attr.get('internal_path'), internal_path)
         from p2.core.volume_stats import adjust_volume_stats
         await adjust_volume_stats(
             volume,
@@ -730,6 +785,8 @@ class ObjectView(S3View):
             marker_vid = await write_delete_marker(engine, path, str(now()))
             from p2.s3.cache import invalidate_metadata
             invalidate_metadata(volume.uuid.hex, path)
+            from p2.s3.cache import invalidate_volume_global
+            invalidate_volume_global(volume.name)
             response = HttpResponse(status=204)
             response['x-amz-version-id'] = marker_vid
             response['x-amz-delete-marker'] = 'true'
@@ -756,6 +813,9 @@ class ObjectView(S3View):
                 except OSError:
                     pass
             await asyncio.to_thread(engine.delete, path)
+            from p2.s3.cache import invalidate_metadata, invalidate_volume_global
+            invalidate_metadata(volume.uuid.hex, path)
+            invalidate_volume_global(volume.name)
             from p2.core.volume_stats import adjust_volume_stats
             await adjust_volume_stats(volume, object_delta=object_delta, bytes_delta=bytes_delta)
 
@@ -765,10 +825,9 @@ class ObjectView(S3View):
     # Range requests
     # -------------------------------------------------------------------------
 
-    async def _range_response(self, request, blob, content_type, total_size, range_header, volume):
+    async def _range_response(self, request, fs_path, content_type, total_size, etag, last_mod, range_header, volume, origin=''):
         """Handle Range: bytes=X-Y requests (RFC 7233)."""
         try:
-            # Parse "bytes=start-end"
             unit, ranges = range_header.split('=', 1)
             if unit.strip() != 'bytes':
                 raise ValueError
@@ -776,9 +835,8 @@ class ObjectView(S3View):
             start = int(start_str) if start_str else None
             end = int(end_str) if end_str else None
         except (ValueError, AttributeError):
-            return HttpResponse(status=416)  # Range Not Satisfiable
+            return HttpResponse(status=416)
 
-        # Suffix range: bytes=-500 means last 500 bytes
         if start is None:
             start = max(0, total_size - end)
             end = total_size - 1
@@ -792,32 +850,27 @@ class ObjectView(S3View):
         length = end - start + 1
 
         async def _ranged_stream():
-            controller = blob.volume.storage.controller
-            if isinstance(controller, AsyncStorageController):
-                # Stream and skip/slice
-                consumed = 0
-                async for chunk in controller.get_read_stream(blob):
-                    chunk_start = consumed
-                    chunk_end = consumed + len(chunk)
-                    if chunk_end <= start:
-                        consumed = chunk_end
-                        continue
-                    if chunk_start >= end + 1:
-                        break
-                    # Slice the chunk to the requested range
-                    slice_start = max(0, start - chunk_start)
-                    slice_end = min(len(chunk), end + 1 - chunk_start)
-                    yield memoryview(chunk)[slice_start:slice_end].tobytes()
-                    consumed = chunk_end
-            else:
-                import asyncio
-                data = await asyncio.to_thread(blob.read)
-                yield data[start:end + 1]
+            from p2.s3.fileio import fadvise_random, open_noatime
+            def _read_range():
+                fd = open_noatime(fs_path)
+                try:
+                    fadvise_random(fd)
+                    buf = bytearray(length)
+                    os.preadv(fd, [buf], start)
+                    return buf
+                finally:
+                    os.close(fd)
+            data = await asyncio.to_thread(_read_range)
+            yield data
 
         response = StreamingHttpResponse(_ranged_stream(), content_type=content_type, status=206)
         response['Content-Length'] = length
         response['Content-Range'] = f'bytes {start}-{end}/{total_size}'
         response['Accept-Ranges'] = 'bytes'
+        if etag:
+            response['ETag'] = etag
+        if last_mod:
+            response['Last-Modified'] = last_mod
         return await self._apply_cors(request, response, volume)
 
     # -------------------------------------------------------------------------
@@ -928,6 +981,15 @@ class ObjectView(S3View):
                 object_delta=0 if existing_dest_counted else 1,
                 bytes_delta=int(dest_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0) - existing_dest_size,
             )
+            from p2.s3.cache import invalidate_metadata, invalidate_volume_global
+            invalidate_metadata(dest_volume.uuid.hex, dest_path)
+            if existing_dest_json:
+                invalidate_volume_global(dest_volume.name)
+            if existing_dest_json and not dest_versioning:
+                await cleanup_replaced_payload(
+                    existing_dest_attr.get('internal_path'),
+                    dest_internal_path,
+                )
             
             root = ElementTree.Element("{%s}CopyObjectResult" % XML_NAMESPACE)
             ElementTree.SubElement(root, "LastModified").text = dest_attr[ATTR_BLOB_STAT_MTIME]
@@ -980,6 +1042,9 @@ class ObjectView(S3View):
             attr[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
             
         engine.put(path, json.dumps(attr))
+        invalidate_metadata(volume.uuid.hex, path)
+        from p2.s3.cache import invalidate_volume_global
+        invalidate_volume_global(volume.name)
         return HttpResponse(status=200)
 
     async def _delete_tagging(self, request, bucket: str, path: str):
@@ -998,6 +1063,9 @@ class ObjectView(S3View):
                 
         if changed:
             engine.put(path, json.dumps(attr))
+            invalidate_metadata(volume.uuid.hex, path)
+            from p2.s3.cache import invalidate_volume_global
+            invalidate_volume_global(volume.name)
         return HttpResponse(status=204)
 
     # -------------------------------------------------------------------------
@@ -1034,4 +1102,7 @@ class ObjectView(S3View):
         attr = json.loads(meta)
         attr[TAG_S3_ACL] = acl_header
         engine.put(path, json.dumps(attr))
+        invalidate_metadata(volume.uuid.hex, path)
+        from p2.s3.cache import invalidate_volume_global
+        invalidate_volume_global(volume.name)
         return HttpResponse(status=200)

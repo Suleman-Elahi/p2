@@ -45,9 +45,20 @@ class APIKey(models.Model):
 
     def save(self, *args, **kwargs):
         """Auto-encrypt a generated secret if none has been set yet."""
+        old_access_key = None
+        if self.pk:
+            old_access_key = (
+                APIKey.objects.filter(pk=self.pk)
+                .values_list('access_key', flat=True)
+                .first()
+            )
         if not self.secret_key_encrypted:
             self.set_secret_key(get_secret_key())
         super().save(*args, **kwargs)
+        from p2.s3.cache import invalidate_apikey
+        if old_access_key and old_access_key != self.access_key:
+            invalidate_apikey(old_access_key)
+        invalidate_apikey(self.access_key)
 
     def set_secret_key(self, raw: str) -> None:
         """Encrypt and store the raw secret key using Fernet."""
@@ -58,6 +69,13 @@ class APIKey(models.Model):
         """Decrypt and return the raw secret key (used for AWS v4 HMAC computation)."""
         f = _get_fernet()
         return f.decrypt(self.secret_key_encrypted.encode()).decode()
+
+    def delete(self, *args, **kwargs):
+        access_key = self.access_key
+        result = super().delete(*args, **kwargs)
+        from p2.s3.cache import invalidate_apikey
+        invalidate_apikey(access_key)
+        return result
 
     def __str__(self):
         return "API Key %s for user %s" % (self.name, self.user.username)

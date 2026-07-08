@@ -49,7 +49,12 @@ class BucketView(S3View):
         origin = request.META.get("HTTP_ORIGIN", "")
         req_method = request.META.get("HTTP_ACCESS_CONTROL_REQUEST_METHOD", "GET")
         try:
-            volume = await self.get_volume(request.user, bucket, "read")
+            from p2.s3.cache import get_cached_volume, set_cached_volume
+            from p2.core.models import Volume
+            volume = get_cached_volume(bucket)
+            if not volume:
+                volume = await Volume.objects.aget(name=bucket)
+                set_cached_volume(bucket, volume)
         except Exception:
             return HttpResponse(status=403)
         rules = get_cors_rules(volume)
@@ -58,6 +63,7 @@ class BucketView(S3View):
             return HttpResponse(status=403)
         from p2.s3.cors import cors_preflight_response
         return cors_preflight_response(rule, origin)
+
 
     async def get(self, request, *args, **kwargs):
         bucket = kwargs.get('bucket', '')
@@ -174,9 +180,21 @@ class BucketView(S3View):
 
         engine = await self.get_engine(volume)
         
-        # Overfetch from engine because multiple keys can collapse into one CommonPrefix
-        # If it doesn't give enough to fill max_keys, S3 pagination standard allows returning less
-        results = engine.list(prefix, start_param, max_keys * 5)
+        # Check prefix cache for common LIST patterns (no delimiter, no continuation token)
+        if not delimiter and not continuation_token:
+            from p2.s3.cache import get_cached_prefix, set_cached_prefix
+            volume_uuid = getattr(volume.uuid, 'hex', '')
+            cache_key = (volume_uuid, prefix, "", start_after or "")
+            cached = get_cached_prefix(*cache_key)
+            if cached is not None:
+                results, _ = cached
+            else:
+                # Overfetch from engine because multiple keys can collapse into one CommonPrefix
+                # If it doesn't give enough to fill max_keys, S3 pagination standard allows returning less
+                results = engine.list(prefix, start_param, max_keys * 5)
+                set_cached_prefix(*cache_key, results=results, common_prefixes=set())
+        else:
+            results = engine.list(prefix, start_param, max_keys * 5)
         
         root = ElementTree.Element("{%s}ListBucketResult" % XML_NAMESPACE)
         ElementTree.SubElement(root, "Name").text = bucket
@@ -472,6 +490,8 @@ class BucketView(S3View):
                         except OSError:
                             pass
                     await asyncio.to_thread(engine.delete, key)
+                    from p2.s3.cache import invalidate_metadata
+                    invalidate_metadata(volume.uuid.hex, key)
                 if not is_quiet:
                     deleted = ElementTree.SubElement(result, f'{{{XML_NAMESPACE}}}Deleted')
                     ElementTree.SubElement(deleted, f'{{{XML_NAMESPACE}}}Key').text = key
@@ -485,6 +505,7 @@ class BucketView(S3View):
         if deleted_objects or deleted_bytes:
             from p2.core.volume_stats import adjust_volume_stats
             await adjust_volume_stats(volume, object_delta=-deleted_objects, bytes_delta=-deleted_bytes)
+            invalidate_volume_global(volume.name)
 
         return XMLResponse(result)
 

@@ -13,6 +13,9 @@ from django.conf import settings
 _cache: dict = {}
 _lock = threading.Lock()
 
+# Thread-local storage for LMDB read transactions (one per thread per environment)
+_thread_local = threading.local()
+
 class LMDbEngine:
     """Wrapper that acts as the S3 meta engine matching the old redb API natively."""
     def __init__(self, db_path: str):
@@ -40,6 +43,49 @@ class LMDbEngine:
         )
         self.db = self.env.open_db(b"objects")
 
+    def _get_read_txn(self):
+        """Get a thread-local read transaction for this engine.
+
+        Reusing transactions reduces overhead for repeated reads in the same thread.
+        LMDB read transactions see a snapshot of the database, so this is safe for
+        read-heavy workloads where stale reads are acceptable.
+        """
+        env_id = id(self.env)
+        if not hasattr(_thread_local, 'read_txns'):
+            _thread_local.read_txns = {}
+        
+        txn_info = _thread_local.read_txns.get(env_id)
+        if txn_info is None:
+            txn = self.env.begin(db=self.db)
+            _thread_local.read_txns[env_id] = (txn, txn.id())
+            return txn
+        
+        txn, txn_id = txn_info
+        # Check if transaction is still valid (not closed or aborted)
+        try:
+            if txn.info()['read']:
+                return txn
+        except Exception:
+            pass
+        
+        # Transaction is invalid, create a new one
+        txn = self.env.begin(db=self.db)
+        _thread_local.read_txns[env_id] = (txn, txn.id())
+        return txn
+
+    def _reset_read_txn(self):
+        """Reset the thread-local read transaction for this engine.
+
+        Call this after write operations to ensure subsequent reads see the latest data.
+        """
+        env_id = id(self.env)
+        if hasattr(_thread_local, 'read_txns') and env_id in _thread_local.read_txns:
+            txn, _ = _thread_local.read_txns.pop(env_id)
+            try:
+                txn.abort()
+            except Exception:
+                pass
+
     def invalidate_cache(self, path: str) -> None:
         if not self.volume_uuid_hex:
             return
@@ -53,27 +99,51 @@ class LMDbEngine:
                 cache.delete(cache_key)
         except Exception:
             pass
+        # Also invalidate prefix cache for this path's parent prefixes
+        try:
+            from p2.s3.cache import invalidate_prefix_cache
+            parts = path.split('/')
+            prefix = ""
+            for part in parts[:-1]:
+                prefix += part + "/"
+                invalidate_prefix_cache(self.volume_uuid_hex, prefix)
+        except Exception:
+            pass
 
     def put(self, path: str, json_metadata: str) -> None:
         """Write key-value to LMDB."""
         with self.env.begin(write=True, db=self.db) as txn:
             txn.put(path.encode('utf-8'), json_metadata.encode('utf-8'))
         self.invalidate_cache(path)
+        self._reset_read_txn()
 
     def put_raw(self, key: bytes, value: bytes) -> None:
         """Write raw bytes key-value to LMDB."""
         with self.env.begin(write=True, db=self.db) as txn:
             txn.put(key, value)
+        self._reset_read_txn()
 
     def get(self, path: str) -> str | None:
-        """Retrieve key-value from LMDB using lock-free read."""
-        with self.env.begin(db=self.db) as txn:
+        """Retrieve key-value from LMDB using thread-local read transaction."""
+        txn = self._get_read_txn()
+        try:
+            val = txn.get(path.encode('utf-8'))
+            return val.decode('utf-8') if val else None
+        except Exception:
+            # Transaction may have been invalidated, reset and retry once
+            self._reset_read_txn()
+            txn = self._get_read_txn()
             val = txn.get(path.encode('utf-8'))
             return val.decode('utf-8') if val else None
 
     def get_raw(self, key: bytes) -> bytes | None:
-        """Retrieve raw bytes key-value from LMDB."""
-        with self.env.begin(db=self.db) as txn:
+        """Retrieve raw bytes key-value from LMDB using thread-local read transaction."""
+        txn = self._get_read_txn()
+        try:
+            return txn.get(key)
+        except Exception:
+            self._reset_read_txn()
+            txn = self._get_read_txn()
             return txn.get(key)
 
     def delete(self, path: str) -> None:
@@ -81,9 +151,21 @@ class LMDbEngine:
         with self.env.begin(write=True, db=self.db) as txn:
             txn.delete(path.encode('utf-8'))
         self.invalidate_cache(path)
+        self._reset_read_txn()
 
-    def list(self, prefix: str, start_after: str | None = None, max_keys: int | None = 1000) -> list[tuple[str, str]]:
+    def list(self, prefix: str, start_after: str | None = None, max_keys: int | None = 1000, use_cache: bool = True) -> list[tuple[str, str]]:
         """Scan keys matching `prefix` in LMDB B-Tree efficiently."""
+        from p2.s3.cache import get_cached_prefix, set_cached_prefix
+
+        # Try prefix cache first for common LIST patterns
+        if use_cache and self.volume_uuid_hex:
+            cache_key = (self.volume_uuid_hex, prefix, "", start_after or "")
+            cached = get_cached_prefix(*cache_key)
+            if cached is not None:
+                results, _ = cached
+                limit = max_keys if max_keys is not None else 1000
+                return results[:limit]
+
         limit = max_keys if max_keys is not None else float('inf')
         results = []
         prefix_bytes = prefix.encode('utf-8')
@@ -97,7 +179,7 @@ class LMDbEngine:
         start_key_bytes = start_key.encode('utf-8')
         if not start_key_bytes:
             start_key_bytes = b"\x01"
-
+            
         with self.env.begin(db=self.db) as txn:
             cursor = txn.cursor()
             if cursor.set_range(start_key_bytes):
@@ -114,6 +196,12 @@ class LMDbEngine:
                     results.append((key.decode('utf-8'), value.decode('utf-8')))
                     if len(results) >= limit:
                         break
+
+        # Cache the results for future requests with the same prefix
+        if use_cache and self.volume_uuid_hex:
+            cache_key = (self.volume_uuid_hex, prefix, "", start_after or "")
+            set_cached_prefix(*cache_key, results=results, common_prefixes=set())
+
         return results
 
     def list_dir(self, prefix: str, delimiter: str = "/", start_after: str | None = None, max_keys: int = 1000) -> 'tuple[list[tuple[str, str]], list[str]]':

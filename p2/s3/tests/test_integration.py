@@ -6,6 +6,7 @@ Non-write tests (bucket config, auth) are in separate classes.
 """
 from uuid import uuid4
 import hashlib
+import hmac
 
 import boto3
 from botocore.exceptions import ClientError
@@ -104,6 +105,36 @@ class BucketMetadataTests(S3TestCase):
             err_headers = e.response['ResponseMetadata']['HTTPHeaders']
             self.assertEqual(err_headers.get('access-control-allow-origin'), 'http://localhost:9000')
 
+        # 4. CORS preflight (OPTIONS request) with matching origin for bucket-level request
+        import urllib.request
+        req = urllib.request.Request(
+            f"{self.live_server_url}/test-1/",
+            method="OPTIONS",
+            headers={
+                "Origin": "http://localhost:9000",
+                "Access-Control-Request-Method": "GET",
+            }
+        )
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers.get('Access-Control-Allow-Origin'), 'http://localhost:9000')
+            self.assertIn('GET', resp.headers.get('Access-Control-Allow-Methods', ''))
+
+        # 5. CORS preflight (OPTIONS request) with matching origin for object-level request
+        req_obj = urllib.request.Request(
+            f"{self.live_server_url}/test-1/song.mp3",
+            method="OPTIONS",
+            headers={
+                "Origin": "http://localhost:9000",
+                "Access-Control-Request-Method": "GET",
+            }
+        )
+        with urllib.request.urlopen(req_obj) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers.get('Access-Control-Allow-Origin'), 'http://localhost:9000')
+            self.assertIn('GET', resp.headers.get('Access-Control-Allow-Methods', ''))
+
+
     def test_policy(self):
         import json
         policy = json.dumps({
@@ -187,12 +218,94 @@ class ObjectWriteTests(S3TestCase):
             Bucket='test-1').get('Contents', [])]
         self.assertIn('obj.txt', keys)
 
-        # Presigned URL generation
-        url = self.boto3.generate_presigned_url(
-            'head_object', Params={'Bucket': 'test-1', 'Key': 'obj.txt'}, ExpiresIn=300)
-        self.assertIn('Signature=', url)
+        # Presigned URL generation (explicitly using SigV4)
+        from botocore.config import Config
+        v4_client = boto3.client(
+            service_name='s3',
+            aws_access_key_id=self.access_key.access_key,
+            aws_secret_access_key=self.access_key.decrypt_secret_key(),
+            endpoint_url=self.live_server_url,
+            config=Config(signature_version='s3v4')
+        )
+        url = v4_client.generate_presigned_url(
+            'get_object', Params={'Bucket': 'test-1', 'Key': 'obj.txt'}, ExpiresIn=300)
+        self.assertIn('X-Amz-Signature=', url)
 
-        # Delete (async DB thread limitation may prevent actual deletion in test env)
+        # Fetch the presigned URL
+        import urllib.request
+        try:
+            with urllib.request.urlopen(url) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), data)
+        except Exception as e:
+            self.fail(f"Failed to fetch presigned URL: {e}")
+
+        # Test unescaped path signature fallback (mimicking the music player behavior)
+        space_data = b'space-data-content'
+        self.boto3.put_object(Body=space_data, Bucket='test-1', Key='space test.txt')
+
+        from urllib.parse import urlparse
+        import datetime
+
+        ak = self.access_key.access_key
+        sk = self.access_key.decrypt_secret_key()
+
+        t = datetime.datetime.now(datetime.timezone.utc)
+        amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+        datestamp = t.strftime('%Y%m%d')
+
+        def sign(key, msg):
+            return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+        def get_signature_key(key, date_stamp, region, service):
+            k_date = sign(('AWS4' + key).encode('utf-8'), date_stamp)
+            k_region = sign(k_date, region)
+            k_service = sign(k_region, service)
+            k_signing = sign(k_service, 'aws4_request')
+            return k_signing
+
+        parsed_url = urlparse(self.live_server_url)
+        host_header = parsed_url.netloc
+
+        # Canonical Request with unescaped space path
+        canonical_uri = '/test-1/space test.txt'
+        canonical_qs = f'X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={ak}%2F{datestamp}%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date={amz_date}&X-Amz-Expires=300&X-Amz-SignedHeaders=host'
+        canonical_headers = f'host:{host_header}\n'
+        signed_headers = 'host'
+
+        canonical_request = '\n'.join([
+            'GET',
+            canonical_uri,
+            canonical_qs,
+            canonical_headers,
+            signed_headers,
+            'UNSIGNED-PAYLOAD'
+        ])
+
+        credential_scope = f'{datestamp}/us-east-1/s3/aws4_request'
+        string_to_sign = '\n'.join([
+            'AWS4-HMAC-SHA256',
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
+        ])
+
+        signing_key = get_signature_key(sk, datestamp, 'us-east-1', 's3')
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        # Build request URL using escaped space path, but using signature from unescaped path
+        escaped_path = '/test-1/space%20test.txt'
+        fallback_url = f'{self.live_server_url}{escaped_path}?{canonical_qs}&X-Amz-Signature={signature}'
+
+        try:
+            with urllib.request.urlopen(fallback_url) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.read(), space_data)
+        except Exception as e:
+            self.fail(f"Failed to fetch unescaped path fallback presigned URL: {e}")
+
+        # Clean up
+        self.boto3.delete_object(Bucket='test-1', Key='space test.txt')
         self.boto3.delete_object(Bucket='test-1', Key='obj.txt')
 
     def test_versioning_lifecycle(self):

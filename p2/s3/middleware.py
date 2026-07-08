@@ -36,8 +36,10 @@ def _extract_bucket(request):
 
 
 def _is_s3(request):
-    # Ignore well-known browser/system probes
-    if request.path.startswith('/.well-known/') or request.path == '/favicon.ico':
+    # Ignore Django admin, API, static, and well-known paths
+    path = request.path
+    if (path.startswith('/_/') or path.startswith('/api/') or
+            path.startswith('/.well-known/') or path.strip('/') == 'favicon.ico'):
         return False
     if 'HTTP_X_AMZ_DATE' in request.META:
         return True

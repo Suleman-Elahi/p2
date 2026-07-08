@@ -40,6 +40,10 @@ export function getUser() {
 export function decodeUserFromToken(token) {
   try {
     const payload = JSON.parse(atob(token.split('.')[1]))
+    if (payload.exp && payload.exp * 1000 < Date.now()) {
+      user.value = null
+      return null
+    }
     user.value = {
       id: payload.user_id,
       username: payload.username || payload.sub || payload.user_id,
@@ -55,7 +59,10 @@ export function decodeUserFromToken(token) {
 
 // Restore session from stored token on load
 if (accessToken.value) {
-  decodeUserFromToken(accessToken.value)
+  const decoded = decodeUserFromToken(accessToken.value)
+  if (!decoded) {
+    clearTokens()
+  }
 }
 
 // ── API client (useFetch factory) ───────────────────────────────────────
@@ -90,6 +97,13 @@ export const useApi = createFetch({
       return ctx
     },
     onFetchError(ctx) {
+      if (ctx.response?.status === 401) {
+        clearTokens()
+        setUser(null)
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
+      }
       // Parse error body for a detail message
       if (ctx.response?.status) {
         return ctx.response.json().then(body => {

@@ -61,8 +61,17 @@ NINJA_JWT = {
 DEBUG = CONFIG.y_bool('debug')
 TEST = any('test' in arg for arg in sys.argv)
 
+# Validate FERNET_KEY early (before DEBUG/TEST are used elsewhere).
+# Skip validation during tests since fixtures may not set this.
+if (not TEST) and (not FERNET_KEY or str(FERNET_KEY).lower().startswith('change-me')):
+    raise ImproperlyConfigured(
+        "FERNET_KEY is not set. Add P2_FERNET_KEY=<fernet-key> to your .env file. "
+        "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+        "print(Fernet.generate_key().decode())\""
+    )
+
 CORS_ORIGIN_ALLOW_ALL = DEBUG
-SECURE_SSL_REDIRECT = False
+SECURE_SSL_REDIRECT = CONFIG.y_bool('security.ssl_redirect', default=not DEBUG and not TEST)
 X_FRAME_OPTIONS = "SAMEORIGIN"
 
 # Set True in production when Nginx handles X-Accel-Redirect (zero-copy reads)
@@ -80,21 +89,27 @@ S3_BLOB_SHARD_DEPTH = max(1, min(2, int(CONFIG.y("s3.blob.shard_depth", default=
 S3_METADATA_LMDB_SYNC = CONFIG.y_bool("s3.metadata.lmdb.sync", default=True)
 S3_METADATA_LMDB_METASYNC = CONFIG.y_bool("s3.metadata.lmdb.metasync", default=True)
 # Optional bounded queue for async metadata writes (reduces PUT tail latency under concurrency).
-S3_METADATA_WRITE_QUEUE_ENABLED = CONFIG.y_bool("s3.metadata.write_queue.enabled", default=False)
+S3_METADATA_WRITE_QUEUE_ENABLED = CONFIG.y_bool("s3.metadata.write_queue.enabled", default=True)
 S3_METADATA_WRITE_QUEUE_MAX_SIZE = int(CONFIG.y("s3.metadata.write_queue.max_size", default=8192))
-S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size", default=64))
-S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=5.0))
+S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size", default=128))
+S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=10.0))
 # In-process hot-path cache TTLs (seconds) for S3 auth/ACL checks.
 S3_CACHE_APIKEY_TTL_SECONDS = float(CONFIG.y("s3.cache.apikey_ttl_seconds", default=600))
 S3_CACHE_VOLUME_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_ttl_seconds", default=600))
 S3_CACHE_ACL_TTL_SECONDS = float(CONFIG.y("s3.cache.acl_ttl_seconds", default=600))
 S3_CACHE_VOLUME_PERMISSION_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_permission_ttl_seconds", default=600))
 S3_CACHE_METADATA_TTL_SECONDS = float(CONFIG.y("s3.cache.metadata_ttl_seconds", default=60))
+S3_CACHE_PREFIX_TTL_SECONDS = float(CONFIG.y("s3.cache.prefix_ttl_seconds", default=30))
+# Compression settings for large objects (disabled by default, enable for storage savings).
+S3_COMPRESSION_ENABLED = CONFIG.y_bool("s3.compression.enabled", default=False)
+S3_COMPRESSION_MIN_SIZE = int(CONFIG.y("s3.compression.min_size", default=1024 * 1024))  # 1MB
+S3_COMPRESSION_LEVEL = int(CONFIG.y("s3.compression.level", default=6))  # zlib level 1-9
 # Base directory for LMDB volume data. Override with P2_STORAGE__ROOT for local dev.
 STORAGE_ROOT = CONFIG.y("storage.root", default="/storage")
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
-ALLOWED_HOSTS = ['*']
+_allowed_hosts = CONFIG.y('allowed_hosts', 'localhost,127.0.0.1,[::1]')
+ALLOWED_HOSTS = ['*'] if DEBUG else [host.strip() for host in str(_allowed_hosts).split(',') if host.strip()]
 INTERNAL_IPS = ['127.0.0.1']
 
 # ---------------------------------------------------------------------------
@@ -150,6 +165,7 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'p2.root.urls'
+APPEND_SLASH = False
 
 TEMPLATES = [
     {
@@ -223,7 +239,8 @@ CACHES = {
 SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
 SESSION_SAVE_EVERY_REQUEST = False  # Only save when session data actually changes
 SESSION_COOKIE_SAMESITE = 'Lax'
-SESSION_COOKIE_SECURE = False
+SESSION_COOKIE_SECURE = CONFIG.y_bool('security.session_cookie_secure', default=not DEBUG and not TEST)
+CSRF_COOKIE_SECURE = CONFIG.y_bool('security.csrf_cookie_secure', default=not DEBUG and not TEST)
 
 CSRF_TRUSTED_ORIGINS = CONFIG.y('csrf_trusted_origins', 'http://localhost,http://127.0.0.1').split(',')
 
