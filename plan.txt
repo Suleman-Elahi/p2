@@ -1,0 +1,450 @@
+════════════════════════════════════════════════════════════
+  P2 NEW ARCHITECTURE — IMPLEMENTATION PLAN
+════════════════════════════════════════════════════════════
+
+─── PHASE 1: Python layer (DONE) ────────────────────────────
+
+New p2/s3/volume_pool.py
+  — Active volume pool manager with fixed-size preallocated .bin files
+  — Thread-safe allocate_block(), active/sealed state, fallocate prealloc
+
+New p2/s3/volume_writer.py
+  — Group Committer: batches writes to volume files + LMDB metadata atomically
+  — asyncio.Queue drains into single fdatasync + one LMDB write txn per batch
+
+New p2/s3/volume_reader.py
+  — Zero-copy block reader (pread from vol files at given offsets)
+  — posix_fadvise(SEQUENTIAL/RANDOM) hints, async generator for large objects
+
+Update p2/s3/views/objects.py
+  — PUT/GET/DELETE use new block-based model
+  — DELETE is logical only (LMDB key removal); physical bytes reclaimed by compaction
+
+Update p2/s3/views/multipart.py
+  — Zero-copy multipart: no file stitching, just block array assembly in LMDB
+
+New p2/s3/compaction.py + cron task in p2/core/worker.py
+  — ARQ background task scans sealed volumes, migrates live blocks, deletes dead files
+
+Update LMDB metadata schema
+  — From: internal_path string
+  — To:   blocks: [{vol_uuid, offset, length}] + size, mime, etag, mtime, is_folder
+
+Update settings with new volume pool config
+  — VOLUME_SIZE_BYTES, VOLUME_ACTIVE_POOL_SIZE, VOLUME_COMPACT_THRESHOLD
+
+Remove old file-per-object code and cleanup
+  — Deleted: p2/s3/meta_write.py, p2/s3/fileio.py
+  — Updated: asgi_handler.py, rsgi_handler.py, fastpath.py, volume_stats.py
+
+─── PHASE 2: Rust Extension (TODO) ──────────────────────────
+
+Current state of p2/s3/rust_ext (p2_s3_crypto.so):
+  ✓ derive_signing_key()       — AWS v4 HMAC signing key derivation
+  ✓ hmac_sha256_hex/bytes()    — HMAC-SHA256 for presigned URL validation
+  ✓ md5_hex/bytes()            — MD5 for ETag computation
+  ✓ write_and_hash_small()     — GIL-releasing file write + hash (NOW OBSOLETE)
+  ✗ io_uring volume writer     — NOT YET IMPLEMENTED
+  ✗ io_uring block reader      — NOT YET IMPLEMENTED
+  ✗ Inline AES-GCM-256 SSE     — NOT YET IMPLEMENTED
+  ✗ Group commit coordinator    — NOT YET IMPLEMENTED (Python fallback in use)
+
+════════════════════════════════════════════════════════════
+  RUST EXTENSION CHANGES REQUIRED
+════════════════════════════════════════════════════════════
+
+The architecture plan calls for a Rust storage engine (p2_storage.so)
+exposing four subsystems via PyO3. The existing p2_s3_crypto crate is
+crypto-only; the new work either extends it or creates a second crate.
+
+Recommended approach: rename/extend the existing crate into p2_storage
+and keep p2_s3_crypto as an alias import for backward compatibility.
+
+────────────────────────────────────────────────────────────
+  1. Cargo.toml — new dependencies
+────────────────────────────────────────────────────────────
+
+Rename crate from p2_s3_crypto → p2_storage (or add a second crate).
+Add to [dependencies]:
+
+  tokio-uring  = { version = "0.5.0" }
+    — Linux io_uring bindings on top of tokio. Provides submit/await for
+      read_at / write_at without blocking threads. Requires kernel ≥ 5.1.
+      NOTE: tokio-uring must be used with its own Runtime::new(), not the
+      standard tokio runtime. The PyO3 bridge runs this on a dedicated
+      OS thread so Python's async loop is never touched.
+
+  tokio        = { version = "1", features = ["rt", "sync", "time"] }
+    — Runtime glue for tokio-uring + channel-based group commit queue.
+
+  aes-gcm      = "0.10"
+    — AES-GCM-256 (SSE-S3 / SSE-C encryption). Uses AVX-512 AES-NI when
+      available — zero-copy, operates on the same buffer being fed to io_uring.
+
+  parking_lot  = "0.12"
+    — Faster Mutex/RwLock for the active volume pool registry (vs std).
+
+  bytes        = "1"
+    — Zero-copy Bytes/BytesMut for passing data between Python and Rust
+      without intermediate copies.
+
+  crossbeam-channel = "0.5"
+    — MPSC queue for group commit submissions (lower overhead than tokio::mpsc
+      because senders are from arbitrary Python threads via PyO3).
+
+  libc         = "0.2"
+    — For raw syscalls: fallocate(2), posix_fadvise(2), fdatasync(2).
+
+Keep existing: pyo3, hmac, sha2, hex, md-5
+
+────────────────────────────────────────────────────────────
+  2. Module structure inside src/
+────────────────────────────────────────────────────────────
+
+  src/
+  ├── lib.rs              — PyO3 module root; re-exports all sub-modules
+  ├── crypto.rs           — EXISTING: HMAC-SHA256, MD5, AES-GCM-256 (extend)
+  ├── volume_pool.rs      — NEW: Active volume registry + fallocate prealloc
+  ├── io_uring_writer.rs  — NEW: io_uring-backed pwrite + fdatasync
+  ├── io_uring_reader.rs  — NEW: io_uring-backed pread, streaming iterator
+  └── group_commit.rs     — NEW: Batch coordinator; replaces volume_writer.py
+
+────────────────────────────────────────────────────────────
+  3. volume_pool.rs — Active Volume Registry
+────────────────────────────────────────────────────────────
+
+Purpose: mirror the Python VolumePool but with Rust-native thread safety
+and fallocate-backed preallocation for true O(1) offset reservation.
+
+Exposed to Python via PyO3:
+
+  class VolumePool:
+    def __new__(vol_dir: str, vol_size_bytes: int, pool_size: int) -> Self
+      — Create/open the pool singleton. Called once at worker startup.
+      — Scans vol_dir for existing vol_*.bin files and reopens writable ones.
+
+    def allocate_block(length: int) -> (vol_uuid: str, offset: int, fd: int)
+      — Atomically reserve `length` bytes in an active volume.
+      — Returns the raw file descriptor for use by io_uring_writer.
+      — Rotates to a new preallocated volume when current is full.
+      — Thread-safe: uses parking_lot::Mutex per volume for the offset counter.
+
+    def seal_full_volumes() -> list[str]
+      — Mark saturated volumes read-only (chmod 0o444).
+      — Returns list of newly sealed vol_uuid strings.
+
+    def get_volume_path(vol_uuid: str) -> str
+      — Returns filesystem path for any volume UUID (active or sealed).
+
+    def get_active_uuids() -> list[str]
+      — Returns currently active volume UUIDs.
+
+    def list_sealed_uuids() -> list[str]
+      — Scans vol_dir for read-only vol_*.bin files.
+
+  Internal details:
+    - fallocate(fd, FALLOC_FL_KEEP_SIZE=0, 0, vol_size_bytes) for true prealloc.
+      This avoids the write-on-first-touch overhead of truncate()/sparse files.
+    - AtomicU64 per volume for the write-head offset (lock-free fast path).
+    - Falls back to parking_lot::Mutex when the atomic CAS fails (rare contention).
+
+────────────────────────────────────────────────────────────
+  4. io_uring_writer.rs — io_uring Write + fdatasync
+────────────────────────────────────────────────────────────
+
+Purpose: replace the Python os.pwrite() + os.fdatasync() hot path in
+volume_writer.py with a true io_uring submission that does NOT block any
+thread during the kernel's DMA phase.
+
+Architecture:
+  - One tokio-uring Runtime per process (created in on_startup, stored
+    in a global OnceCell<Runtime>).
+  - Python submits writes via PyO3 into a crossbeam_channel::Sender.
+  - The io_uring runtime's event loop drains the channel in batches,
+    submits write_at() SQEs, polls completions, then issues fdatasync().
+  - Each submission carries a oneshot::Sender<Result<(), IoError>> that
+    resolves the Python asyncio.Future on completion.
+
+Exposed to Python via PyO3:
+
+  async def write_block_uring(
+      fd: int,
+      offset: int,
+      data: bytes,          # PyBytes — zero-copy via py.allow_threads
+      md5_out: bool = True,
+      sha256_out: bool = True,
+  ) -> (md5_hex: str, sha256_hex: str)
+    — Submits a write_at(fd, data, offset) to io_uring.
+    — Computes MD5 + SHA256 inline on the data buffer while io_uring
+      does the DMA write (zero extra CPU pass over the data).
+    — Returns hashes. Raises OSError on write failure.
+    — NOTE: Python side awaits a Future; Rust side signals it via
+      PyO3's pyo3_asyncio::tokio::future_into_py bridge.
+
+  async def fdatasync_uring(fd: int) -> None
+    — Issues an io_uring fdatasync SQE for the given fd.
+    — Called by the group committer after a batch of write_block_uring().
+
+  GIL interaction:
+    - py.allow_threads() releases the GIL for the duration of the io_uring
+      submit + data copy so other Python coroutines can run.
+    - Hash computation also runs GIL-free (pure Rust on a copy of the buffer).
+
+────────────────────────────────────────────────────────────
+  5. io_uring_reader.rs — Zero-Copy pread Streaming
+────────────────────────────────────────────────────────────
+
+Purpose: replace Python os.pread() loops in volume_reader.py with
+io_uring read_at() calls, eliminating thread-pool overhead for reads
+and enabling true kernel-bypass zero-copy on supported hardware.
+
+Exposed to Python via PyO3:
+
+  async def read_block_uring(
+      path: str,
+      offset: int,
+      length: int,
+  ) -> bytes
+    — Opens the volume file O_RDONLY|O_NOATIME, issues a read_at() SQE.
+    — Returns the bytes to Python as PyBytes (zero-copy from Rust's buffer).
+    — Uses posix_fadvise(FADV_RANDOM) for small/random-access reads.
+
+  class UringBlockStreamer:
+    — Async iterator yielding 4 MiB chunks from a sequence of BlockCoords.
+    — Each chunk is a separate read_at() SQE submitted to io_uring.
+    — Uses posix_fadvise(FADV_SEQUENTIAL) per volume file for large objects.
+    — Implements Python's async iterator protocol (__anext__) via PyO3.
+
+    def __new__(
+        blocks: list[dict],   # [{vol_uuid, offset, length}]
+        vol_dir: str,
+        chunk_size: int = 4194304,
+    ) -> Self
+
+    async def __anext__(self) -> bytes   # raises StopAsyncIteration when done
+
+  Splice optimization (future):
+    — On Linux ≥ 6.0 with io_uring IORING_OP_SPLICE, data can flow from
+      the volume file directly into the network socket fd with zero user-space
+      copies. This is a follow-up optimization; the pread path above is
+      sufficient for the initial implementation.
+
+────────────────────────────────────────────────────────────
+  6. group_commit.rs — Rust-native Group Committer
+────────────────────────────────────────────────────────────
+
+Purpose: replace volume_writer.py's asyncio.Queue-based group committer
+with a Rust-native coordinator that submits io_uring SQEs in bulk,
+issuing a single fdatasync per batch and then calling back into Python
+to commit the LMDB batch transaction.
+
+This is the highest-value change: Python's asyncio.Queue adds per-item
+overhead and doesn't interleave with io_uring's submission ring.
+
+Architecture:
+  - crossbeam_channel::bounded(8192) for submissions.
+  - Each submission is a WriteRequest{fd, offset, data, md5, sha256, lmdb_key,
+    meta_json, ack_tx: oneshot::Sender<Result>}.
+  - A dedicated OS thread runs the tokio-uring Runtime.
+  - That thread drains up to BATCH_SIZE (default 64) requests per cycle,
+    submits all write_at SQEs, awaits all completions, issues one fdatasync
+    per unique fd, then calls back into Python (py.with_gil) to commit the
+    LMDB transaction, then resolves all ack futures.
+
+Exposed to Python via PyO3:
+
+  class GroupCommitter:
+    def __new__(
+        batch_size: int = 64,
+        batch_window_ms: float = 4.0,
+        queue_depth: int = 8192,
+    ) -> Self
+
+    async def submit(
+        fd: int,
+        offset: int,
+        data: bytes,
+        engine_ptr: int,       # ctypes.addressof(engine._lmdb_ptr)
+        lmdb_key: str,
+        meta_json: str,
+    ) -> (md5_hex: str, sha256_hex: str)
+      — Non-blocking enqueue (raises QueueFull if at capacity).
+      — Awaitable: suspends caller until the batch containing this write
+        has been fsynced and committed to LMDB.
+      — Returns inline-computed hashes.
+
+  Integration with Python side:
+    — volume_writer.py's write_block() checks for the Rust GroupCommitter
+      first (imported from p2_storage); falls back to the Python asyncio
+      queue only if the Rust extension is unavailable (e.g., in tests).
+
+────────────────────────────────────────────────────────────
+  7. crypto.rs — Extend with AES-GCM-256 SSE
+────────────────────────────────────────────────────────────
+
+Purpose: add inline AES-GCM-256 encryption/decryption for SSE-S3 and
+SSE-C to the existing crypto module. The new architecture plan specifies
+that encryption must happen inline during the io_uring write path — no
+separate pass over the data.
+
+New functions in crypto.rs:
+
+  fn aes_gcm_encrypt(
+      key: &[u8; 32],      # 256-bit key
+      nonce: &[u8; 12],    # 96-bit nonce (random per object)
+      plaintext: &[u8],
+  ) -> (ciphertext: Vec<u8>, tag: [u8; 16])
+    — Pure Rust, GIL-free, uses ring/aes-gcm crate with AES-NI acceleration.
+    — Returns ciphertext + authentication tag (16 bytes).
+
+  fn aes_gcm_decrypt(
+      key: &[u8; 32],
+      nonce: &[u8; 12],
+      ciphertext: &[u8],
+      tag: &[u8; 16],
+  ) -> Result<Vec<u8>, AuthenticationError>
+
+Exposed to Python via PyO3:
+
+  def sse_encrypt_block(key: bytes, nonce: bytes, plaintext: bytes) -> bytes
+    — Returns nonce (12 bytes) || ciphertext || tag (16 bytes).
+    — Called by group_commit.rs inline before write_at() submission.
+
+  def sse_decrypt_block(key: bytes, nonce: bytes, ciphertext_with_tag: bytes) -> bytes
+    — Called by io_uring_reader.rs per chunk during streaming GETs.
+
+  SSE-S3 key derivation:
+    — Server-managed keys are derived from FERNET_KEY + vol_uuid + object_path
+      via HKDF-SHA256. This matches the architecture's "Encrypted payload"
+      label on volume files.
+    — SSE-C keys come from the client's x-amz-server-side-encryption-customer-key
+      header (base64-decoded 32 bytes), verified with x-amz-sse-customer-key-md5.
+
+  LMDB metadata additions when SSE active:
+    {
+      "sse_algorithm": "AES256",      # or "aws:kms" for future KMS support
+      "sse_nonce": "<base64 12b>",
+      "sse_tag":   "<base64 16b>",
+      ...existing fields...
+    }
+
+────────────────────────────────────────────────────────────
+  8. write_and_hash_small() — retire / adapt
+────────────────────────────────────────────────────────────
+
+The existing write_and_hash_small(path, data) function writes to a
+filesystem path (one-file-per-object model). Under the new architecture:
+
+  - The function is OBSOLETE for new writes (volume pool is used instead).
+  - Remove the call from asgi_handler.py (already done in Phase 1).
+  - Keep the function in lib.rs but mark it #[deprecated] for any
+    potential legacy path that still exists during migration.
+  - The replacement is:
+      volume_pool.allocate_block(len) → (vol_uuid, offset, fd)
+      group_committer.submit(fd, offset, data, ...) → (md5, sha256)
+    which does the write + hash in a single GIL-free Rust call via io_uring.
+
+────────────────────────────────────────────────────────────
+  9. Build & Integration
+────────────────────────────────────────────────────────────
+
+Crate rename / dual-crate strategy:
+  Option A (simpler): Extend existing rust_ext crate.
+    — Rename output lib from p2_s3_crypto → p2_storage in Cargo.toml.
+    — Add a shim: p2/s3/__init__.py imports p2_storage as p2_s3_crypto
+      for backward compat with existing callers.
+    — Single .so artifact; simpler build pipeline.
+
+  Option B (cleaner): Two separate crates.
+    — p2_s3_crypto remains unchanged (crypto only, stable).
+    — p2_storage is a new crate in rust_ext_storage/ with io_uring.
+    — Python imports both independently.
+    — Easier to test in isolation; io_uring failure doesn't break auth.
+
+  Recommended: Option A for initial implementation; split to B later.
+
+Cargo.toml [features] for conditional io_uring:
+  [features]
+  default = ["io_uring"]
+  io_uring = ["tokio-uring"]
+  — Allows building without io_uring on non-Linux or kernel < 5.1.
+  — Python side checks: hasattr(p2_storage, 'write_block_uring')
+    before using the fast path; falls back to Python os.pwrite.
+
+build.sh updates:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "$(dirname "$0")"
+  # Detect kernel version; disable io_uring on < 5.1
+  KERNEL=$(uname -r | cut -d. -f1,2)
+  FEATURES=""
+  python3 -c "
+  maj, min = '${KERNEL}'.split('.')
+  if int(maj) < 5 or (int(maj) == 5 and int(min) < 1):
+      print('no_uring')
+  " | grep -q no_uring && FEATURES="--no-default-features"
+  cargo build --release $FEATURES
+  cp target/release/libp2_storage.so \
+     $(python3 -c "import site; print(site.getsitepackages()[0])")/p2_storage.so
+
+Python integration points to update after Rust extension is built:
+
+  p2/s3/volume_writer.py:
+    — Import GroupCommitter from p2_storage (with try/except ImportError fallback).
+    — Replace asyncio.Queue + _commit_worker with GroupCommitter.submit().
+    — Keep Python fallback path for environments without the .so.
+
+  p2/s3/volume_reader.py:
+    — Import read_block_uring / UringBlockStreamer from p2_storage.
+    — Replace asyncio.to_thread(os.pread, ...) with read_block_uring().
+    — UringBlockStreamer replaces the Python stream_blocks() async generator.
+
+  p2/s3/volume_pool.py:
+    — Import VolumePool (Rust) from p2_storage if available.
+    — The Rust VolumePool uses fallocate for true prealloc vs Python's
+      os.truncate which creates sparse files. This matters on ext4/xfs.
+
+  p2/s3/asgi_handler.py / rsgi_handler.py:
+    — After Rust GroupCommitter is wired, remove the asyncio.to_thread()
+      wrappers around allocate_block + write_block in the fast PUT path.
+    — The entire PUT hot path becomes:
+        (md5, sha256) = await p2_storage.group_committer.submit(...)
+        — single await, zero threads, zero copies.
+
+────────────────────────────────────────────────────────────
+  10. Testing plan for Rust changes
+────────────────────────────────────────────────────────────
+
+  rust_ext/tests/
+  ├── test_volume_pool.rs     — allocate_block, seal, fallocate sizing
+  ├── test_uring_writer.rs    — write_block_uring correctness + hash output
+  ├── test_uring_reader.rs    — read_block_uring matches written data
+  ├── test_group_commit.rs    — concurrent submissions, batch flush timing
+  └── test_crypto.rs          — AES-GCM round-trip, nonce uniqueness
+
+  Python integration tests (pytest):
+    tests/test_volume_pool_rust.py
+      — Compares Rust VolumePool.allocate_block() output against
+        Python VolumePool for identical byte-level correctness.
+    tests/test_s3_uring.py
+      — Full PUT → GET round-trip using the Rust fast path.
+      — Verifies ETag, block coords, and data integrity (SHA256 check).
+
+────────────────────────────────────────────────────────────
+  SUMMARY — what changes in the Rust crate
+────────────────────────────────────────────────────────────
+
+  FILE                  STATUS    WHAT TO DO
+  ─────────────────────────────────────────────────────────
+  Cargo.toml            CHANGE    Add tokio-uring, aes-gcm, parking_lot,
+                                  bytes, crossbeam-channel, libc, tokio
+  src/lib.rs            CHANGE    Register new PyO3 modules; keep existing
+                                  crypto functions; add mod declarations
+  src/crypto.rs         NEW       Move existing HMAC/MD5 here; add AES-GCM-256
+  src/volume_pool.rs    NEW       fallocate prealloc, AtomicU64 offset, seal
+  src/io_uring_writer.rs NEW      write_at + fdatasync via tokio-uring
+  src/io_uring_reader.rs NEW      read_at + UringBlockStreamer async iterator
+  src/group_commit.rs   NEW       crossbeam queue + tokio-uring batch flush
+  build.sh              CHANGE    Kernel version check, feature flags, new .so name
+  write_and_hash_small  DEPRECATE Keep but mark deprecated; remove call sites
+════════════════════════════════════════════════════════════

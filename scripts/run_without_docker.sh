@@ -137,7 +137,10 @@ _ensure_generated_secret "P2_FERNET_KEY"
 _set_env_value "P2_STORAGE__ROOT" "$STORAGE_ROOT"
 _set_env_value "P2_REDIS__HOST" "127.0.0.1"
 _set_env_value "P2_REDIS__ARQ_URL" "redis://127.0.0.1:6379/1"
-_set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "true"
+_set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "false"
+_set_env_value "P2_STORAGE__VOLUME_SIZE_BYTES" "104857600"
+_set_env_value "P2_STORAGE__VOLUME_ACTIVE_POOL_SIZE" "2"
+_set_env_value "P2_SECURITY__SSL_REDIRECT" "false"
 
 # ── Port ───────────────────────────────────────────────────────────────────────
 PORT=8787
@@ -248,6 +251,10 @@ info "Starting arq worker..."
 uv run --env-file .env python -m arq p2.core.worker.WorkerSettings &
 WORKER_PID=$!
 
+info "Starting gRPC server..."
+uv run --env-file .env python manage.py grpc &
+GRPC_PID=$!
+
 CORES=$(nproc)
 WORKERS=$((CORES * 1))
 info "Starting granian (${WORKERS} workers based on ${CORES} CPU cores)..."
@@ -277,7 +284,7 @@ uv run granian "${GRANIAN_ARGS[@]}" p2.core.asgi:application &
 SERVER_PID=$!
 
 # ── Cleanup on exit ────────────────────────────────────────────────────────────
-trap "info 'Shutting down...'; kill $WORKER_PID $SERVER_PID 2>/dev/null; wait" SIGINT SIGTERM
+trap "info 'Shutting down...'; kill $WORKER_PID $SERVER_PID $GRPC_PID 2>/dev/null; wait" SIGINT SIGTERM
 
 info "p2 running at http://localhost:$PORT (granian) — Ctrl+C to stop"
 wait

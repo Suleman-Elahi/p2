@@ -1,73 +1,66 @@
-"""p2 S3 Object views"""
+"""p2 S3 Object views — Volume Pool architecture.
+
+Metadata schema stored in LMDB per key:
+{
+  "size": <int>,
+  "mime": <str>,
+  "blocks": [{"vol_uuid": "...", "offset": <int>, "length": <int>}, ...],
+  "etag": "<md5hex>",
+  "sha256": "<sha256hex>",
+  "mtime": "<iso8601>",
+  "ctime": "<iso8601>",
+  "version_id": "<str>",          # optional
+  "is_folder": false,
+  "sse_algorithm": "AES256",      # optional
+  "tags": {},                     # optional user tags
+  "acl": "private"                # optional
+}
+
+DELETE is logical: removes the LMDB key only — physical bytes stay in the
+volume until the compaction worker reclaims them.
+"""
+from __future__ import annotations
+
+import asyncio
+import binascii
+import hashlib
+import json
 import logging
+import uuid
 from email.utils import format_datetime
+from typing import Any
 from xml.etree import ElementTree
 
+from django.conf import settings
+from django.http import StreamingHttpResponse
 from django.http.response import HttpResponse
 from django.utils.dateparse import parse_datetime
+from django.utils.timezone import now
 
-from p2.core.acl import has_volume_permission
-from p2.core.constants import (ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME,
-                               ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME,
-                               ATTR_BLOB_STAT_CTIME)
-from p2.s3.constants import (TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX,
-                             XML_NAMESPACE)
-from p2.s3.cors import apply_cors_headers, find_matching_rule, get_cors_rules
+from p2.core.constants import ATTR_BLOB_IS_FOLDER, ATTR_BLOB_MIME, ATTR_BLOB_SIZE_BYTES, ATTR_BLOB_STAT_MTIME, ATTR_BLOB_STAT_CTIME
+from p2.s3.constants import TAG_S3_ACL, TAG_S3_USER_TAG_PREFIX, XML_NAMESPACE
+from p2.s3.cors import apply_cors_headers, cors_preflight_response, find_matching_rule, get_cors_rules
 from p2.s3.errors import AWSAccessDenied, AWSBadDigest, AWSNoSuchKey
-from p2.s3.fastpath import cleanup_replaced_payload
 from p2.s3.http import XMLResponse
 from p2.s3.presign import validate_presigned_token
 from p2.s3.views.common import S3View
 from p2.s3.views.multipart import MultipartUploadView
 from p2.s3.utils import decode_aws_chunked, iter_request_body
-from p2.s3.cache import get_cached_metadata, set_cached_metadata, invalidate_metadata
-import json
-import asyncio
-from django.conf import settings
-from django.http import StreamingHttpResponse
-
-USE_ACCEL_REDIRECT = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
-
-
-def _format_http_date(mtime_str: str) -> str | None:
-    """Convert stored mtime string to RFC 7231 HTTP date format.
-    Returns None when mtime_str is absent so callers can skip the header.
-    Handles both ISO 8601 (current) and legacy Unix epoch floats."""
-    if not mtime_str:
-        return None
-    dt = parse_datetime(mtime_str)
-    if dt is None:
-        # Legacy: Unix epoch floats from objects written before timestamp fix.
-        import datetime as _dt
-        try:
-            dt = _dt.datetime.fromtimestamp(float(mtime_str), tz=_dt.UTC)
-        except (ValueError, OverflowError):
-            return None
-    return format_datetime(dt, usegmt=True) if dt else None
-
-
+from p2.s3.cache import (
+    get_cached_metadata, set_cached_metadata, invalidate_metadata, invalidate_volume_global,
+)
+from p2.s3.volume_pool import BlockCoord, VolumePool
+from p2.s3.volume_reader import (
+    read_object, read_range, slice_blocks, stream_blocks, stream_sliced_blocks, total_size,
+)
+from p2.s3.volume_writer import write_block
 
 LOGGER = logging.getLogger(__name__)
 
-# Canned ACL → p2 permission list mapping
-_CANNED_ACL_PERMS = {
-    "private":                  [],
-    "public-read":              ["read"],
-    "public-read-write":        ["read", "write"],
-    "authenticated-read":       ["read"],
-    "bucket-owner-read":        ["read"],
-    "bucket-owner-full-control":["read", "write", "delete"],
-}
 
-
-def _log_event_publish_result(task: asyncio.Task) -> None:
-    """Surface background publish failures without affecting request latency."""
-    try:
-        task.result()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Failed to publish blob event (background): %s", exc)
-
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _check_conditional_headers(request, blob) -> HttpResponse | None:
     """Check If-Match/If-None-Match/If-Modified-Since/If-Unmodified-Since.
@@ -78,7 +71,15 @@ def _check_conditional_headers(request, blob) -> HttpResponse | None:
         if request.META.get('HTTP_IF_MATCH'):
             return HttpResponse(status=412)
         return None
-    etag = blob.attributes.get('blob.p2.io/hash/md5', '')
+
+    if hasattr(blob, 'attributes'):
+        attrs = blob.attributes
+    elif isinstance(blob, dict):
+        attrs = blob
+    else:
+        attrs = {}
+
+    etag = attrs.get('blob.p2.io/hash/md5', '') or attrs.get('etag', '')
     if_match = request.META.get('HTTP_IF_MATCH')
     if if_match:
         tags = [t.strip().strip('"') for t in if_match.split(',')]
@@ -96,7 +97,7 @@ def _check_conditional_headers(request, blob) -> HttpResponse | None:
         from email.utils import parsedate_to_datetime
         try:
             threshold = parsedate_to_datetime(if_unmod)
-            mtime = blob.attributes.get(ATTR_BLOB_STAT_MTIME, '')
+            mtime = attrs.get(ATTR_BLOB_STAT_MTIME, '') or attrs.get('mtime', '')
             if mtime:
                 from django.utils.dateparse import parse_datetime
                 blob_dt = parse_datetime(str(mtime))
@@ -107,44 +108,24 @@ def _check_conditional_headers(request, blob) -> HttpResponse | None:
     return None
 
 
-def _user_tags_from_blob(blob: dict) -> dict:
-    """Extract S3 user tags (s3.user/* prefix) from metadata dict tags."""
-    tags = blob.get('tags', {}) if isinstance(blob, dict) else getattr(blob, 'tags', {})
-    return {
-        k[len(TAG_S3_USER_TAG_PREFIX):]: v
-        for k, v in tags.items()
-        if k.startswith(TAG_S3_USER_TAG_PREFIX)
-    }
+def _fmt_http_date(mtime_str: str) -> str | None:
+    if not mtime_str:
+        return None
+    dt = parse_datetime(mtime_str)
+    if dt is None:
+        import datetime as _dt
+        try:
+            dt = _dt.datetime.fromtimestamp(float(mtime_str), tz=_dt.UTC)
+        except (ValueError, OverflowError):
+            return None
+    return format_datetime(dt, usegmt=True) if dt else None
 
 
-def _validate_checksum_headers(request, *, crc32_b64: str | None = None,
-                               crc32c_b64: str | None = None,
-                               sha256_hex: str | None = None,
-                               sha1_b64: str | None = None):
-    """Validate x-amz-checksum-* headers if present.
-
-    Only validates algorithms that were computed by the caller.
-    """
-    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32')
-    if expected and crc32_b64 and expected != crc32_b64:
-        raise AWSBadDigest
-    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32C')
-    if expected and crc32c_b64 and expected != crc32c_b64:
-        raise AWSBadDigest
-    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA256')
-    if expected and sha256_hex:
-        import base64
-        import binascii
-        sha256_b64 = base64.b64encode(binascii.unhexlify(sha256_hex)).decode('ascii')
-        if expected != sha256_b64:
-            raise AWSBadDigest
-    expected = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA1')
-    if expected and sha1_b64 and expected != sha1_b64:
-        raise AWSBadDigest
+def _blocks_from_meta(meta: dict) -> list[BlockCoord]:
+    return [BlockCoord.from_dict(b) for b in meta.get("blocks", [])]
 
 
 def _parse_tagging_xml(body: bytes) -> dict:
-    """Parse a PutObjectTagging XML body into a flat dict."""
     root = ElementTree.fromstring(body)
     tags = {}
     for tag_el in root.iter("Tag"):
@@ -156,573 +137,370 @@ def _parse_tagging_xml(body: bytes) -> dict:
 
 
 def _build_tagging_xml(tags: dict) -> ElementTree.Element:
-    root = ElementTree.Element("{%s}Tagging" % XML_NAMESPACE)
+    root = ElementTree.Element(f"{{{XML_NAMESPACE}}}Tagging")
     tag_set = ElementTree.SubElement(root, "TagSet")
     for k, v in tags.items():
-        tag_el = ElementTree.SubElement(tag_set, "Tag")
-        ElementTree.SubElement(tag_el, "Key").text = k
-        ElementTree.SubElement(tag_el, "Value").text = str(v)
+        t = ElementTree.SubElement(tag_set, "Tag")
+        ElementTree.SubElement(t, "Key").text = k
+        ElementTree.SubElement(t, "Value").text = str(v)
     return root
 
 
-def _build_acl_xml(blob, owner_id: str, owner_name: str) -> ElementTree.Element:
-    root = ElementTree.Element("{%s}AccessControlPolicy" % XML_NAMESPACE)
-    owner = ElementTree.SubElement(root, "Owner")
-    ElementTree.SubElement(owner, "ID").text = owner_id
-    ElementTree.SubElement(owner, "DisplayName").text = owner_name
-    acl_list = ElementTree.SubElement(root, "AccessControlList")
-    canned = blob.tags.get(TAG_S3_ACL, "private")
-    # Always add owner FULL_CONTROL
-    grant = ElementTree.SubElement(acl_list, "Grant")
-    grantee = ElementTree.SubElement(grant, "Grantee")
-    grantee.set("{http://www.w3.org/2001/XMLSchema-instance}type", "CanonicalUser")
-    ElementTree.SubElement(grantee, "ID").text = owner_id
-    ElementTree.SubElement(grant, "Permission").text = "FULL_CONTROL"
-    if "public-read" in canned or "public-read-write" in canned:
-        grant2 = ElementTree.SubElement(acl_list, "Grant")
-        grantee2 = ElementTree.SubElement(grant2, "Grantee")
-        grantee2.set("{http://www.w3.org/2001/XMLSchema-instance}type", "Group")
-        ElementTree.SubElement(grantee2, "URI").text = "http://acs.amazonaws.com/groups/global/AllUsers"
-        ElementTree.SubElement(grant2, "Permission").text = "READ"
-    return root
-
+# ---------------------------------------------------------------------------
+# ObjectView
+# ---------------------------------------------------------------------------
 
 class ObjectView(S3View):
-    """Object related views — all handlers are async."""
+    """S3 Object CRUD — all handlers async, uses Volume Pool block model."""
 
-    async def _check_presigned(self, request, bucket: str, path: str):
-        """If request carries a presigned token, validate it; skip normal AWS auth."""
+    # ── CORS / presign helpers ────────────────────────────────────────────
+
+    async def _check_presigned(self, request, bucket, path):
         token = request.GET.get("X-P2-Signature")
         if not token:
             return
         max_age = int(request.GET.get("X-Amz-Expires", 3600))
-        # Normalize: token key has no leading slash (matches URL router capture)
-        validate_presigned_token(token, bucket, path.lstrip('/'), request.method, max_age=max_age)
+        validate_presigned_token(token, bucket, path.lstrip("/"), request.method, max_age=max_age)
         request._presigned_validated = True
 
     async def _apply_cors(self, request, response, volume):
+        requested_vid = request.GET.get("versionId")
+        if requested_vid:
+            response["x-amz-version-id"] = requested_vid
         origin = request.META.get("HTTP_ORIGIN", "")
         if not origin:
             return response
-        rules = get_cors_rules(volume)
-        rule = find_matching_rule(rules, origin, request.method)
+        rule = find_matching_rule(get_cors_rules(volume), origin, request.method)
         if rule:
             apply_cors_headers(response, rule, origin)
         return response
 
+    # ── OPTIONS ───────────────────────────────────────────────────────────
+
     async def options(self, request, bucket, path):
-        """CORS preflight."""
         origin = request.META.get("HTTP_ORIGIN", "")
         req_method = request.META.get("HTTP_ACCESS_CONTROL_REQUEST_METHOD", "GET")
         try:
-            from p2.s3.cache import get_cached_volume, set_cached_volume
             from p2.core.models import Volume
+            from p2.s3.cache import get_cached_volume, set_cached_volume
             volume = get_cached_volume(bucket)
             if not volume:
                 volume = await Volume.objects.aget(name=bucket)
                 set_cached_volume(bucket, volume)
         except Exception:
             return HttpResponse(status=403)
-        rules = get_cors_rules(volume)
-        rule = find_matching_rule(rules, origin, req_method)
+        rule = find_matching_rule(get_cors_rules(volume), origin, req_method)
         if not rule:
             return HttpResponse(status=403)
-        from p2.s3.cors import cors_preflight_response
         return cors_preflight_response(rule, origin)
 
+    # ── HEAD ──────────────────────────────────────────────────────────────
 
     async def head(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html"""
-        import asyncio
         await self._check_presigned(request, bucket, path)
-        volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
+        volume = await self.get_volume(request.user, bucket, "read", object_key=path)
 
-        requested_version_id = request.GET.get('versionId')
-        if requested_version_id:
-            engine = await self.get_engine(volume)
+        requested_vid = request.GET.get("versionId")
+        if requested_vid:
             from p2.s3.versioning import _version_lmdb_key
-            lmdb_key = _version_lmdb_key(path, requested_version_id)
-
-            def _get_version_meta():
-                with engine.env.begin(db=engine.db) as txn:
-                    val = txn.get(lmdb_key)
-                    return val
-
-            raw_val = await asyncio.to_thread(_get_version_meta)
-            if raw_val is None:
+            engine = await self.get_engine(volume)
+            version_key = _version_lmdb_key(path, requested_vid)
+            raw = await asyncio.to_thread(engine.get_raw, version_key)
+            if not raw:
                 return HttpResponse(status=404)
-            attributes = json.loads(raw_val)
-            if attributes.get('blob.p2.io/delete_marker', False):
+            meta = json.loads(raw)
+            if meta.get("blob.p2.io/delete_marker", False) or meta.get("delete_marker", False):
                 response = HttpResponse(status=404)
-                response['x-amz-delete-marker'] = 'true'
-                response['x-amz-version-id'] = requested_version_id
+                response["x-amz-delete-marker"] = "true"
+                response["x-amz-version-id"] = requested_vid
                 return await self._apply_cors(request, response, volume)
         else:
-            from p2.s3.cache import get_cached_metadata, set_cached_metadata
-            attributes = get_cached_metadata(volume.uuid.hex, path)
-            if attributes is None:
+            meta = get_cached_metadata(volume.uuid.hex, path)
+            if meta is None:
                 engine = await self.get_engine(volume)
-                metadata_json = engine.get(path)
-                if not metadata_json:
-                    from p2.s3.versioning import list_versions
-                    versions = await list_versions(engine, prefix=path, max_keys=1)
-                    if versions and versions[0]['key'] == path and versions[0]['is_delete_marker']:
-                        response = HttpResponse(status=404)
-                        response['x-amz-delete-marker'] = 'true'
-                        response['x-amz-version-id'] = versions[0]['version_id']
-                        return await self._apply_cors(request, response, volume)
+                raw = await asyncio.to_thread(engine.get, path)
+                if not raw:
                     return HttpResponse(status=404)
-                attributes = json.loads(metadata_json)
-                set_cached_metadata(volume.uuid.hex, path, attributes)
-
-        await asyncio.sleep(0)
+                meta = json.loads(raw)
+                set_cached_metadata(volume.uuid.hex, path, meta)
 
         response = HttpResponse(status=200)
-        response['Content-Length'] = attributes.get(ATTR_BLOB_SIZE_BYTES, 0)
-        response['Content-Type'] = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-        last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
-        if last_mod:
-            response['Last-Modified'] = last_mod
-        etag = attributes.get('blob.p2.io/hash/md5', '')
+        response["Content-Length"] = meta.get("size", 0)
+        response["Content-Type"] = meta.get("mime", "application/octet-stream")
+        lm = _fmt_http_date(meta.get("mtime", ""))
+        if lm:
+            response["Last-Modified"] = lm
+        etag = meta.get("etag", "")
         if etag:
-            response['ETag'] = f'"{etag}"'
-        response['Accept-Ranges'] = 'bytes'
-        if requested_version_id:
-            response['x-amz-version-id'] = requested_version_id
-        elif attributes.get('blob.p2.io/version_id'):
-            response['x-amz-version-id'] = attributes.get('blob.p2.io/version_id')
-
+            response["ETag"] = f'"{etag}"'
+        response["Accept-Ranges"] = "bytes"
         return await self._apply_cors(request, response, volume)
 
+    # ── GET ───────────────────────────────────────────────────────────────
+
     async def get(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html"""
         await self._check_presigned(request, bucket, path)
 
-        # Object tagging
-        if 'tagging' in request.GET:
+        if "tagging" in request.GET:
             return await self._get_tagging(request, bucket, path)
-        # Object ACL
-        if 'acl' in request.GET:
+        if "acl" in request.GET:
             return await self._get_acl(request, bucket, path)
-        # List parts
-        if 'uploadId' in request.GET:
+        if "uploadId" in request.GET:
             return await MultipartUploadView().dispatch(request, bucket, path)
 
-        # ── Versioning: GET a specific historical version ─────────────────────
-        requested_version_id = request.GET.get('versionId')
-        if requested_version_id:
-            volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
-            engine = await self.get_engine(volume)
+        volume = await self.get_volume(request.user, bucket, "read", object_key=path)
+        pool = VolumePool.get()
+
+        requested_vid = request.GET.get("versionId")
+        if requested_vid:
             from p2.s3.versioning import _version_lmdb_key
-            lmdb_key = _version_lmdb_key(path, requested_version_id)
-
-            def _get_version_meta():
-                with engine.env.begin(db=engine.db) as txn:
-                    val = txn.get(lmdb_key)
-                    return val
-
-            raw_val = await asyncio.to_thread(_get_version_meta)
-            if raw_val is None:
-                return HttpResponse(status=404)
-            attributes = json.loads(raw_val)
-            if attributes.get('blob.p2.io/delete_marker', False):
-                response = HttpResponse(status=404)
-                response['x-amz-delete-marker'] = 'true'
-                response['x-amz-version-id'] = requested_version_id
-                return await self._apply_cors(request, response, volume)
-            # Serve the blob — reuse the same tiered serving logic below by
-            # falling through with `attributes` already set. Build a minimal
-            # response directly for simplicity.
-            internal_path = attributes.get('internal_path')
-            if not internal_path:
-                return HttpResponse(status=404)
-            from p2.core.storage_path import internal_to_fs
-            import os
-            fs_path = internal_to_fs(internal_path)
-            if not os.path.exists(fs_path):
-                return HttpResponse(status=404)
-            content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-            total_size = int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
-            etag = attributes.get('blob.p2.io/hash/md5', '')
-            data = await asyncio.to_thread(lambda: open(fs_path, 'rb').read())
-            response = HttpResponse(data, content_type=content_type, status=200)
-            response['Content-Length'] = total_size
-            response['ETag'] = f'"{etag}"' if etag else ''
-            response['x-amz-version-id'] = requested_version_id
-            return await self._apply_cors(request, response, volume)
-        # ─────────────────────────────────────────────────────────────────────
-
-        volume = await self.get_volume(request.user, bucket, 'read', object_key=path)
-
-        attributes = get_cached_metadata(volume.uuid.hex, path)
-
-        if attributes is None:
             engine = await self.get_engine(volume)
-            metadata_json = engine.get(path)
-            if not metadata_json:
-                from p2.s3.versioning import list_versions
-                versions = await list_versions(engine, prefix=path, max_keys=1)
-                if versions and versions[0]['key'] == path and versions[0]['is_delete_marker']:
-                    response = HttpResponse(status=404)
-                    response['x-amz-delete-marker'] = 'true'
-                    response['x-amz-version-id'] = versions[0]['version_id']
-                    return await self._apply_cors(request, response, volume)
-                LOGGER.warning("GET 404: bucket=%s path=%r", bucket, path)
+            version_key = _version_lmdb_key(path, requested_vid)
+            raw = await asyncio.to_thread(engine.get_raw, version_key)
+            if not raw:
                 return HttpResponse(status=404)
-            attributes = json.loads(metadata_json)
-            set_cached_metadata(volume.uuid.hex, path, attributes)
-        
-        content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-        total_size = int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0))
+            meta = json.loads(raw)
+            if meta.get("blob.p2.io/delete_marker", False) or meta.get("delete_marker", False):
+                response = HttpResponse(status=404)
+                response["x-amz-delete-marker"] = "true"
+                response["x-amz-version-id"] = requested_vid
+                return await self._apply_cors(request, response, volume)
+        else:
+            meta = get_cached_metadata(volume.uuid.hex, path)
+            if meta is None:
+                engine = await self.get_engine(volume)
+                raw = await asyncio.to_thread(engine.get, path)
+                if not raw:
+                    LOGGER.warning("GET 404: bucket=%s path=%r", bucket, path)
+                    return HttpResponse(status=404)
+                meta = json.loads(raw)
+                set_cached_metadata(volume.uuid.hex, path, meta)
 
-        etag = attributes.get('blob.p2.io/hash/md5', '')
-        # If-None-Match → 304 Not Modified
-        if_none_match = request.META.get('HTTP_IF_NONE_MATCH')
+        blocks = _blocks_from_meta(meta)
+        obj_size = int(meta.get("size", 0))
+        content_type = meta.get("mime", "application/octet-stream")
+        etag = meta.get("etag", "")
+
+        # 304 Not Modified
+        if_none_match = request.META.get("HTTP_IF_NONE_MATCH")
         if if_none_match and etag:
-            tags = [t.strip().strip('"') for t in if_none_match.split(',')]
+            tags = [t.strip().strip('"') for t in if_none_match.split(",")]
             if etag.strip('"') in tags:
                 resp = HttpResponse(status=304)
-                resp['ETag'] = etag
+                resp["ETag"] = etag
                 return await self._apply_cors(request, resp, volume)
 
-        internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{volume.uuid.hex}{path}")
-        from p2.core.storage_path import internal_to_fs
-        fs_path = internal_to_fs(internal_path)
-
-        # Range request support (RFC 7233)
-        range_header = request.META.get('HTTP_RANGE')
-        if range_header and total_size > 0:
-            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
-            etag_str = f'"{etag}"' if etag else None
-            return await self._range_response(
-                request, fs_path, content_type, total_size,
-                etag_str, last_mod, range_header, volume,
-            )
-
-        use_accel_redirect = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
-        if use_accel_redirect and request.META.get('HTTP_X_REAL_IP'):
-            response = HttpResponse()
-            response['X-Accel-Redirect'] = internal_path
-            response['X-P2-Accel'] = '1'
-            response['Content-Type'] = content_type
-            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
-            if last_mod:
-                response['Last-Modified'] = last_mod
-            response['ETag'] = etag
-            response['Accept-Ranges'] = 'bytes'
-            if 'response-content-type' in request.GET:
-                response['Content-Type'] = request.GET['response-content-type']
-            if 'response-content-disposition' in request.GET:
-                response['Content-Disposition'] = request.GET['response-content-disposition']
-            if attributes.get('blob.p2.io/version_id'):
-                response['x-amz-version-id'] = attributes['blob.p2.io/version_id']
+        # X-Accel-Redirect: Django hands off to Nginx sendfile() — zero-copy.
+        use_accel = getattr(settings, "USE_X_ACCEL_REDIRECT", False) and ("HTTP_X_REAL_IP" in request.META)
+        if use_accel:
+            internal_path = meta.get("internal_path", f"/internal-storage/volumes/{volume.uuid.hex}/{path}")
+            response = HttpResponse(status=200)
+            response["X-Accel-Redirect"] = internal_path
+            response["X-P2-Accel"] = "1"
+            response["Content-Type"] = content_type
+            lm = _fmt_http_date(meta.get("mtime", ""))
+            if lm:
+                response["Last-Modified"] = lm
+            if etag:
+                response["ETag"] = f'"{etag}"'
+            response["Accept-Ranges"] = "bytes"
+            if "response-content-type" in request.GET:
+                response["Content-Type"] = request.GET["response-content-type"]
+            if "response-content-disposition" in request.GET:
+                response["Content-Disposition"] = request.GET["response-content-disposition"]
             return await self._apply_cors(request, response, volume)
+
+        range_header = request.META.get("HTTP_RANGE")
+        if range_header and obj_size > 0:
+            return await self._range_response(request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume)
+
+        # Full object streaming
+        lm = _fmt_http_date(meta.get("mtime", ""))
+        if obj_size <= 4 * 1024 * 1024:
+            data = await read_object(pool, blocks)
+            response = HttpResponse(data, content_type=content_type, status=200)
         else:
-            # Optimized file serving — fadvise + mmap/pread/streaming
-            from p2.s3.fileio import (
-                fadvise_random, fadvise_sequential, mmap_read,
-                open_noatime, read_file_optimized,
-            )
-            import os
+            async def _gen():
+                async for chunk in stream_blocks(pool, blocks):
+                    yield chunk
+            response = StreamingHttpResponse(_gen(), content_type=content_type, status=200)
 
-            SMALL_FILE_MAX = 64 * 1024
-            MEDIUM_FILE_MAX = 4 * 1024 * 1024
-            STREAM_CHUNK_SIZE = 4 * 1024 * 1024
+        response["Content-Length"] = obj_size
+        if lm:
+            response["Last-Modified"] = lm
+        response["ETag"] = f'"{etag}"' if etag else ""
+        response["Accept-Ranges"] = "bytes"
+        if "response-content-type" in request.GET:
+            response["Content-Type"] = request.GET["response-content-type"]
+        if "response-content-disposition" in request.GET:
+            response["Content-Disposition"] = request.GET["response-content-disposition"]
+        return await self._apply_cors(request, response, volume)
 
-            if not os.path.exists(fs_path):
-                return HttpResponse(status=404)
+    async def _range_response(self, request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume):
+        try:
+            unit, ranges = range_header.split("=", 1)
+            if unit.strip() != "bytes":
+                raise ValueError
+            start_str, end_str = ranges.strip().split("-", 1)
+            start = int(start_str) if start_str else None
+            end = int(end_str) if end_str else None
+        except (ValueError, AttributeError):
+            return HttpResponse(status=416)
 
-            if total_size <= SMALL_FILE_MAX:
-                # Small file: mmap read (zero syscall overhead)
-                try:
-                    data = await asyncio.to_thread(mmap_read, fs_path)
-                    response = HttpResponse(data, content_type=content_type, status=200)
-                except OSError:
-                    return HttpResponse(status=404)
-            elif total_size <= MEDIUM_FILE_MAX:
-                # Medium file: pread with fadvise(RANDOM) — no seek overhead
-                def _read_medium():
-                    fd = open_noatime(fs_path)
-                    try:
-                        fadvise_random(fd)
-                        buf = bytearray(total_size)
-                        os.preadv(fd, [buf], 0)
-                        return buf
-                    finally:
-                        os.close(fd)
-                try:
-                    data = await asyncio.to_thread(_read_medium)
-                    response = HttpResponse(data, content_type=content_type, status=200)
-                except OSError:
-                    return HttpResponse(status=404)
-            else:
-                # Large file: streaming with fadvise(SEQUENTIAL) + buffered read
-                def _stream_large():
-                    fd = open_noatime(fs_path)
-                    fadvise_sequential(fd)
-                    return fd
+        if start is None:
+            start = max(0, obj_size - end)
+            end = obj_size - 1
+        if end is None or end >= obj_size:
+            end = obj_size - 1
+        if start > end or start >= obj_size:
+            resp = HttpResponse(status=416)
+            resp["Content-Range"] = f"bytes */{obj_size}"
+            return resp
 
-                fd = await asyncio.to_thread(_stream_large)
+        length = end - start + 1
+        slices = slice_blocks(blocks, start, end)
 
-                async def _file_stream():
-                    try:
-                        while True:
-                            chunk = await asyncio.to_thread(os.read, fd, STREAM_CHUNK_SIZE)
-                            if not chunk:
-                                break
-                            yield chunk
-                    finally:
-                        os.close(fd)
+        if length <= 4 * 1024 * 1024:
+            data = await read_range(pool, blocks, start, end)
+            response = HttpResponse(data, content_type=content_type, status=206)
+        else:
+            async def _gen():
+                async for chunk in stream_sliced_blocks(pool, slices):
+                    yield chunk
+            response = StreamingHttpResponse(_gen(), content_type=content_type, status=206)
 
-                response = StreamingHttpResponse(_file_stream(), content_type=content_type, status=200)
+        response["Content-Length"] = length
+        response["Content-Range"] = f"bytes {start}-{end}/{obj_size}"
+        response["Accept-Ranges"] = "bytes"
+        if etag:
+            response["ETag"] = f'"{etag}"'
+        lm = _fmt_http_date(meta.get("mtime", ""))
+        if lm:
+            response["Last-Modified"] = lm
+        return await self._apply_cors(request, response, volume)
 
-            response['Content-Length'] = total_size
-            last_mod = _format_http_date(attributes.get(ATTR_BLOB_STAT_MTIME, ''))
-            if last_mod:
-                response['Last-Modified'] = last_mod
-            response['ETag'] = etag
-            response['Accept-Ranges'] = 'bytes'
-            if 'response-content-type' in request.GET:
-                response['Content-Type'] = request.GET['response-content-type']
-            if 'response-content-disposition' in request.GET:
-                response['Content-Disposition'] = request.GET['response-content-disposition']
-            elif content_type != 'application/octet-stream':
-                response['Content-Disposition'] = 'inline'
-            if attributes.get('blob.p2.io/version_id'):
-                response['x-amz-version-id'] = attributes['blob.p2.io/version_id']
-            return await self._apply_cors(request, response, volume)
-
+    # ── POST ──────────────────────────────────────────────────────────────
 
     async def post(self, request, bucket, path):
         return await MultipartUploadView().dispatch(request, bucket, path)
 
+    # ── PUT ───────────────────────────────────────────────────────────────
+
     async def put(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html"""
         await self._check_presigned(request, bucket, path)
 
-        if 'uploadId' in request.GET:
+        if "uploadId" in request.GET:
             return await MultipartUploadView().dispatch(request, bucket, path)
-        if 'tagging' in request.GET:
+        if "tagging" in request.GET:
             return await self._put_tagging(request, bucket, path)
-        if 'acl' in request.GET:
+        if "acl" in request.GET:
             return await self._put_acl(request, bucket, path)
+        if request.META.get("HTTP_X_AMZ_COPY_SOURCE"):
+            return await self._copy_object(request, bucket, path, request.META["HTTP_X_AMZ_COPY_SOURCE"])
 
-        # Copy object — x-amz-copy-source header present
-        copy_source = request.META.get('HTTP_X_AMZ_COPY_SOURCE')
-        if copy_source:
-            return await self._copy_object(request, bucket, path, copy_source)
-
-        volume = await self.get_volume(request.user, bucket, 'write')
-        import uuid
-        import json
-        from django.utils.timezone import now
-        
+        volume = await self.get_volume(request.user, bucket, "write")
         engine = await self.get_engine(volume)
+        pool = VolumePool.get()
 
-        # Honour Content-Type from the client
-        client_ct = request.META.get('CONTENT_TYPE', 'application/octet-stream')
+        client_ct = request.META.get("CONTENT_TYPE", "application/octet-stream")
+        content_encoding = request.META.get("HTTP_CONTENT_ENCODING", "")
+        decoded_length = request.META.get("HTTP_X_AMZ_DECODED_CONTENT_LENGTH")
+        is_aws_chunked = "aws-chunked" in content_encoding or decoded_length
 
-        # Read body — decode aws-chunked if present
-        # AWS SDKs use x-amz-decoded-content-length when sending chunked payloads
-        import asyncio
-        content_encoding = request.META.get('HTTP_CONTENT_ENCODING', '')
-        decoded_length = request.META.get('HTTP_X_AMZ_DECODED_CONTENT_LENGTH')
-        is_aws_chunked = 'aws-chunked' in content_encoding or decoded_length
-        content_length_raw = request.META.get('CONTENT_LENGTH', '')
-        try:
-            content_length = int(content_length_raw) if content_length_raw else -1
-        except (TypeError, ValueError):
-            content_length = -1
-        small_put_fast_path = (
-            not is_aws_chunked and
-            content_length >= 0 and
-            content_length <= 64 * 1024
-        )
+        # ── Read body ────────────────────────────────────────────────────
+        md5_h = hashlib.md5()
+        sha256_h = hashlib.sha256()
+        chunks: list[bytes] = []
 
-        # Streaming high-throughput write
-        blob_uuid = uuid.uuid4().hex
-        from p2.core.storage_path import blob_dir, blob_fs_path, blob_internal_path, ensure_dir
-        dir_path = blob_dir(volume.uuid.hex, blob_uuid)
-        ensure_dir(dir_path)
-        fs_path = blob_fs_path(volume.uuid.hex, blob_uuid)
-        internal_path = blob_internal_path(volume.uuid.hex, blob_uuid)
-
-        import binascii
-        import base64
-        import hashlib
-
-        expected_crc32 = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32')
-        expected_crc32c = request.META.get('HTTP_X_AMZ_CHECKSUM_CRC32C')
-        expected_sha256 = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA256')
-        expected_sha1 = request.META.get('HTTP_X_AMZ_CHECKSUM_SHA1')
-
-        md5_hasher = hashlib.md5()
-        sha256_hasher = hashlib.sha256()
-        sha1_hasher = hashlib.sha1() if expected_sha1 else None
-        crc32_val = 0
-
-        # CRC32C: incremental computation to avoid buffering all chunks
-        crc32c_val = None
-        _rust_cs = None
-        if expected_crc32c:
-            try:
-                from p2.s3 import p2_s3_checksum as _rust_cs
-                crc32c_val = 0  # will be computed incrementally
-            except (ImportError, AttributeError):
-                _rust_cs = None
-                crc32c_val = None
-
-        blob_size = 0
-        final_md5 = ""
-        final_sha256 = ""
-        md5_digest = b""
-
-        if small_put_fast_path:
-            # Hot path for tiny uploads: offload file IO and hashing entirely to Rust
-            # bypasses python context-switching and hashes concurrently.
-            body = request.body
-            blob_size = len(body)
-            from p2.s3 import p2_s3_crypto
-            # Safe to call directly: the Rust extension releases the GIL
-            # during file I/O via py.allow_threads().
-            final_md5, final_sha256 = p2_s3_crypto.write_and_hash_small(fs_path, body)
-            md5_digest = binascii.unhexlify(final_md5)
-            
-            if sha1_hasher:
-                sha1_hasher.update(body)
-            if expected_crc32:
-                crc32_val = binascii.crc32(body, crc32_val)
-            if crc32c_val is not None:
-                crc32c_val = binascii.crc32(body, crc32c_val) & 0xFFFFFFFF
+        if is_aws_chunked:
+            raw = await asyncio.to_thread(request.read)
+            body = decode_aws_chunked(raw)
+            chunks = [body]
         else:
-            import aiofiles
-            async with aiofiles.open(fs_path, 'wb') as f:
-                if is_aws_chunked:
-                    body = await asyncio.to_thread(request.read)
-                    body = decode_aws_chunked(body)
-                    await f.write(body)
-                    blob_size = len(body)
-                    md5_hasher.update(body)
-                    sha256_hasher.update(body)
-                    if sha1_hasher:
-                        sha1_hasher.update(body)
-                    if expected_crc32:
-                        crc32_val = binascii.crc32(body, crc32_val)
-                    if crc32c_val is not None:
-                        crc32c_val = binascii.crc32(body, crc32c_val) & 0xFFFFFFFF
-                else:
-                    async for chunk in iter_request_body(request, 4 * 1024 * 1024):
-                        await f.write(chunk)
-                        blob_size += len(chunk)
-                        md5_hasher.update(chunk)
-                        sha256_hasher.update(chunk)
-                        if sha1_hasher:
-                            sha1_hasher.update(chunk)
-                        if expected_crc32:
-                            crc32_val = binascii.crc32(chunk, crc32_val)
-                        if crc32c_val is not None:
-                            crc32c_val = binascii.crc32(chunk, crc32c_val) & 0xFFFFFFFF
+            async for chunk in iter_request_body(request, 4 * 1024 * 1024):
+                chunks.append(chunk)
 
-            md5_digest = md5_hasher.digest()
-            final_md5 = md5_hasher.hexdigest()
-            final_sha256 = sha256_hasher.hexdigest()
+        data = b"".join(chunks)
+        blob_size = len(data)
+        md5_h.update(data)
+        sha256_h.update(data)
+        final_md5 = md5_h.hexdigest()
+        final_sha256 = sha256_h.hexdigest()
 
-        expected_md5 = request.META.get('HTTP_CONTENT_MD5')
+        # ── Integrity checks ─────────────────────────────────────────────
+        expected_md5 = request.META.get("HTTP_CONTENT_MD5")
         if expected_md5:
-            computed_md5_b64 = base64.b64encode(md5_digest).decode('ascii')
-            if computed_md5_b64 != expected_md5:
+            import base64
+            computed = base64.b64encode(md5_h.digest()).decode("ascii")
+            if computed != expected_md5:
                 raise AWSBadDigest
 
-        expected_content_sha256 = request.META.get('HTTP_X_AMZ_CONTENT_SHA256')
-        if (
-            expected_content_sha256
-            and expected_content_sha256 != 'UNSIGNED-PAYLOAD'
-            and not expected_content_sha256.startswith('STREAMING-')
-            and expected_content_sha256 != final_sha256
-        ):
-            from p2.s3.errors import AWSContentSignatureMismatch
-            raise AWSContentSignatureMismatch
+        # ── Allocate block in volume pool ─────────────────────────────────
+        if blob_size > 0:
+            handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
+            block = BlockCoord(vol_uuid=handle.uuid_hex, offset=offset, length=blob_size)
+            blocks = [block]
+        else:
+            # Zero-byte object: no block allocated
+            handle = None
+            offset = 0
+            blocks = []
 
-        crc32_b64 = None
-        if expected_crc32:
-            crc32_b64 = base64.b64encode(
-                (crc32_val & 0xFFFFFFFF).to_bytes(4, byteorder='big', signed=False)
-            ).decode('ascii')
-
-        sha1_b64 = None
-        if sha1_hasher:
-            sha1_b64 = base64.b64encode(sha1_hasher.digest()).decode('ascii')
-
-        crc32c_b64 = None
-        if expected_crc32c and _rust_cs is not None and crc32c_val is not None:
-            # Convert incremental CRC32C to base64
-            crc32c_b64 = base64.b64encode(
-                (crc32c_val & 0xFFFFFFFF).to_bytes(4, byteorder='big', signed=False)
-            ).decode("ascii")
-
-        _validate_checksum_headers(
-            request,
-            crc32_b64=crc32_b64,
-            crc32c_b64=crc32c_b64,
-            sha256_hex=final_sha256 if expected_sha256 else None,
-            sha1_b64=sha1_b64,
-        )
-
-        # Update and save attributes in LMDB (single put, no read-modify-write).
-        existing_metadata_json = await asyncio.to_thread(engine.get, path)
+        # ── Versioning ────────────────────────────────────────────────────
+        existing_raw = await asyncio.to_thread(engine.get, path)
         existing_size = 0
         existing_counted = False
-        if existing_metadata_json:
-            existing_attr = json.loads(existing_metadata_json)
-            if not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
-                existing_size = int(existing_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+        if existing_raw:
+            ex = json.loads(existing_raw)
+            if not ex.get("is_folder", False):
+                existing_size = int(ex.get("size", 0) or 0)
                 existing_counted = True
 
-        # ── Versioning: archive old content BEFORE overwriting ────────────────
-        # Guard is a single dict-lookup on the already-cached volume object —
-        # zero overhead for non-versioned buckets.
-        bucket_versioning = (volume.tags or {}).get('versioning') == 'true'
+        bucket_versioning = (volume.tags or {}).get("versioning") == "true"
         new_version_id = None
         if bucket_versioning:
             from p2.s3.versioning import archive_version, new_version_id as _new_vid
-            if existing_metadata_json and not existing_attr.get(ATTR_BLOB_IS_FOLDER, False):
-                # Fire-and-forget as a background task: archive is non-blocking
-                # for the response but we still await it to keep ordering.
-                await archive_version(engine, path, existing_metadata_json)
+            if existing_raw and not json.loads(existing_raw).get("is_folder", False):
+                await archive_version(engine, path, existing_raw)
             new_version_id = _new_vid()
-        # ─────────────────────────────────────────────────────────────────────
 
+        # ── Build metadata ────────────────────────────────────────────────
         now_ts = str(now())
-        metadata_payload = {
-            ATTR_BLOB_MIME: client_ct,
-            ATTR_BLOB_SIZE_BYTES: str(blob_size),
-            ATTR_BLOB_IS_FOLDER: False,
-            ATTR_BLOB_STAT_MTIME: now_ts,
-            ATTR_BLOB_STAT_CTIME: now_ts,
-            'blob.p2.io/hash/md5': final_md5,
-            'blob.p2.io/hash/sha256': final_sha256,
-            'internal_path': internal_path,
+        import uuid
+        blob_uuid = uuid.uuid4().hex
+        internal_path = f"/internal-storage/volumes/{volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+
+        metadata_payload: dict[str, Any] = {
+            "size": blob_size,
+            "mime": client_ct,
+            "blocks": [b.to_dict() for b in blocks],
+            "etag": final_md5,
+            "sha256": final_sha256,
+            "mtime": now_ts,
+            "ctime": now_ts,
+            "is_folder": False,
+            "internal_path": internal_path,
         }
         if new_version_id:
-            metadata_payload['blob.p2.io/version_id'] = new_version_id
-
+            metadata_payload["version_id"] = new_version_id
         metadata_json = json.dumps(metadata_payload)
-        from p2.s3.meta_write import write_metadata
-        await write_metadata(engine, path, metadata_json)
+
+        # ── Group-commit: write data + metadata atomically ────────────────
+        if handle is not None:
+            await write_block(handle, offset, data, engine, path, metadata_json)
+        else:
+            await asyncio.to_thread(engine.put, path, metadata_json)
 
         if new_version_id:
             from p2.s3.versioning import _version_lmdb_key
             lmdb_key = _version_lmdb_key(path, new_version_id)
-            await asyncio.to_thread(engine.put_raw, lmdb_key, metadata_json.encode('utf-8'))
+            await asyncio.to_thread(engine.put_raw, lmdb_key, metadata_json.encode("utf-8"))
 
-        # Invalidate metadata cache after write
-        from p2.s3.cache import invalidate_metadata
+        # ── Cache invalidation + stats ────────────────────────────────────
         invalidate_metadata(volume.uuid.hex, path)
-        if existing_metadata_json:
-            from p2.s3.cache import invalidate_volume_global
+        if existing_raw:
             invalidate_volume_global(volume.name)
-        if existing_metadata_json and not bucket_versioning:
-            await cleanup_replaced_payload(existing_attr.get('internal_path'), internal_path)
+
         from p2.core.volume_stats import adjust_volume_stats
         await adjust_volume_stats(
             volume,
@@ -730,90 +508,68 @@ class ObjectView(S3View):
             bytes_delta=blob_size - existing_size,
         )
 
-        # Publish event for background processing (webhooks, EXIF, etc.).
-        # Optional non-blocking mode removes publish latency from the PUT critical path.
+        # ── Publish event ─────────────────────────────────────────────────
         try:
             from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
             event = make_event(
-                blob_uuid=blob_uuid,
+                blob_uuid=uuid.uuid4().hex,
                 volume_uuid=volume.uuid.hex,
-                event_type="blob_post_save"
+                event_type="blob_post_save",
             )
-            event['blob_path'] = path
-            event['mime'] = client_ct
-            event['internal_path'] = internal_path
-            if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
+            event["blob_path"] = path
+            event["mime"] = client_ct
+            event["blocks"] = [b.to_dict() for b in blocks]
+            if getattr(settings, "S3_ASYNC_EVENT_PUBLISH", False):
                 task = asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
-                task.add_done_callback(_log_event_publish_result)
+                task.add_done_callback(lambda t: t.exception() if t.exception() else None)
             else:
                 await publish_event(STREAM_BLOB_POST_SAVE, event)
         except Exception as e:
             LOGGER.warning("Failed to publish blob event: %s", e)
 
         response = HttpResponse(status=200)
-        response['ETag'] = f'"{final_md5}"'
+        response["ETag"] = f'"{final_md5}"'
         if new_version_id:
-            response['x-amz-version-id'] = new_version_id
-        response['X-P2-Put-FastPath'] = '1' if small_put_fast_path else '0'
-        response['X-P2-Put-MetaQueue'] = '1' if getattr(settings, 'S3_METADATA_WRITE_QUEUE_ENABLED', False) else '0'
+            response["x-amz-version-id"] = new_version_id
         return await self._apply_cors(request, response, volume)
 
-    async def delete(self, request, bucket, path):
-        """https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectDELETE.html"""
-        await self._check_presigned(request, bucket, path)
-        volume = await self.get_volume(request.user, bucket, 'delete')
+    # ── DELETE ────────────────────────────────────────────────────────────
 
+    async def delete(self, request, bucket, path):
+        await self._check_presigned(request, bucket, path)
+        volume = await self.get_volume(request.user, bucket, "delete")
         engine = await self.get_engine(volume)
 
-        # ── Versioning: delete specific version or place a delete marker ──────
-        bucket_versioning = (volume.tags or {}).get('versioning') == 'true'
-        requested_version_id = request.GET.get('versionId')
-
-        if bucket_versioning and requested_version_id:
-            # Permanently delete a specific historical version.
+        # Versioning
+        bucket_versioning = (volume.tags or {}).get("versioning") == "true"
+        requested_vid = request.GET.get("versionId")
+        if bucket_versioning and requested_vid:
             from p2.s3.versioning import delete_specific_version
-            found = await delete_specific_version(engine, path, requested_version_id)
-            response = HttpResponse(status=204)
+            found = await delete_specific_version(engine, path, requested_vid)
+            resp = HttpResponse(status=204)
             if found:
-                response['x-amz-version-id'] = requested_version_id
-            return response
-
-        if bucket_versioning and not requested_version_id:
-            # Place a delete marker — do NOT remove the actual data.
+                resp["x-amz-version-id"] = requested_vid
+            return resp
+        if bucket_versioning and not requested_vid:
             from p2.s3.versioning import write_delete_marker
-            from django.utils.timezone import now
             marker_vid = await write_delete_marker(engine, path, str(now()))
-            from p2.s3.cache import invalidate_metadata
             invalidate_metadata(volume.uuid.hex, path)
-            from p2.s3.cache import invalidate_volume_global
             invalidate_volume_global(volume.name)
-            response = HttpResponse(status=204)
-            response['x-amz-version-id'] = marker_vid
-            response['x-amz-delete-marker'] = 'true'
-            return response
-        # ─────────────────────────────────────────────────────────────────────
+            resp = HttpResponse(status=204)
+            resp["x-amz-version-id"] = marker_vid
+            resp["x-amz-delete-marker"] = "true"
+            return resp
 
-        # Non-versioned (original) path — unchanged.
-        metadata_json = await asyncio.to_thread(engine.get, path)
-
-        if metadata_json:
-            import os
-            attributes = json.loads(metadata_json)
-            bytes_delta = 0
-            object_delta = 0
-            if not attributes.get(ATTR_BLOB_IS_FOLDER, False):
-                bytes_delta = -int(attributes.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+        # Logical delete: remove LMDB key only — physical bytes reclaimed by compaction
+        raw = await asyncio.to_thread(engine.get, path)
+        bytes_delta = 0
+        object_delta = 0
+        if raw:
+            meta = json.loads(raw)
+            if not meta.get("is_folder", False):
+                bytes_delta = -int(meta.get("size", 0) or 0)
                 object_delta = -1
-            internal_path = attributes.get('internal_path')
-            if internal_path:
-                from p2.core.storage_path import internal_to_fs
-                fs_path = internal_to_fs(internal_path)
-                try:
-                    os.remove(fs_path)
-                except OSError:
-                    pass
             await asyncio.to_thread(engine.delete, path)
-            from p2.s3.cache import invalidate_metadata, invalidate_volume_global
             invalidate_metadata(volume.uuid.hex, path)
             invalidate_volume_global(volume.name)
             from p2.core.volume_stats import adjust_volume_stats
@@ -821,288 +577,138 @@ class ObjectView(S3View):
 
         return HttpResponse(status=204)
 
-    # -------------------------------------------------------------------------
-    # Range requests
-    # -------------------------------------------------------------------------
+    # ── Copy object ───────────────────────────────────────────────────────
 
-    async def _range_response(self, request, fs_path, content_type, total_size, etag, last_mod, range_header, volume, origin=''):
-        """Handle Range: bytes=X-Y requests (RFC 7233)."""
+    async def _copy_object(self, request, dest_bucket, dest_path, copy_source):
+        import urllib.parse
         try:
-            unit, ranges = range_header.split('=', 1)
-            if unit.strip() != 'bytes':
-                raise ValueError
-            start_str, end_str = ranges.strip().split('-', 1)
-            start = int(start_str) if start_str else None
-            end = int(end_str) if end_str else None
-        except (ValueError, AttributeError):
-            return HttpResponse(status=416)
-
-        if start is None:
-            start = max(0, total_size - end)
-            end = total_size - 1
-        if end is None or end >= total_size:
-            end = total_size - 1
-        if start > end or start >= total_size:
-            response = HttpResponse(status=416)
-            response['Content-Range'] = f'bytes */{total_size}'
-            return response
-
-        length = end - start + 1
-
-        async def _ranged_stream():
-            from p2.s3.fileio import fadvise_random, open_noatime
-            def _read_range():
-                fd = open_noatime(fs_path)
-                try:
-                    fadvise_random(fd)
-                    buf = bytearray(length)
-                    os.preadv(fd, [buf], start)
-                    return buf
-                finally:
-                    os.close(fd)
-            data = await asyncio.to_thread(_read_range)
-            yield data
-
-        response = StreamingHttpResponse(_ranged_stream(), content_type=content_type, status=206)
-        response['Content-Length'] = length
-        response['Content-Range'] = f'bytes {start}-{end}/{total_size}'
-        response['Accept-Ranges'] = 'bytes'
-        if etag:
-            response['ETag'] = etag
-        if last_mod:
-            response['Last-Modified'] = last_mod
-        return await self._apply_cors(request, response, volume)
-
-    # -------------------------------------------------------------------------
-    # Copy object
-    # -------------------------------------------------------------------------
-
-    async def _copy_object(self, request, dest_bucket: str, dest_path: str, copy_source: str):
-        """PUT with x-amz-copy-source — copy blob within or across volumes."""
-        try:
-            import asyncio
-            import json
-            import os
-            import shutil
-            import urllib.parse
-            import uuid
-            from django.utils.timezone import now
-
-            copy_source = urllib.parse.unquote(copy_source).lstrip('/')
-            
-            parts = copy_source.split('/', 1)
+            copy_source = urllib.parse.unquote(copy_source).lstrip("/")
+            parts = copy_source.split("/", 1)
             if len(parts) != 2:
                 return HttpResponse(status=400)
-                
             src_bucket, src_path = parts
-            
-            src_version_id = None
-            if '?' in src_path:
-                src_path_only, query = src_path.split('?', 1)
-                src_q = urllib.parse.parse_qs(query)
-                src_version_id = src_q.get('versionId', [None])[0]
-                src_path = src_path_only
-            
-            src_volume = await self.get_volume(request.user, src_bucket, 'read')
-            dest_volume = await self.get_volume(request.user, dest_bucket, 'write')
-            
+
+            src_volume = await self.get_volume(request.user, src_bucket, "read")
+            dest_volume = await self.get_volume(request.user, dest_bucket, "write")
             src_engine = await self.get_engine(src_volume)
             dest_engine = await self.get_engine(dest_volume)
-            
-            if src_version_id:
-                from p2.s3.versioning import _version_lmdb_key
-                lmdb_key = _version_lmdb_key(src_path, src_version_id)
-                src_json = await asyncio.to_thread(src_engine.get_raw, lmdb_key)
-            else:
-                src_json = await asyncio.to_thread(src_engine.get, src_path)
 
-            if not src_json:
+            src_raw = await asyncio.to_thread(src_engine.get, src_path)
+            if not src_raw:
                 return HttpResponse(status=404)
-                
-            if isinstance(src_json, bytes):
-                src_json = src_json.decode('utf-8')
-                
-            src_attr = json.loads(src_json)
-            src_internal_path = src_attr.get('internal_path')
-            if not src_internal_path:
-                return HttpResponse(status=404)
-                
-            src_fs = src_internal_path.replace('/internal-storage/', '/storage/')
-            
-            blob_uuid = uuid.uuid4().hex
-            from p2.core.storage_path import storage_path, internal_to_fs
-            src_fs = internal_to_fs(src_internal_path)
-            dir_path = storage_path("volumes", dest_volume.uuid.hex, blob_uuid[0:2], blob_uuid[2:4])
-            os.makedirs(dir_path, exist_ok=True)
-            dest_fs = os.path.join(dir_path, blob_uuid)
-            dest_internal_path = f"/internal-storage/volumes/{dest_volume.uuid.hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
-            
-            try:
-                await asyncio.to_thread(shutil.copy2, src_fs, dest_fs)
-            except Exception as e:
-                LOGGER.exception("Failed to copy physical file")
-                return HttpResponse(status=500)
-                
-            dest_attr = src_attr.copy()
-            dest_attr['internal_path'] = dest_internal_path
-            dest_attr[ATTR_BLOB_STAT_MTIME] = str(now())
-            dest_attr[ATTR_BLOB_STAT_CTIME] = str(now())
-            
-            existing_dest_json = await asyncio.to_thread(dest_engine.get, dest_path)
-            existing_dest_size = 0
-            existing_dest_counted = False
-            if existing_dest_json:
-                existing_dest_attr = json.loads(existing_dest_json)
-                if not existing_dest_attr.get(ATTR_BLOB_IS_FOLDER, False):
-                    existing_dest_size = int(existing_dest_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
-                    existing_dest_counted = True
+            src_meta = json.loads(src_raw)
 
-            dest_versioning = (dest_volume.tags or {}).get('versioning') == 'true'
-            new_version_id = None
+            # Copy: reuse the exact same block coords (zero physical copy)
+            dest_meta = dict(src_meta)
+            dest_meta["mtime"] = str(now())
+            dest_meta["ctime"] = str(now())
+
+            existing_raw = await asyncio.to_thread(dest_engine.get, dest_path)
+            existing_size = 0
+            existing_counted = False
+            if existing_raw:
+                ex = json.loads(existing_raw)
+                if not ex.get("is_folder", False):
+                    existing_size = int(ex.get("size", 0) or 0)
+                    existing_counted = True
+
+            dest_versioning = (dest_volume.tags or {}).get("versioning") == "true"
+            new_vid = None
             if dest_versioning:
                 from p2.s3.versioning import archive_version, new_version_id as _new_vid
-                if existing_dest_json:
-                    await archive_version(dest_engine, dest_path, existing_dest_json)
-                new_version_id = _new_vid()
-                dest_attr['blob.p2.io/version_id'] = new_version_id
+                if existing_raw:
+                    await archive_version(dest_engine, dest_path, existing_raw)
+                new_vid = _new_vid()
+                dest_meta["version_id"] = new_vid
             else:
-                dest_attr.pop('blob.p2.io/version_id', None)
+                dest_meta.pop("version_id", None)
 
-            dest_json = json.dumps(dest_attr)
+            dest_json = json.dumps(dest_meta)
             await asyncio.to_thread(dest_engine.put, dest_path, dest_json)
-            if new_version_id:
+            if new_vid:
                 from p2.s3.versioning import _version_lmdb_key
-                lmdb_key = _version_lmdb_key(dest_path, new_version_id)
-                await asyncio.to_thread(dest_engine.put_raw, lmdb_key, dest_json.encode('utf-8'))
+                lk = _version_lmdb_key(dest_path, new_vid)
+                await asyncio.to_thread(dest_engine.put_raw, lk, dest_json.encode("utf-8"))
 
             from p2.core.volume_stats import adjust_volume_stats
             await adjust_volume_stats(
                 dest_volume,
-                object_delta=0 if existing_dest_counted else 1,
-                bytes_delta=int(dest_attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0) - existing_dest_size,
+                object_delta=0 if existing_counted else 1,
+                bytes_delta=int(dest_meta.get("size", 0) or 0) - existing_size,
             )
-            from p2.s3.cache import invalidate_metadata, invalidate_volume_global
             invalidate_metadata(dest_volume.uuid.hex, dest_path)
-            if existing_dest_json:
+            if existing_raw:
                 invalidate_volume_global(dest_volume.name)
-            if existing_dest_json and not dest_versioning:
-                await cleanup_replaced_payload(
-                    existing_dest_attr.get('internal_path'),
-                    dest_internal_path,
-                )
-            
-            root = ElementTree.Element("{%s}CopyObjectResult" % XML_NAMESPACE)
-            ElementTree.SubElement(root, "LastModified").text = dest_attr[ATTR_BLOB_STAT_MTIME]
-            etag = dest_attr.get('blob.p2.io/hash/md5', '')
+
+            root = ElementTree.Element(f"{{{XML_NAMESPACE}}}CopyObjectResult")
+            ElementTree.SubElement(root, "LastModified").text = dest_meta["mtime"]
+            etag = dest_meta.get("etag", "")
             if etag:
                 ElementTree.SubElement(root, "ETag").text = f'"{etag}"'
-                
-            response = XMLResponse(root)
-            if new_version_id:
-                response['x-amz-version-id'] = new_version_id
-            actual_src_vid = src_attr.get('blob.p2.io/version_id') or src_version_id
-            if actual_src_vid:
-                response['x-amz-copy-source-version-id'] = actual_src_vid
-            return response
-        except Exception as e:
-            LOGGER.exception("Unexpected exception in _copy_object")
+            resp = XMLResponse(root)
+            if new_vid:
+                resp["x-amz-version-id"] = new_vid
+            return resp
+        except Exception:
+            LOGGER.exception("_copy_object failed")
             return HttpResponse(status=500)
 
-    # -------------------------------------------------------------------------
-    # Object tagging
-    # -------------------------------------------------------------------------
+    # ── Tagging ───────────────────────────────────────────────────────────
 
-    async def _get_tagging(self, request, bucket: str, path: str):
-        volume = await self.get_volume(request.user, bucket, 'read')
+    async def _get_tagging(self, request, bucket, path):
+        volume = await self.get_volume(request.user, bucket, "read")
         engine = await self.get_engine(volume)
-        meta = engine.get(path)
-        if not meta: return HttpResponse(status=404)
-        
-        import json
-        attr = json.loads(meta)
-        tags = {k[len(TAG_S3_USER_TAG_PREFIX):]: v for k, v in attr.items() if k.startswith(TAG_S3_USER_TAG_PREFIX)}
+        raw = await asyncio.to_thread(engine.get, path)
+        if not raw:
+            return HttpResponse(status=404)
+        meta = json.loads(raw)
+        tags = meta.get("tags", {})
         return XMLResponse(_build_tagging_xml(tags))
 
-    async def _put_tagging(self, request, bucket: str, path: str):
-        volume = await self.get_volume(request.user, bucket, 'write')
+    async def _put_tagging(self, request, bucket, path):
+        volume = await self.get_volume(request.user, bucket, "write")
         engine = await self.get_engine(volume)
-        meta = engine.get(path)
-        if not meta: return HttpResponse(status=404)
-        
-        body = request.body
-        new_tags = _parse_tagging_xml(body)
-        import json
-        attr = json.loads(meta)
-        
-        for k in list(attr.keys()):
-            if k.startswith(TAG_S3_USER_TAG_PREFIX):
-                del attr[k]
-                
-        for k, v in new_tags.items():
-            attr[f"{TAG_S3_USER_TAG_PREFIX}{k}"] = v
-            
-        engine.put(path, json.dumps(attr))
+        raw = await asyncio.to_thread(engine.get, path)
+        if not raw:
+            return HttpResponse(status=404)
+        meta = json.loads(raw)
+        meta["tags"] = _parse_tagging_xml(request.body)
+        await asyncio.to_thread(engine.put, path, json.dumps(meta))
         invalidate_metadata(volume.uuid.hex, path)
-        from p2.s3.cache import invalidate_volume_global
-        invalidate_volume_global(volume.name)
         return HttpResponse(status=200)
 
-    async def _delete_tagging(self, request, bucket: str, path: str):
-        volume = await self.get_volume(request.user, bucket, 'write')
+    async def _get_acl(self, request, bucket, path):
+        volume = await self.get_volume(request.user, bucket, "read")
         engine = await self.get_engine(volume)
-        meta = engine.get(path)
-        if not meta: return HttpResponse(status=204)
-        
-        import json
-        attr = json.loads(meta)
-        changed = False
-        for k in list(attr.keys()):
-            if k.startswith(TAG_S3_USER_TAG_PREFIX):
-                del attr[k]
-                changed = True
-                
-        if changed:
-            engine.put(path, json.dumps(attr))
-            invalidate_metadata(volume.uuid.hex, path)
-            from p2.s3.cache import invalidate_volume_global
-            invalidate_volume_global(volume.name)
-        return HttpResponse(status=204)
-
-    # -------------------------------------------------------------------------
-    # Object ACL
-    # -------------------------------------------------------------------------
-
-    async def _get_acl(self, request, bucket: str, path: str):
-        volume = await self.get_volume(request.user, bucket, 'read')
-        engine = await self.get_engine(volume)
-        meta = engine.get(path)
-        if not meta: return HttpResponse(status=404)
-        
-        import json
-        attr = json.loads(meta)
-        class StubBlob: pass
-        b = StubBlob()
-        b.tags = {TAG_S3_ACL: attr.get(TAG_S3_ACL, 'private')}
-        
+        raw = await asyncio.to_thread(engine.get, path)
+        if not raw:
+            return HttpResponse(status=404)
+        meta = json.loads(raw)
+        acl = meta.get("acl", "private")
         owner_id = str(volume.owner.pk) if volume.owner else "0"
         owner_name = volume.owner.username if volume.owner else "System"
-        return XMLResponse(_build_acl_xml(b, owner_id, owner_name))
+        root = ElementTree.Element(f"{{{XML_NAMESPACE}}}AccessControlPolicy")
+        owner_el = ElementTree.SubElement(root, "Owner")
+        ElementTree.SubElement(owner_el, "ID").text = owner_id
+        ElementTree.SubElement(owner_el, "DisplayName").text = owner_name
+        acl_list = ElementTree.SubElement(root, "AccessControlList")
+        grant = ElementTree.SubElement(acl_list, "Grant")
+        grantee = ElementTree.SubElement(grant, "Grantee")
+        grantee.set("{http://www.w3.org/2001/XMLSchema-instance}type", "CanonicalUser")
+        ElementTree.SubElement(grantee, "ID").text = owner_id
+        ElementTree.SubElement(grant, "Permission").text = "FULL_CONTROL"
+        return XMLResponse(root)
 
-    async def _put_acl(self, request, bucket: str, path: str):
-        volume = await self.get_volume(request.user, bucket, 'write')
+    async def _put_acl(self, request, bucket, path):
+        volume = await self.get_volume(request.user, bucket, "write")
         engine = await self.get_engine(volume)
-        meta = engine.get(path)
-        if not meta: return HttpResponse(status=404)
-        
-        acl_header = request.META.get('HTTP_X_AMZ_ACL')
-        if not acl_header:
-            return HttpResponse(status=200)
-            
-        import json
-        attr = json.loads(meta)
-        attr[TAG_S3_ACL] = acl_header
-        engine.put(path, json.dumps(attr))
-        invalidate_metadata(volume.uuid.hex, path)
-        from p2.s3.cache import invalidate_volume_global
-        invalidate_volume_global(volume.name)
+        raw = await asyncio.to_thread(engine.get, path)
+        if not raw:
+            return HttpResponse(status=404)
+        acl_header = request.META.get("HTTP_X_AMZ_ACL")
+        if acl_header:
+            meta = json.loads(raw)
+            meta["acl"] = acl_header
+            await asyncio.to_thread(engine.put, path, json.dumps(meta))
+            invalidate_metadata(volume.uuid.hex, path)
         return HttpResponse(status=200)

@@ -146,7 +146,7 @@ class BucketView(S3View):
 
         content = ElementTree.Element("Contents")
         ElementTree.SubElement(content, "Key").text = key
-        mtime = attr.get(ATTR_BLOB_STAT_MTIME, '')
+        mtime = attr.get(ATTR_BLOB_STAT_MTIME, attr.get('mtime', ''))
         if mtime:
             from django.utils.dateparse import parse_datetime
             dt = parse_datetime(mtime)
@@ -154,9 +154,9 @@ class BucketView(S3View):
         else:
             iso_mtime = ''
         ElementTree.SubElement(content, "LastModified").text = iso_mtime
-        etag = attr.get('blob.p2.io/hash/md5', '')
+        etag = attr.get('blob.p2.io/hash/md5', attr.get('etag', ''))
         ElementTree.SubElement(content, "ETag").text = f'"{etag}"' if etag else '""'
-        ElementTree.SubElement(content, "Size").text = str(attr.get(ATTR_BLOB_SIZE_BYTES, 0))
+        ElementTree.SubElement(content, "Size").text = str(attr.get(ATTR_BLOB_SIZE_BYTES, attr.get('size', 0)))
         ElementTree.SubElement(content, "StorageClass").text = 'STANDARD'
         return content
 

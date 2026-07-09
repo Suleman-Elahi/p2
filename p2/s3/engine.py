@@ -44,47 +44,8 @@ class LMDbEngine:
         self.db = self.env.open_db(b"objects")
 
     def _get_read_txn(self):
-        """Get a thread-local read transaction for this engine.
-
-        Reusing transactions reduces overhead for repeated reads in the same thread.
-        LMDB read transactions see a snapshot of the database, so this is safe for
-        read-heavy workloads where stale reads are acceptable.
-        """
-        env_id = id(self.env)
-        if not hasattr(_thread_local, 'read_txns'):
-            _thread_local.read_txns = {}
-        
-        txn_info = _thread_local.read_txns.get(env_id)
-        if txn_info is None:
-            txn = self.env.begin(db=self.db)
-            _thread_local.read_txns[env_id] = (txn, txn.id())
-            return txn
-        
-        txn, txn_id = txn_info
-        # Check if transaction is still valid (not closed or aborted)
-        try:
-            if txn.info()['read']:
-                return txn
-        except Exception:
-            pass
-        
-        # Transaction is invalid, create a new one
-        txn = self.env.begin(db=self.db)
-        _thread_local.read_txns[env_id] = (txn, txn.id())
-        return txn
-
-    def _reset_read_txn(self):
-        """Reset the thread-local read transaction for this engine.
-
-        Call this after write operations to ensure subsequent reads see the latest data.
-        """
-        env_id = id(self.env)
-        if hasattr(_thread_local, 'read_txns') and env_id in _thread_local.read_txns:
-            txn, _ = _thread_local.read_txns.pop(env_id)
-            try:
-                txn.abort()
-            except Exception:
-                pass
+        """Deprecated: Return a new read transaction. Used for backward compatibility."""
+        return self.env.begin(db=self.db)
 
     def invalidate_cache(self, path: str) -> None:
         if not self.volume_uuid_hex:
@@ -115,35 +76,21 @@ class LMDbEngine:
         with self.env.begin(write=True, db=self.db) as txn:
             txn.put(path.encode('utf-8'), json_metadata.encode('utf-8'))
         self.invalidate_cache(path)
-        self._reset_read_txn()
 
     def put_raw(self, key: bytes, value: bytes) -> None:
         """Write raw bytes key-value to LMDB."""
         with self.env.begin(write=True, db=self.db) as txn:
             txn.put(key, value)
-        self._reset_read_txn()
 
     def get(self, path: str) -> str | None:
-        """Retrieve key-value from LMDB using thread-local read transaction."""
-        txn = self._get_read_txn()
-        try:
-            val = txn.get(path.encode('utf-8'))
-            return val.decode('utf-8') if val else None
-        except Exception:
-            # Transaction may have been invalidated, reset and retry once
-            self._reset_read_txn()
-            txn = self._get_read_txn()
+        """Retrieve key-value from LMDB using a short-lived transaction."""
+        with self.env.begin(db=self.db) as txn:
             val = txn.get(path.encode('utf-8'))
             return val.decode('utf-8') if val else None
 
     def get_raw(self, key: bytes) -> bytes | None:
-        """Retrieve raw bytes key-value from LMDB using thread-local read transaction."""
-        txn = self._get_read_txn()
-        try:
-            return txn.get(key)
-        except Exception:
-            self._reset_read_txn()
-            txn = self._get_read_txn()
+        """Retrieve raw bytes key-value from LMDB using a short-lived transaction."""
+        with self.env.begin(db=self.db) as txn:
             return txn.get(key)
 
     def delete(self, path: str) -> None:
@@ -151,7 +98,6 @@ class LMDbEngine:
         with self.env.begin(write=True, db=self.db) as txn:
             txn.delete(path.encode('utf-8'))
         self.invalidate_cache(path)
-        self._reset_read_txn()
 
     def list(self, prefix: str, start_after: str | None = None, max_keys: int | None = 1000, use_cache: bool = True) -> list[tuple[str, str]]:
         """Scan keys matching `prefix` in LMDB B-Tree efficiently."""

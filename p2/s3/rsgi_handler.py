@@ -1,11 +1,11 @@
 """
-RSGI S3 Datapath Handler
+RSGI S3 Datapath Handler — Volume Pool Edition
 
 Intercepts S3 GET/PUT single-object requests at the RSGI layer before
 Django is involved. Uses Granian's native proto API:
 
-  GET  → proto.response_file()       zero-copy sendfile from Rust
-  PUT  → async for chunk in proto    body streaming without ASGI overhead
+  GET  → stream from volume pool via pread()
+  PUT  → async body read → volume pool block allocation → group commit
   else → django_fallback(scope, proto)
 
 Falls back to Django for: multipart, ACL, tagging, bucket ops, non-S3.
@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 import urllib.parse
 
 from django.conf import settings
@@ -30,16 +29,14 @@ from p2.s3.cache import (
 from p2.s3.engine import get_engine
 from p2.s3.errors import AWSError
 from p2.s3.fastpath import (
-    cleanup_replaced_payload,
     existing_object_state,
     require_volume_permission,
     update_volume_stats_for_put,
     validate_fast_put_integrity,
 )
-from p2.s3.meta_write import write_metadata
-from p2.core.storage_path import (
-    blob_dir, blob_fs_path, blob_internal_path, ensure_dir, internal_to_fs,
-)
+from p2.s3.volume_pool import BlockCoord, VolumePool
+from p2.s3.volume_writer import write_block
+from p2.s3.volume_reader import read_object, stream_blocks, total_size as _total_size
 from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
 
 try:
@@ -49,17 +46,10 @@ except ImportError:
 
 LOGGER = logging.getLogger(__name__)
 
-ATTR_BLOB_MIME = "blob.p2.io/mime"
-ATTR_BLOB_SIZE_BYTES = "blob.p2.io/size/bytes"
-ATTR_BLOB_IS_FOLDER = "blob.p2.io/is_folder"
-ATTR_BLOB_STAT_MTIME = "blob.p2.io/stat/mtime"
-ATTR_BLOB_STAT_CTIME = "blob.p2.io/stat/ctime"
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _headers_dict(scope):
-    """Return a lowercase str→str dict from RSGI scope headers."""
     return {k.lower(): v for k, v in scope.headers.items()}
 
 
@@ -88,7 +78,7 @@ def _extract_bucket_and_key(scope, hdrs):
     from p2.lib.config import CONFIG
     s3_base = CONFIG.y('s3.base_domain', 's3.example.com')
     if host.endswith('.' + s3_base):
-        bucket = host[: -(len(s3_base) + 1)]
+        bucket = host[:-(len(s3_base) + 1)]
         key = urllib.parse.unquote(scope.path.lstrip('/'))
         return bucket, key
     parts = scope.path.lstrip('/').split('/', 1)
@@ -100,7 +90,6 @@ def _extract_bucket_and_key(scope, hdrs):
 
 
 def _mock_request(scope, hdrs):
-    """Minimal Django-like request for AWSV4Authentication."""
     class _R:
         method = scope.method
         path = scope.path
@@ -149,20 +138,13 @@ async def _error(proto, status, code, volume=None, origin=''):
     headers = [('content-type', 'application/xml')]
     if volume and origin:
         _apply_rsgi_cors(headers, volume, origin, 'GET')
-    proto.response_bytes(
-        status=status,
-        headers=headers,
-        body=xml,
-    )
+    proto.response_bytes(status=status, headers=headers, body=xml)
 
 
 # ── Main RSGI app factory ─────────────────────────────────────────────────────
 
 def S3ProxyRSGIApp(django_fallback):
-    """
-    RSGI application that intercepts S3 GET/PUT single-object traffic.
-    Everything else is forwarded to django_fallback(scope, proto).
-    """
+    """RSGI application that intercepts S3 GET/PUT single-object traffic."""
 
     async def app(scope, proto):
         if scope.proto != 'http':
@@ -211,6 +193,8 @@ def S3ProxyRSGIApp(django_fallback):
         except ObjectDoesNotExist:
             return await _error(proto, 404, 'NoSuchBucket')
 
+        pool = VolumePool.get()
+
         # ── GET ───────────────────────────────────────────────────────────────
         if method == 'GET':
             try:
@@ -227,20 +211,17 @@ def S3ProxyRSGIApp(django_fallback):
                 attributes = json.loads(metadata_json)
                 set_cached_metadata(volume.uuid.hex, key, attributes)
 
-            content_type = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-            total_size = str(attributes.get(ATTR_BLOB_SIZE_BYTES, '0'))
-            etag = attributes.get('blob.p2.io/hash/md5', '')
-            internal_path = attributes.get(
-                'internal_path',
-                f"/internal-storage/volumes/{volume.uuid.hex}/{key}",
-            )
+            # New schema fields
+            content_type = attributes.get('mime', attributes.get('blob.p2.io/mime', 'application/octet-stream'))
+            obj_size = int(attributes.get('size', attributes.get('blob.p2.io/size/bytes', 0)) or 0)
+            etag = attributes.get('etag', attributes.get('blob.p2.io/hash/md5', ''))
 
             from email.utils import format_datetime
-            last_mod_str = attributes.get(ATTR_BLOB_STAT_MTIME, '')
+            from django.utils.dateparse import parse_datetime
+            import datetime as _dt
+            last_mod_str = attributes.get('mtime', attributes.get('blob.p2.io/stat/mtime', ''))
             last_mod = ''
             if last_mod_str:
-                from django.utils.dateparse import parse_datetime
-                import datetime as _dt
                 dt = parse_datetime(last_mod_str)
                 if dt is None:
                     try:
@@ -252,32 +233,30 @@ def S3ProxyRSGIApp(django_fallback):
 
             resp_headers = [
                 ('content-type', content_type),
-                ('content-length', total_size),
+                ('content-length', str(obj_size)),
                 ('accept-ranges', 'bytes'),
             ]
             if etag:
                 resp_headers.append(('etag', f'"{etag}"'))
             if last_mod:
                 resp_headers.append(('last-modified', last_mod))
-
             _apply_rsgi_cors(resp_headers, volume, origin, method)
 
-
-
-            if getattr(settings, 'USE_X_ACCEL_REDIRECT', False) and 'x-real-ip' in hdrs:
-                # Only use X-Accel-Redirect when Nginx is actually proxying.
-                # Nginx sets X-Real-IP; if absent the request is direct and
-                # we must serve the file body ourselves.
-                resp_headers.append(('x-accel-redirect', internal_path))
-                resp_headers.append(('x-p2-accel', '1'))
-                proto.response_empty(status=200, headers=resp_headers)
-                return
-
-            # Zero-copy file send via Granian's Rust sendfile.
-            fs_path = internal_to_fs(internal_path)
-            if not await asyncio.to_thread(lambda: __import__('os').path.exists(fs_path)):
-                return await _error(proto, 404, 'NoSuchKey', volume=volume, origin=origin)
-            proto.response_file(status=200, headers=resp_headers, file=fs_path)
+            blocks_raw = attributes.get('blocks', [])
+            if blocks_raw:
+                # New volume-pool schema: stream from block coords
+                blocks = [BlockCoord.from_dict(b) for b in blocks_raw]
+                if obj_size <= 4 * 1024 * 1024:
+                    data = await read_object(pool, blocks)
+                    proto.response_bytes(status=200, headers=resp_headers, body=data)
+                else:
+                    proto.response_str(status=200, headers=resp_headers)
+                    async for chunk in stream_blocks(pool, blocks):
+                        await proto.send_bytes(chunk)
+                    await proto.close()
+            else:
+                # Legacy schema with internal_path — fall back to Django
+                return await django_fallback(scope, proto)
             return
 
         # ── PUT ───────────────────────────────────────────────────────────────
@@ -289,13 +268,11 @@ def S3ProxyRSGIApp(django_fallback):
                 content_length = int(hdrs.get('content-length', '-1'))
             except ValueError:
                 return await _error(proto, 400, 'InvalidRequest')
-            content_encoding = hdrs.get('content-encoding', '')
-            is_aws_chunked = (
-                'aws-chunked' in content_encoding
-                or 'x-amz-decoded-content-length' in hdrs
-            )
 
-            # Only fast-path contiguous uploads ≤ 64 MB
+            content_encoding = hdrs.get('content-encoding', '')
+            is_aws_chunked = 'aws-chunked' in content_encoding or 'x-amz-decoded-content-length' in hdrs
+
+            # Fast-path: only handle contiguous uploads ≤ 64 MiB
             if content_length > 64 * 1024 * 1024 or content_length == -1:
                 return await django_fallback(scope, proto)
 
@@ -304,7 +281,6 @@ def S3ProxyRSGIApp(django_fallback):
             except AWSError as e:
                 return await _error(proto, e.status, e.code, volume=volume, origin=origin)
 
-            # Read body via RSGI async iteration
             body_chunks = []
             async for chunk in proto:
                 body_chunks.append(chunk)
@@ -314,62 +290,71 @@ def S3ProxyRSGIApp(django_fallback):
                 from p2.s3.utils import decode_aws_chunked
                 body = decode_aws_chunked(body)
 
-            blob_uuid = os.urandom(16).hex()
-            dir_path = blob_dir(volume.uuid.hex, blob_uuid)
-            ensure_dir(dir_path)
-            fs_path = blob_fs_path(volume.uuid.hex, blob_uuid)
-            internal_path = blob_internal_path(volume.uuid.hex, blob_uuid)
-
-            if p2_s3_crypto:
+            import hashlib
+            if p2_s3_crypto and len(body) <= 64 * 1024:
                 final_md5, final_sha256 = await asyncio.to_thread(
-                    p2_s3_crypto.write_and_hash_small, fs_path, body
+                    p2_s3_crypto.write_and_hash_small, '/dev/null', body
                 )
+                # Don't write to file — we'll write to volume pool below
+                final_md5 = hashlib.md5(body).hexdigest()
+                final_sha256 = hashlib.sha256(body).hexdigest()
             else:
-                import hashlib
-                await asyncio.to_thread(lambda: open(fs_path, 'wb').write(body))
                 final_md5 = hashlib.md5(body).hexdigest()
                 final_sha256 = hashlib.sha256(body).hexdigest()
 
             try:
                 validate_fast_put_integrity(hdrs, body, final_md5, final_sha256)
             except AWSError as e:
-                try:
-                    os.remove(fs_path)
-                except OSError:
-                    pass
                 return await _error(proto, e.status, e.code, volume=volume, origin=origin)
 
+            engine = get_engine(volume)
+            existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+
+            # Allocate block in volume pool
+            blob_size = len(body)
             import datetime as _dt
             now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             client_ct = hdrs.get('content-type', 'application/octet-stream')
-            metadata_payload = {
-                ATTR_BLOB_MIME: client_ct,
-                ATTR_BLOB_SIZE_BYTES: str(len(body)),
-                ATTR_BLOB_IS_FOLDER: False,
-                ATTR_BLOB_STAT_MTIME: now_iso,
-                ATTR_BLOB_STAT_CTIME: now_iso,
-                'blob.p2.io/hash/md5': final_md5,
-                'blob.p2.io/hash/sha256': final_sha256,
-                'internal_path': internal_path,
-            }
 
-            engine = get_engine(volume)
-            existing_json, existing_size, existing_counted, old_internal_path = await existing_object_state(engine, key)
-            await write_metadata(engine, key, json.dumps(metadata_payload))
+            if blob_size > 0:
+                handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
+                block = BlockCoord(vol_uuid=handle.uuid_hex, offset=offset, length=blob_size)
+                blocks = [block]
+            else:
+                handle = None
+                offset = 0
+                blocks = []
+
+            metadata_payload = {
+                'size': blob_size,
+                'mime': client_ct,
+                'blocks': [b.to_dict() for b in blocks],
+                'etag': final_md5,
+                'sha256': final_sha256,
+                'mtime': now_iso,
+                'ctime': now_iso,
+                'is_folder': False,
+            }
+            meta_json = json.dumps(metadata_payload)
+
+            if handle is not None:
+                await write_block(handle, offset, body, engine, key, meta_json)
+            else:
+                await asyncio.to_thread(engine.put, key, meta_json)
+
             invalidate_metadata(volume.uuid.hex, key)
             if existing_json:
                 from p2.s3.cache import invalidate_volume_global
                 invalidate_volume_global(bucket)
-            await cleanup_replaced_payload(old_internal_path, internal_path)
-            await update_volume_stats_for_put(volume, existing_counted, existing_size, len(body))
+            await update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
 
             if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
                 event = make_event(
-                    blob_uuid=blob_uuid,
+                    blob_uuid=os.urandom(8).hex(),
                     volume_uuid=volume.uuid.hex,
                     event_type='blob_post_save',
                 )
-                event.update({'blob_path': key, 'mime': client_ct, 'internal_path': internal_path})
+                event.update({'blob_path': key, 'mime': client_ct, 'blocks': [b.to_dict() for b in blocks]})
                 asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
 
             put_headers = [
@@ -378,10 +363,7 @@ def S3ProxyRSGIApp(django_fallback):
                 ('x-p2-put-fastpath', '1'),
             ]
             _apply_rsgi_cors(put_headers, volume, origin, method)
-            proto.response_empty(
-                status=200,
-                headers=put_headers,
-            )
+            proto.response_empty(status=200, headers=put_headers)
             return
 
     return app

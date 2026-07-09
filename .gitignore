@@ -15,6 +15,7 @@ parts/
 sdist/
 var/
 wheels/
+node_modules
 *.egg-info/
 .installed.cfg
 *.egg
@@ -120,8 +121,10 @@ p2/s3/rust_ext/dist/
 
 p2.crt
 p2.key
-static/**
-storage/**
+ui/node_modules/
+.git/
+storage/
+static/
 
 # Generated nginx config (created by scripts/setup.sh from deploy/nginx-host.conf).
 # Contains machine-local absolute paths — do NOT commit.

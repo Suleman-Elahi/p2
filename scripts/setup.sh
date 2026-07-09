@@ -130,6 +130,7 @@ _set_env_value "P2_HOST_STORAGE_ROOT" "$HOST_STORAGE_ROOT"
 _set_env_value "P2_STORAGE__ROOT" "$CONTAINER_STORAGE_ROOT"
 _set_env_value "P2_REDIS__HOST" "redis"
 _set_env_value "P2_REDIS__ARQ_URL" "redis://redis:6379/1"
+_set_env_value "P2_SECURITY__SSL_REDIRECT" "false"
 
 # ── Nginx config ───────────────────────────────────────────────────────────────
 _install_nginx() {

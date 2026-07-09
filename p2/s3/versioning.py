@@ -70,7 +70,7 @@ _DELETE_MARKER_MIME = "application/x-delete-marker"
 
 
 def _is_delete_marker(meta: dict) -> bool:
-    return meta.get("blob.p2.io/delete_marker", False) is True
+    return (meta.get("blob.p2.io/delete_marker", False) is True) or (meta.get("delete_marker", False) is True)
 
 
 def archive_version_sync(engine: "LMDbEngine", s3_key: str, metadata_json: str) -> str:
@@ -79,9 +79,13 @@ def archive_version_sync(engine: "LMDbEngine", s3_key: str, metadata_json: str) 
     Called synchronously inside ``asyncio.to_thread``.  Returns the version_id string.
     """
     meta = json.loads(metadata_json)
-    version_id = meta.get("blob.p2.io/version_id")
+    version_id = meta.get("version_id", meta.get("blob.p2.io/version_id"))
     if not version_id:
         version_id = "null"
+        meta["version_id"] = version_id
+        meta["blob.p2.io/version_id"] = version_id
+    else:
+        meta["version_id"] = version_id
         meta["blob.p2.io/version_id"] = version_id
     archived_json = json.dumps(meta)
 
@@ -99,8 +103,11 @@ def write_delete_marker_sync(engine: "LMDbEngine", s3_key: str, now_ts: str) -> 
 
     marker_meta = {
         "blob.p2.io/delete_marker": True,
+        "delete_marker": True,
         "blob.p2.io/version_id": version_id,
+        "version_id": version_id,
         "blob.p2.io/stat/mtime": now_ts,
+        "mtime": now_ts,
     }
     marker_json = json.dumps(marker_meta).encode()
 
@@ -109,15 +116,16 @@ def write_delete_marker_sync(engine: "LMDbEngine", s3_key: str, now_ts: str) -> 
         live_val = txn.get(s3_key.encode())
         if live_val:
             live_meta = json.loads(live_val)
-            if not live_meta.get("blob.p2.io/delete_marker", False):
-                live_vid = live_meta.get("blob.p2.io/version_id")
+            if not live_meta.get("blob.p2.io/delete_marker", False) and not live_meta.get("delete_marker", False):
+                live_vid = live_meta.get("version_id", live_meta.get("blob.p2.io/version_id"))
                 if not live_vid:
                     live_vid = "null"
+                    live_meta["version_id"] = live_vid
                     live_meta["blob.p2.io/version_id"] = live_vid
-                    txn.put(
-                        _version_lmdb_key(s3_key, live_vid),
-                        json.dumps(live_meta).encode(),
-                    )
+                txn.put(
+                    _version_lmdb_key(s3_key, live_vid),
+                    json.dumps(live_meta).encode(),
+                )
 
         # Write the delete marker as a version entry
         txn.put(marker_key, marker_json)
@@ -163,14 +171,14 @@ def list_versions_sync(
             except Exception:
                 continue
 
-            is_dm = meta.get("blob.p2.io/delete_marker", False) is True
+            is_dm = (meta.get("blob.p2.io/delete_marker", False) is True) or (meta.get("delete_marker", False) is True)
             all_records.append({
                 "key": s3_key,
                 "version_id": version_id,
                 "is_delete_marker": is_dm,
-                "etag": meta.get("blob.p2.io/hash/md5", ""),
-                "size": int(meta.get("blob.p2.io/size/bytes", 0)),
-                "last_modified": meta.get("blob.p2.io/stat/mtime", ""),
+                "etag": meta.get("blob.p2.io/hash/md5", meta.get("etag", "")),
+                "size": int(meta.get("blob.p2.io/size/bytes", meta.get("size", 0)) or 0),
+                "last_modified": meta.get("blob.p2.io/stat/mtime", meta.get("mtime", "")),
                 "storage_class": "STANDARD",
             })
 
@@ -254,7 +262,8 @@ def delete_specific_version_sync(engine: "LMDbEngine", s3_key: str, version_id: 
             def _sort_key(item):
                 try:
                     meta = json.loads(item[1])
-                    return meta.get("blob.p2.io/stat/mtime", ""), item[0]
+                    mtime = meta.get("blob.p2.io/stat/mtime", meta.get("mtime", ""))
+                    return mtime, item[0]
                 except Exception:
                     return "", item[0]
             remaining.sort(key=_sort_key)

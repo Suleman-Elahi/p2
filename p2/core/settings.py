@@ -106,6 +106,16 @@ S3_COMPRESSION_MIN_SIZE = int(CONFIG.y("s3.compression.min_size", default=1024 *
 S3_COMPRESSION_LEVEL = int(CONFIG.y("s3.compression.level", default=6))  # zlib level 1-9
 # Base directory for LMDB volume data. Override with P2_STORAGE__ROOT for local dev.
 STORAGE_ROOT = CONFIG.y("storage.root", default="/storage")
+
+# ---------------------------------------------------------------------------
+# Volume Pool (Fixed-Size Preallocated .bin files)
+# ---------------------------------------------------------------------------
+# Max size of a single volume file before it is sealed (default 10 GiB).
+VOLUME_SIZE_BYTES = int(CONFIG.y("storage.volume_size_bytes", default=10 * 1024 * 1024 * 1024))
+# Number of concurrently active write volumes per process.
+VOLUME_ACTIVE_POOL_SIZE = max(1, int(CONFIG.y("storage.volume_active_pool_size", default=4)))
+# Sealed volume live-byte ratio below which compaction triggers (0.0–1.0).
+VOLUME_COMPACT_THRESHOLD = float(CONFIG.y("storage.volume_compact_threshold", default=0.30))
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 _allowed_hosts = CONFIG.y('allowed_hosts', 'localhost,127.0.0.1,[::1]')
@@ -376,7 +386,8 @@ LOGGING = {
 # ---------------------------------------------------------------------------
 
 if TEST:
-    pass
+    VOLUME_SIZE_BYTES = 10 * 1024 * 1024  # 10 MiB for tests (prevents huge allocations via posix_fallocate)
+    VOLUME_ACTIVE_POOL_SIZE = 2           # 2 active volumes for tests
 
 # ---------------------------------------------------------------------------
 # Debug toolbar (dev only)

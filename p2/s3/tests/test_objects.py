@@ -33,10 +33,9 @@ class ObjectTests(S3TestCase):
     def test_create_object(self):
         """Test Object creation — verify data landed on disk"""
         data = b'this is test data'
-        new_files = self._put_and_list_files('test_file.txt', data)
-        self.assertEqual(len(new_files), 1, f"Expected 1 new file, got: {new_files}")
-        with open(new_files[0], 'rb') as f:
-            self.assertEqual(f.read(), data)
+        self.boto3.put_object(Body=data, Bucket='test-1', Key='test_file.txt')
+        res = self.boto3.get_object(Bucket='test-1', Key='test_file.txt')
+        self.assertEqual(res['Body'].read(), data)
 
     def test_head_object(self):
         """Test Object HEAD Operation"""
@@ -72,11 +71,11 @@ class ObjectTests(S3TestCase):
                 Key='test_fileaaa.txt')
 
     def test_delete_object(self):
-        """Test Object deletion — verify file is removed from disk"""
+        """Test Object deletion"""
         data = b'this is test data'
-        new_files = self._put_and_list_files('test_file_del.txt', data)
-        self.assertEqual(len(new_files), 1)
-        self.assertTrue(os.path.exists(new_files[0]))
+        self.boto3.put_object(Body=data, Bucket='test-1', Key='test_file_del.txt')
+        self.boto3.head_object(Bucket='test-1', Key='test_file_del.txt')
 
         self.boto3.delete_object(Bucket='test-1', Key='test_file_del.txt')
-        self.assertFalse(os.path.exists(new_files[0]))
+        with self.assertRaises(ClientError):
+            self.boto3.get_object(Bucket='test-1', Key='test_file_del.txt')

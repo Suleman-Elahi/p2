@@ -22,24 +22,22 @@ class MultipartTests(S3TestCase):
             use_threads=False,
         )
         expected_size = 1024 * 1024  # 1 MB
-        from p2.core.storage_path import storage_path
-        storage_dir = storage_path("volumes", self.volume.uuid.hex)
+        with NamedTemporaryFile(delete=False) as file:
+            file_name = file.name
+            try:
+                data = os.urandom(expected_size)
+                file.write(data)
+                file.close()
 
-        before_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
+                self.boto3.upload_file(
+                    file_name, 'test-1', 'test-file-1', Config=config
+                )
 
-        with NamedTemporaryFile() as file:
-            file.write(os.urandom(expected_size))
-            file.seek(0)
-            self.boto3.upload_file(
-                file.name, 'test-1', 'test-file-1', Config=config
-            )
-
-        after_files = set(glob.glob(f"{storage_dir}/**/*", recursive=True))
-        new_files = [f for f in after_files - before_files if os.path.isfile(f) and '.lmdb' not in f]
-
-        # The merged result file must exist
-        self.assertTrue(len(new_files) >= 1, f"Expected at least 1 new file, got: {new_files}")
-
-        # Find the biggest new file — that is the merged output
-        merged_file = max(new_files, key=os.path.getsize)
-        self.assertEqual(os.path.getsize(merged_file), expected_size)
+                # Get the object back and assert size and content match
+                res = self.boto3.get_object(Bucket='test-1', Key='test-file-1')
+                retrieved_data = res['Body'].read()
+                self.assertEqual(len(retrieved_data), expected_size)
+                self.assertEqual(retrieved_data, data)
+            finally:
+                if os.path.exists(file_name):
+                    os.unlink(file_name)

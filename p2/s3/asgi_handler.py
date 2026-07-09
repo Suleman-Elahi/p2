@@ -21,21 +21,14 @@ from p2.s3.cache import get_cached_metadata, set_cached_metadata, invalidate_met
 from p2.s3.engine import get_engine
 from p2.s3.errors import AWSError
 from p2.s3.fastpath import (
-    cleanup_replaced_payload,
     existing_object_state,
     require_volume_permission,
     update_volume_stats_for_put,
     validate_fast_put_integrity,
 )
-from p2.s3.fileio import (
-    fadvise_random,
-    fadvise_sequential,
-    mmap_read,
-    open_noatime,
-    read_file_optimized,
-)
-from p2.s3.meta_write import write_metadata
-from p2.core.storage_path import blob_dir, blob_fs_path, blob_internal_path, ensure_dir, internal_to_fs
+from p2.s3.volume_pool import BlockCoord, VolumePool
+from p2.s3.volume_writer import write_block
+from p2.s3.volume_reader import read_object, stream_blocks
 from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
 
 try:
@@ -237,6 +230,7 @@ def S3ProxyASGIApp(django_app):
         vol_hex = volume.uuid.hex
         origin = hdrs.get('origin', '')
 
+
         # ── GET ───────────────────────────────────────────────────────────
         if method == 'GET':
             try:
@@ -253,193 +247,66 @@ def S3ProxyASGIApp(django_app):
                 attributes = json.loads(raw)
                 set_cached_metadata(vol_hex, key, attributes)
 
-            ct = attributes.get(ATTR_BLOB_MIME, 'application/octet-stream')
-            size = attributes.get(ATTR_BLOB_SIZE_BYTES, '0')
-            etag = attributes.get('blob.p2.io/hash/md5', '')
-            ipath = attributes.get('internal_path', f"/internal-storage/volumes/{vol_hex}/{key}")
+            blocks_raw = attributes.get('blocks', [])
+            if not blocks_raw:
+                # Legacy object with internal_path — fall back to Django
+                return await django_app(scope, receive, send)
 
-            # Check if object is compressed
-            from p2.s3.compression import is_compressed, decompress
-            object_compressed = is_compressed(attributes)
-            # Use original size for content-length if compressed
-            if object_compressed:
-                original_size = attributes.get('blob.p2.io/original_size', size)
-                size = original_size
+            ct = attributes.get('mime', attributes.get('blob.p2.io/mime', 'application/octet-stream'))
+            size = int(attributes.get('size', attributes.get('blob.p2.io/size/bytes', 0)) or 0)
+            etag = attributes.get('etag', attributes.get('blob.p2.io/hash/md5', ''))
 
             from email.utils import format_datetime
-            lm = b""
-            lm_str = attributes.get(ATTR_BLOB_STAT_MTIME, '')
+            lm = b''
+            lm_str = attributes.get('mtime', attributes.get('blob.p2.io/stat/mtime', ''))
             if lm_str:
                 dt = _parse_stored_timestamp(lm_str)
                 if dt:
                     lm = format_datetime(dt, usegmt=True).encode('ascii')
 
-            # Skip X-Accel-Redirect for compressed objects (nginx can't decompress)
-            if use_accel and 'x-real-ip' in hdrs and not object_compressed:
+            blocks = [BlockCoord.from_dict(b) for b in blocks_raw]
+            pool = VolumePool.get()
+
+            if use_accel and 'x-real-ip' in hdrs:
+                internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{vol_hex}/{key}")
                 resp_h = [
-                    (b'x-accel-redirect', ipath.encode('utf-8')),
+                    (b'x-accel-redirect', internal_path.encode('utf-8')),
                     (b'x-p2-accel', b'1'),
                     (b'content-type', ct.encode('utf-8')),
-                    (b'content-length', b'0'),
                     (b'accept-ranges', b'bytes'),
                 ]
-                if etag: resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
-                if lm: resp_h.append((b'last-modified', lm))
-                
+                if etag:
+                    resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
+                if lm:
+                    resp_h.append((b'last-modified', lm))
                 _apply_asgi_cors(resp_h, volume, origin, method)
-                
                 await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
-                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})
+                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY, 'more_body': False})
                 return
 
-            # Range request support (RFC 7233)
-            # Range requests are not supported for compressed objects
-            range_header = hdrs.get('range')
-            if range_header and int(size) > 0 and not object_compressed:
-                try:
-                    unit, ranges = range_header.split('=', 1)
-                    if unit.strip() != 'bytes':
-                        raise ValueError
-                    start_str, end_str = ranges.strip().split('-', 1)
-                    start = int(start_str) if start_str else None
-                    end = int(end_str) if end_str else None
-                except (ValueError, AttributeError):
-                    await _s3_error(send, 416, 'InvalidRange', volume=volume, origin=origin)
-                    return
-
-                total_size = int(size)
-                if start is None:
-                    start = max(0, total_size - end)
-                    end = total_size - 1
-                if end is None or end >= total_size:
-                    end = total_size - 1
-                if start > end or start >= total_size:
-                    resp_h = [
-                        (b'content-range', f'bytes */{total_size}'.encode('ascii')),
-                    ]
-                    await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 416, 'headers': resp_h})
-                    await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})
-                    return
-
-                length = end - start + 1
-                fs_path = internal_to_fs(ipath)
-                resp_h = [
-                    (b'content-type', ct.encode('utf-8')),
-                    (b'content-length', str(length).encode('ascii')),
-                    (b'content-range', f'bytes {start}-{end}/{total_size}'.encode('ascii')),
-                    (b'accept-ranges', b'bytes'),
-                ]
-                if etag: resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
-                if lm: resp_h.append((b'last-modified', lm))
-                _apply_asgi_cors(resp_h, volume, origin, method)
-
-                try:
-                    await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 206, 'headers': resp_h})
-                    # Optimized range read: fadvise(RANDOM) + pread for zero-seek overhead.
-                    # Use memoryview to avoid copying bytearray into bytes.
-                    def _read_range():
-                        fd = open_noatime(fs_path)
-                        try:
-                            fadvise_random(fd)
-                            buf = bytearray(length)
-                            os.preadv(fd, [buf], start)
-                            return buf
-                        finally:
-                            os.close(fd)
-                    data = await asyncio.to_thread(_read_range)
-                    await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': data, 'more_body': False})
-                except OSError:
-                    return await _s3_error(send, 404, 'NoSuchKey', volume=volume, origin=origin)
-                return
-
-            # Full body stream — optimized with fadvise + read_file_optimized
-            fs_path = internal_to_fs(ipath)
             resp_h = [
                 (b'content-type', ct.encode('utf-8')),
                 (b'content-length', str(size).encode('ascii')),
                 (b'accept-ranges', b'bytes'),
             ]
-            if etag: resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
-            if lm: resp_h.append((b'last-modified', lm))
-            
+            if etag:
+                resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
+            if lm:
+                resp_h.append((b'last-modified', lm))
             _apply_asgi_cors(resp_h, volume, origin, method)
-            
-            total_size = int(size)
-            SMALL_FILE_MAX = 256 * 1024  # mmap for files <= 256KB
-            MEDIUM_FILE_MAX = 4 * 1024 * 1024  # pread for files <= 4MB
-            STREAM_CHUNK = 4 * 1024 * 1024
 
-            try:
-                await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
-
-                if total_size <= SMALL_FILE_MAX:
-                    # Small file: mmap read (zero syscall, zero copy)
-                    data = await asyncio.to_thread(mmap_read, fs_path)
-                    if object_compressed:
-                        data = decompress(data, True)
-                    await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': data, 'more_body': False})
-                elif total_size <= MEDIUM_FILE_MAX:
-                    # Medium file: pread with fadvise(RANDOM) — no seek overhead
-                    def _read_medium():
-                        fd = open_noatime(fs_path)
-                        try:
-                            fadvise_random(fd)
-                            buf = bytearray(total_size)
-                            os.preadv(fd, [buf], 0)
-                            return buf
-                        finally:
-                            os.close(fd)
-                    data = await asyncio.to_thread(_read_medium)
-                    if object_compressed:
-                        data = decompress(data, True)
-                    await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': data, 'more_body': False})
-                else:
-                    if object_compressed:
-                        # Compressed large file: read all, decompress, send
-                        def _read_compressed_large():
-                            fd = open_noatime(fs_path)
-                            try:
-                                fadvise_sequential(fd)
-                                data = os.read(fd, total_size)
-                                return data
-                            finally:
-                                os.close(fd)
-                        data = await asyncio.to_thread(_read_compressed_large)
-                        data = decompress(data, True)
-                        await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': data, 'more_body': False})
-                    else:
-                        # Large file: streaming with fadvise(SEQUENTIAL) + buffered read
-                        def _stream_large():
-                            fd = open_noatime(fs_path)
-                            try:
-                                fadvise_sequential(fd)
-                                return fd
-                            except Exception:
-                                os.close(fd)
-                                raise
-
-                        fd = await asyncio.to_thread(_stream_large)
-                        try:
-                            remaining = total_size
-                            while remaining > 0:
-                                chunk_size = min(remaining, STREAM_CHUNK)
-                                chunk = await asyncio.to_thread(os.read, fd, chunk_size)
-                                if not chunk:
-                                    break
-                                remaining -= len(chunk)
-                                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': chunk, 'more_body': remaining > 0})
-                        finally:
-                            os.close(fd)
-
-            except OSError:
-                return await _s3_error(send, 404, 'NoSuchKey', volume=volume, origin=origin)
+            await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
+            if size <= 4 * 1024 * 1024:
+                data = await read_object(pool, blocks)
+                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': data, 'more_body': False})
+            else:
+                async for chunk in stream_blocks(pool, blocks):
+                    await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': chunk, 'more_body': True})
+                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY, 'more_body': False})
             return
 
         # ── PUT ───────────────────────────────────────────────────────────
         if method == 'PUT':
-            # If versioning is enabled, fall through to Django view which has
-            # full version-aware archive/metadata logic. This keeps the fast
-            # path simple for the common non-versioned case.
             if (volume.tags or {}).get('versioning') == 'true':
                 return await django_app(scope, receive, send)
 
@@ -461,129 +328,91 @@ def S3ProxyASGIApp(django_app):
             if content_length > 67108864 or content_length == -1:
                 return await django_app(scope, receive, send)
 
-            # Stream body directly to file while hashing — avoids buffering
-            # the entire payload in memory. Peak memory = 1 chunk (4MB) instead
-            # of full content_length (up to 64MB).
-            blob_uuid = os.urandom(16).hex()
-            dir_path = blob_dir(vol_hex, blob_uuid)
-            ensure_dir(dir_path)
-            fs_path = blob_fs_path(vol_hex, blob_uuid)
-            ipath = blob_internal_path(vol_hex, blob_uuid)
-
             import hashlib
-            CHUNK_SIZE = 4 * 1024 * 1024  # 4MB streaming chunks
+            import datetime as _dt
+
+            pool = VolumePool.get()
+            chunks_body = []
+            blob_size = 0
             md5_hasher = hashlib.md5()
             sha256_hasher = hashlib.sha256()
-            blob_size = 0
 
             try:
-                fd = os.open(fs_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-                try:
-                    while True:
-                        message = await receive()
-                        mtype = message['type']
-                        if mtype == 'http.request':
-                            chunk = message.get('body', _EMPTY_BODY)
-                            if chunk:
-                                if is_aws_chunked:
-                                    from p2.s3.utils import decode_aws_chunked
-                                    chunk = decode_aws_chunked(chunk)
-                                os.write(fd, chunk)
-                                md5_hasher.update(chunk)
-                                sha256_hasher.update(chunk)
-                                blob_size += len(chunk)
-                            if not message.get('more_body', False):
-                                break
-                        elif mtype == 'http.disconnect':
-                            os.close(fd)
-                            try:
-                                os.remove(fs_path)
-                            except OSError:
-                                pass
-                            return
-                finally:
-                    os.close(fd)
-            except OSError as e:
-                try:
-                    os.remove(fs_path)
-                except OSError:
-                    pass
+                while True:
+                    message = await receive()
+                    mtype = message['type']
+                    if mtype == 'http.request':
+                        chunk = message.get('body', _EMPTY_BODY)
+                        if chunk:
+                            if is_aws_chunked:
+                                from p2.s3.utils import decode_aws_chunked
+                                chunk = decode_aws_chunked(chunk)
+                            chunks_body.append(chunk)
+                            md5_hasher.update(chunk)
+                            sha256_hasher.update(chunk)
+                            blob_size += len(chunk)
+                        if not message.get('more_body', False):
+                            break
+                    elif mtype == 'http.disconnect':
+                        return
+            except Exception:
                 return await _s3_error(send, 500, 'InternalError')
 
+            body = b''.join(chunks_body)
             final_md5 = md5_hasher.hexdigest()
             final_sha256 = sha256_hasher.hexdigest()
 
-            # Validate integrity headers against computed hashes
             try:
                 validate_fast_put_integrity(hdrs, b'', final_md5, final_sha256, blob_size=blob_size)
             except AWSError as e:
-                try:
-                    os.remove(fs_path)
-                except OSError:
-                    pass
                 return await _s3_error(send, e.status, e.code, volume=volume, origin=origin)
 
-            # Metadata — use stdlib datetime for ISO 8601 without Django timezone overhead.
-            import datetime as _dt
             now_iso = _dt.datetime.now(_dt.UTC).isoformat()
-
-            # Check if object should be compressed
-            from p2.s3.compression import should_compress, compress, get_compression_metadata
-            compression_meta = {}
-            if should_compress(blob_size):
-                # Read the file back, compress, and overwrite
-                def _compress_blob():
-                    try:
-                        with open(fs_path, 'rb') as f:
-                            data = f.read()
-                        compressed, was_compressed = compress(data)
-                        if was_compressed:
-                            with open(fs_path, 'wb') as f:
-                                f.write(compressed)
-                            return get_compression_metadata(blob_size, len(compressed))
-                    except Exception:
-                        pass
-                    return {}
-                compression_meta = await asyncio.to_thread(_compress_blob)
-                if compression_meta:
-                    # Update blob_size to compressed size for stats
-                    blob_size = compression_meta.get('blob.p2.io/compressed_size', blob_size)
-
-            metadata_json = json.dumps({
-                ATTR_BLOB_MIME: client_ct,
-                ATTR_BLOB_SIZE_BYTES: str(blob_size),
-                ATTR_BLOB_IS_FOLDER: False,
-                ATTR_BLOB_STAT_MTIME: now_iso,
-                ATTR_BLOB_STAT_CTIME: now_iso,
-                'blob.p2.io/hash/md5': final_md5,
-                'blob.p2.io/hash/sha256': final_sha256,
-                'internal_path': ipath,
-                **compression_meta,
-            })
-
             engine = get_engine(volume)
-            existing_json, existing_size, existing_counted, old_internal_path = await existing_object_state(engine, key)
-            try:
-                await write_metadata(engine, key, metadata_json)
-            except Exception:
-                try:
-                    os.remove(fs_path)
-                except OSError:
-                    pass
-                LOGGER.error("PUT metadata write failed for %s/%s, cleaned up blob", bucket, key)
-                return await _s3_error(send, 500, 'InternalError')
+            existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+
+            if blob_size > 0:
+                handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
+                block = BlockCoord(vol_uuid=handle.uuid_hex, offset=offset, length=blob_size)
+                blocks = [block]
+            else:
+                handle = None
+                offset = 0
+                blocks = []
+
+            import uuid
+            blob_uuid = uuid.uuid4().hex
+            internal_path = f"/internal-storage/volumes/{vol_hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
+
+            meta_payload = {
+                'size': blob_size,
+                'mime': client_ct,
+                'blocks': [b.to_dict() for b in blocks],
+                'etag': final_md5,
+                'sha256': final_sha256,
+                'mtime': now_iso,
+                'ctime': now_iso,
+                'is_folder': False,
+                'internal_path': internal_path,
+            }
+            meta_json = json.dumps(meta_payload)
+
+            if handle is not None:
+                await write_block(handle, offset, body, engine, key, meta_json)
+            else:
+                await asyncio.to_thread(engine.put, key, meta_json)
+
             invalidate_metadata(vol_hex, key)
             if existing_json:
                 from p2.s3.cache import invalidate_volume_global
                 invalidate_volume_global(bucket)
-            await cleanup_replaced_payload(old_internal_path, ipath)
             await update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
 
             if async_events:
-                event = make_event(blob_uuid=blob_uuid, volume_uuid=vol_hex, event_type='blob_post_save')
+                event = make_event(blob_uuid=os.urandom(8).hex(), volume_uuid=vol_hex, event_type='blob_post_save')
                 event['blob_path'] = key
                 event['mime'] = client_ct
-                event['internal_path'] = ipath
+                event['blocks'] = [b.to_dict() for b in blocks]
                 asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
 
             resp_h = [
@@ -592,11 +421,7 @@ def S3ProxyASGIApp(django_app):
                 (b'x-p2-put-fastpath', b'1'),
             ]
             _apply_asgi_cors(resp_h, volume, origin, method)
-            await send({
-                'type': _PUT_RESPONSE_START_TYPE,
-                'status': 200,
-                'headers': resp_h
-            })
+            await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
             await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})
             return
 
