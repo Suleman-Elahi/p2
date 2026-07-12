@@ -11,10 +11,15 @@ Django is involved. Uses Granian's native proto API:
 Falls back to Django for: multipart, ACL, tagging, bucket ops, non-S3.
 """
 import asyncio
+import datetime as _dt
+import hashlib
 import json
 import logging
 import os
 import urllib.parse
+import uuid
+from email.utils import format_datetime
+from django.utils.dateparse import parse_datetime
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
@@ -45,6 +50,16 @@ except ImportError:
     p2_s3_crypto = None
 
 LOGGER = logging.getLogger(__name__)
+
+# Strong references to fire-and-forget background tasks. asyncio only holds a
+# weak reference to tasks, so without this they can be GC'd before completion.
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -167,7 +182,7 @@ def S3ProxyRSGIApp(django_fallback):
         if not bucket or not key:
             return await django_fallback(scope, proto)
 
-        if method not in ('GET', 'PUT'):
+        if method not in ('GET', 'PUT', 'DELETE'):
             return await django_fallback(scope, proto)
 
         # ── Auth ──────────────────────────────────────────────────────────────
@@ -205,7 +220,9 @@ def S3ProxyRSGIApp(django_fallback):
             attributes = get_cached_metadata(volume.uuid.hex, key)
             if attributes is None:
                 engine = get_engine(volume)
-                metadata_json = await asyncio.to_thread(engine.get, key)
+                # LMDB get is a lock-free mmap read (~1-5us); running it inline
+                # is cheaper than an asyncio.to_thread dispatch (~30-100us).
+                metadata_json = engine.get(key)
                 if not metadata_json:
                     return await _error(proto, 404, 'NoSuchKey', volume=volume, origin=origin)
                 attributes = json.loads(metadata_json)
@@ -216,9 +233,6 @@ def S3ProxyRSGIApp(django_fallback):
             obj_size = int(attributes.get('size', attributes.get('blob.p2.io/size/bytes', 0)) or 0)
             etag = attributes.get('etag', attributes.get('blob.p2.io/hash/md5', ''))
 
-            from email.utils import format_datetime
-            from django.utils.dateparse import parse_datetime
-            import datetime as _dt
             last_mod_str = attributes.get('mtime', attributes.get('blob.p2.io/stat/mtime', ''))
             last_mod = ''
             if last_mod_str:
@@ -261,7 +275,8 @@ def S3ProxyRSGIApp(django_fallback):
 
         # ── PUT ───────────────────────────────────────────────────────────────
         if method == 'PUT':
-            if (volume.tags or {}).get('versioning') == 'true':
+            is_versioned = (volume.tags or {}).get('versioning') == 'true'
+            if is_versioned:
                 return await django_fallback(scope, proto)
 
             try:
@@ -290,17 +305,11 @@ def S3ProxyRSGIApp(django_fallback):
                 from p2.s3.utils import decode_aws_chunked
                 body = decode_aws_chunked(body)
 
-            import hashlib
-            if p2_s3_crypto and len(body) <= 64 * 1024:
-                final_md5, final_sha256 = await asyncio.to_thread(
-                    p2_s3_crypto.write_and_hash_small, '/dev/null', body
-                )
-                # Don't write to file — we'll write to volume pool below
-                final_md5 = hashlib.md5(body).hexdigest()
-                final_sha256 = hashlib.sha256(body).hexdigest()
-            else:
-                final_md5 = hashlib.md5(body).hexdigest()
-                final_sha256 = hashlib.sha256(body).hexdigest()
+            # Compute hashes with Python hashlib (fast enough for small bodies).
+            # Previously called p2_s3_crypto.write_and_hash_small('/dev/null', body)
+            # which wrote to /dev/null (wasted I/O) then discarded the result.
+            final_md5 = hashlib.md5(body).hexdigest()
+            final_sha256 = hashlib.sha256(body).hexdigest()
 
             try:
                 validate_fast_put_integrity(hdrs, body, final_md5, final_sha256)
@@ -308,11 +317,14 @@ def S3ProxyRSGIApp(django_fallback):
                 return await _error(proto, e.status, e.code, volume=volume, origin=origin)
 
             engine = get_engine(volume)
-            existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+            # Skip LMDB read for non-versioned buckets (saves 1 LMDB txn per PUT).
+            if is_versioned:
+                existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+            else:
+                existing_json, existing_size, existing_counted = None, 0, False
 
             # Allocate block in volume pool
             blob_size = len(body)
-            import datetime as _dt
             now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             client_ct = hdrs.get('content-type', 'application/octet-stream')
 
@@ -346,7 +358,12 @@ def S3ProxyRSGIApp(django_fallback):
             if existing_json:
                 from p2.s3.cache import invalidate_volume_global
                 invalidate_volume_global(bucket)
-            await update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
+            # Volume stats are approximate and flushed to the DB every ~2s, so
+            # don't gate the HTTP 200 on the Redis round-trip — fire it in the
+            # background. adjust_volume_stats swallows its own exceptions.
+            _spawn_bg(
+                update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
+            )
 
             if getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False):
                 event = make_event(
@@ -355,7 +372,7 @@ def S3ProxyRSGIApp(django_fallback):
                     event_type='blob_post_save',
                 )
                 event.update({'blob_path': key, 'mime': client_ct, 'blocks': [b.to_dict() for b in blocks]})
-                asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
+                _spawn_bg(publish_event(STREAM_BLOB_POST_SAVE, event))
 
             put_headers = [
                 ('etag', f'"{final_md5}"'),
@@ -364,6 +381,20 @@ def S3ProxyRSGIApp(django_fallback):
             ]
             _apply_rsgi_cors(put_headers, volume, origin, method)
             proto.response_empty(status=200, headers=put_headers)
+            return
+
+        # ── DELETE ───────────────────────────────────────────────────────────
+        if method == 'DELETE':
+            try:
+                await require_volume_permission(user, volume, 'delete', bucket, key)
+            except AWSError as e:
+                return await _error(proto, e.status, e.code, volume=volume, origin=origin)
+
+            engine = get_engine(volume)
+            await asyncio.to_thread(engine.delete, key)
+            invalidate_metadata(volume.uuid.hex, key)
+
+            proto.response_empty(status=204, headers=[('content-length', '0')])
             return
 
     return app

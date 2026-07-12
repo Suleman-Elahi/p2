@@ -13,7 +13,8 @@ workers we use Django's Redis cache as a shared generation counter:
     invalidate_volume_global(name)  — bumps a Redis counter
     get_cached_volume(name)         — checks local gen vs Redis gen, evicts on mismatch
 
-One Redis GET per volume-lookup adds <1ms but guarantees instant propagation.
+Generation checks are throttled to once per second per key to avoid per-request
+Redis roundtrips that would kill throughput.
 """
 import time
 from collections import OrderedDict
@@ -52,6 +53,14 @@ _PREFIX_MAX_SIZE = 1000  # Max cached prefix results
 
 # ─── Cross-worker generation counter (Redis-backed) ─────────────────────────
 
+# Throttle Redis generation checks to once per second per key.
+# This eliminates the per-request Redis roundtrip while still propagating
+# config changes within ~1 second.
+_GEN_CHECK_INTERVAL = 1.0  # seconds between Redis checks
+_volume_gen_cache: dict[str, Tuple[int, float]] = {}   # bucket_name -> (gen, last_check_ts)
+_apikey_gen_cache: dict[str, Tuple[int, float]] = {}   # access_key -> (gen, last_check_ts)
+
+
 def _redis_gen_key(bucket_name: str) -> str:
     """Redis key for the volume generation counter."""
     return f"p2:vol_gen:{bucket_name}"
@@ -63,13 +72,22 @@ def _redis_apikey_gen_key(access_key: str) -> str:
 
 
 def _get_redis_generation(bucket_name: str) -> int:
-    """Read the current generation counter from Redis. Returns 0 on miss/error."""
+    """Read the current generation counter from Redis. Returns 0 on miss/error.
+
+    Throttled: only hits Redis once per second per key.
+    """
+    now = time.monotonic()
+    cached = _volume_gen_cache.get(bucket_name)
+    if cached and (now - cached[1]) < _GEN_CHECK_INTERVAL:
+        return cached[0]
     try:
         from django.core.cache import cache
         val = cache.get(_redis_gen_key(bucket_name))
-        return int(val) if val is not None else 0
+        gen = int(val) if val is not None else 0
     except Exception:
-        return 0
+        gen = 0
+    _volume_gen_cache[bucket_name] = (gen, now)
+    return gen
 
 
 def _bump_redis_generation(bucket_name: str) -> int:
@@ -84,18 +102,27 @@ def _bump_redis_generation(bucket_name: str) -> int:
             # Key doesn't exist yet — initialize it
             cache.set(key, 1, timeout=None)
             new_val = 1
+        # Update local cache immediately so this worker sees the bump
+        _volume_gen_cache[bucket_name] = (new_val, time.monotonic())
         return new_val
     except Exception:
         return 0
 
 
 def _get_redis_apikey_generation(access_key: str) -> int:
+    """Throttled API key generation check — once per second per key."""
+    now = time.monotonic()
+    cached = _apikey_gen_cache.get(access_key)
+    if cached and (now - cached[1]) < _GEN_CHECK_INTERVAL:
+        return cached[0]
     try:
         from django.core.cache import cache
         val = cache.get(_redis_apikey_gen_key(access_key))
-        return int(val) if val is not None else 0
+        gen = int(val) if val is not None else 0
     except Exception:
-        return 0
+        gen = 0
+    _apikey_gen_cache[access_key] = (gen, now)
+    return gen
 
 
 def _bump_redis_apikey_generation(access_key: str) -> int:
@@ -103,10 +130,12 @@ def _bump_redis_apikey_generation(access_key: str) -> int:
         from django.core.cache import cache
         key = _redis_apikey_gen_key(access_key)
         try:
-            return cache.incr(key)
+            new_val = cache.incr(key)
         except ValueError:
             cache.set(key, 1, timeout=None)
-            return 1
+            new_val = 1
+        _apikey_gen_cache[access_key] = (new_val, time.monotonic())
+        return new_val
     except Exception:
         return 0
 

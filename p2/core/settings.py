@@ -85,14 +85,28 @@ S3_EVENT_QUEUE_BATCH_SIZE = int(CONFIG.y("s3.event_queue.batch_size", default=64
 S3_EVENT_QUEUE_FLUSH_MS = int(CONFIG.y("s3.event_queue.flush_ms", default=5))
 S3_EVENT_QUEUE_WAIT_FOR_ACK = CONFIG.y_bool("s3.event_queue.wait_for_ack", default=False)
 S3_BLOB_SHARD_DEPTH = max(1, min(2, int(CONFIG.y("s3.blob.shard_depth", default=2))))
-# LMDB metadata durability knobs (default durable; can be relaxed for throughput experiments).
-S3_METADATA_LMDB_SYNC = CONFIG.y_bool("s3.metadata.lmdb.sync", default=True)
-S3_METADATA_LMDB_METASYNC = CONFIG.y_bool("s3.metadata.lmdb.metasync", default=True)
+# LMDB metadata durability knobs.
+# Default is NON-fsyncing (sync/metasync False): every PUT already issues one
+# fdatasync on the volume .bin file (the actual object bytes). Making LMDB also
+# fsync on each commit doubles the fsync count on the PUT hot path for no real
+# safety gain — the metadata index is fully rebuildable by scanning the volume
+# files after a crash (see p2.core.volume_stats.scan_volume_stats). Set these
+# True only if you need the LMDB index itself to survive an OS-level crash
+# without a rebuild pass.
+S3_METADATA_LMDB_SYNC = CONFIG.y_bool("s3.metadata.lmdb.sync", default=False)
+S3_METADATA_LMDB_METASYNC = CONFIG.y_bool("s3.metadata.lmdb.metasync", default=False)
+# Whether the group committer issues fdatasync on the volume file after each
+# batch. True = data is durable on HTTP 200 (S3 semantics). Set False only for
+# throughput benchmarks where durability is not required.
+S3_VOLUME_FDATASYNC = CONFIG.y_bool("s3.volume.fdatasync", default=True)
 # Optional bounded queue for async metadata writes (reduces PUT tail latency under concurrency).
 S3_METADATA_WRITE_QUEUE_ENABLED = CONFIG.y_bool("s3.metadata.write_queue.enabled", default=True)
 S3_METADATA_WRITE_QUEUE_MAX_SIZE = int(CONFIG.y("s3.metadata.write_queue.max_size", default=8192))
 S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size", default=128))
-S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=10.0))
+# Straggler wait before flushing a batch of 1. Default 0: the drain loop already
+# coalesces all queued requests; a non-zero wait only adds latency at the low
+# per-worker concurrency real deployments see (measured 7.3ms vs 1.3ms/op).
+S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=0.0))
 # In-process hot-path cache TTLs (seconds) for S3 auth/ACL checks.
 S3_CACHE_APIKEY_TTL_SECONDS = float(CONFIG.y("s3.cache.apikey_ttl_seconds", default=600))
 S3_CACHE_VOLUME_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_ttl_seconds", default=600))

@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
+import time
 from typing import AsyncIterator
 
 from p2.s3.volume_pool import BlockCoord, VolumePool
@@ -32,6 +34,80 @@ try:
 except ImportError:
     rust_read_block_uring = None
     RustUringBlockStreamer = None
+
+
+# ---------------------------------------------------------------------------
+# FD cache — avoid open+close per pread (saves 2 syscalls per block read)
+# ---------------------------------------------------------------------------
+
+class _FDCache:
+    """Thread-safe LRU cache of open file descriptors for volume files.
+
+    Each entry is (fd, last_used_mono). Evicts entries idle for >30s.
+    Max 64 entries (covers all active + recently sealed volumes).
+    """
+    def __init__(self, max_size: int = 64, idle_timeout: float = 30.0):
+        self._max_size = max_size
+        self._idle_timeout = idle_timeout
+        self._lock = threading.Lock()
+        # path -> (fd, last_used)
+        self._cache: dict[str, tuple[int, float]] = {}
+
+    def get(self, path: str) -> tuple[int, bool]:
+        """Return (fd, is_hit) for *path*, reusing a cached one or opening fresh.
+
+        The is_hit flag tells the caller to skip fadvise (kernel already
+        has the pages hot in page cache for recently-used FDs).
+        """
+        now = time.monotonic()
+        with self._lock:
+            entry = self._cache.get(path)
+            if entry is not None:
+                fd, _ = entry
+                self._cache[path] = (fd, now)
+                return fd, True
+
+        # Open outside the lock to avoid holding it during I/O
+        fd = _open_vol_noatime(path)
+        with self._lock:
+            # Evict oldest if over capacity
+            if len(self._cache) >= self._max_size:
+                self._evict_expired(now)
+                if len(self._cache) >= self._max_size:
+                    self._evict_oldest()
+            self._cache[path] = (fd, now)
+        return fd, False
+
+    def close_all(self) -> None:
+        """Close all cached FDs (call on shutdown)."""
+        with self._lock:
+            for fd, _ in self._cache.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._cache.clear()
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [p for p, (_, ts) in self._cache.items() if now - ts > self._idle_timeout]
+        for p in expired:
+            fd, _ = self._cache.pop(p)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _evict_oldest(self) -> None:
+        if not self._cache:
+            return
+        oldest_path = min(self._cache, key=lambda p: self._cache[p][1])
+        fd, _ = self._cache.pop(oldest_path)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+_fd_cache = _FDCache()
 
 
 # Read-ahead thresholds (bytes)
@@ -112,15 +188,23 @@ def slice_blocks(blocks: list[BlockCoord], range_start: int, range_end: int) -> 
 # ---------------------------------------------------------------------------
 
 def _pread_block(path: str, offset: int, length: int) -> bytes:
-    """Read *length* bytes from *path* at *offset* using a single pread()."""
-    fd = _open_vol_noatime(path)
-    try:
+    """Read *length* bytes from *path* at *offset* using a single pread().
+
+    Uses the FD cache to avoid open+close per call (saves 2 syscalls).
+    Skips fadvise on cache hits (pages already hot in kernel page cache).
+
+    NOTE: This path deliberately uses ``os.pread`` and never the Rust
+    ``read_block_uring``. For the small/medium objects that reach here
+    (≤ 4 MiB), the uring implementation funnels every read through a single
+    global uring thread via a crossbeam channel + oneshot round-trip and
+    ``dup(2)`` per call. For a page-cache hit (~1-2us) that hand-off costs
+    more than the pread it replaces and serializes all small reads in the
+    worker. Plain pread is both faster and fully parallel here.
+    """
+    fd, is_hit = _fd_cache.get(path)
+    if not is_hit:
         _fadvise_hint(fd, _FADV_RANDOM, offset, length)
-        if rust_read_block_uring is not None:
-            return rust_read_block_uring(fd, offset, length)
-        return os.pread(fd, length, offset)
-    finally:
-        os.close(fd)
+    return os.pread(fd, length, offset)
 
 
 def _read_blocks_full(pool: VolumePool, blocks: list[BlockCoord]) -> bytes:
@@ -233,12 +317,18 @@ async def stream_sliced_blocks(
 # ---------------------------------------------------------------------------
 
 async def read_object(pool: VolumePool, blocks: list[BlockCoord]) -> bytes:
-    """Read a complete object into memory.  Choose strategy by total size."""
+    """Read a complete object into memory.
+
+    For small objects (≤ 64 KiB), pread inline in the event loop.
+    The syscall completes in ~1-5us for page-cache hits, avoiding the
+    ~30-100us asyncio.to_thread dispatch overhead.
+
+    For medium/large objects, dispatch to the thread pool so the event
+    loop stays responsive under concurrent load.
+    """
     obj_size = total_size(blocks)
-    if obj_size <= _MEDIUM_MAX:
-        return await asyncio.to_thread(_read_blocks_full, pool, blocks)
-    # For large objects, callers should use stream_blocks instead.
-    # This path buffers everything — only call for medium objects.
+    if obj_size <= _SMALL_MAX:
+        return _read_blocks_full(pool, blocks)
     return await asyncio.to_thread(_read_blocks_full, pool, blocks)
 
 

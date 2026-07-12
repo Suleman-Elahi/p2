@@ -56,8 +56,7 @@ async def run_compaction(ctx) -> None:  # noqa: C901
     # live_objects[vol_uuid] = list of (lmdb_key, block_coord) for surviving blocks
     live_objects: dict[str, list[tuple[str, Any, "BlockCoord"]]] = {uid: [] for uid in sealed_uuids}
 
-    all_volumes = await Volume.objects.all().aiterator()
-    async for volume in all_volumes:
+    async for volume in Volume.objects.all():
         try:
             engine = await asyncio.to_thread(get_engine, volume)
         except Exception as exc:

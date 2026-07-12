@@ -5,7 +5,6 @@ enforce the same safety checks without routing through the full middleware stack
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import binascii
 import hashlib
@@ -142,7 +141,9 @@ async def existing_object_state(engine, key: str) -> tuple[str | None, int, bool
     """
     from p2.core.constants import ATTR_BLOB_IS_FOLDER, ATTR_BLOB_SIZE_BYTES
 
-    metadata_json = await asyncio.to_thread(engine.get, key)
+    # LMDB get is a lock-free mmap read (~1-5us); inline is cheaper than a
+    # thread dispatch (~30-100us).
+    metadata_json = engine.get(key)
     if not metadata_json:
         return None, 0, False
     try:

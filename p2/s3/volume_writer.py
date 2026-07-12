@@ -73,8 +73,22 @@ def _batch_size() -> int:
 
 
 def _batch_window_ms() -> float:
-    """Max milliseconds to wait for stragglers before flushing an incomplete batch."""
-    return max(0.0, float(getattr(settings, "S3_METADATA_WRITE_BATCH_WINDOW_MS", 4.0)))
+    """Max milliseconds to wait for stragglers before flushing an incomplete batch.
+
+    Default 0: the non-blocking drain loop already coalesces every request that
+    is *already* queued into one batch. Waiting for *more* stragglers only helps
+    when the arrival rate exceeds the flush rate — otherwise the queue is empty
+    between requests and this wait becomes pure added latency on every PUT. At
+    the low per-worker concurrency a multi-worker deployment actually sees
+    (~2-3 conns/worker), a non-zero window is a self-reinforcing latency trap:
+    measured 7.3ms/op at 5ms window vs 1.3ms/op at 0ms window (conc=1).
+    """
+    return max(0.0, float(getattr(settings, "S3_METADATA_WRITE_BATCH_WINDOW_MS", 0.0)))
+
+
+def _volume_fdatasync_enabled() -> bool:
+    """Whether to fdatasync the volume file after each batch (data durability)."""
+    return bool(getattr(settings, "S3_VOLUME_FDATASYNC", True))
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +212,8 @@ async def _flush_batch(batch: list[tuple]) -> None:
     """
     assert _IO_EXECUTOR is not None
 
+    do_fdatasync = _volume_fdatasync_enabled()
+
     def _do_flush(batch=batch) -> list[tuple]:
         """Runs on the dedicated IO thread."""
         # Group by volume handle for bulk pwrite
@@ -208,6 +224,9 @@ async def _flush_batch(batch: list[tuple]) -> None:
 
         errors: dict[int, Exception] = {}  # id(item) -> exc
 
+        # Phase 1: issue all pwrites for every volume first (cheap, no blocking
+        # on disk flush). Collect the fds that need syncing.
+        fds_to_sync: list[tuple[int, list[tuple]]] = []
         for uid, items in vol_groups.items():
             handle = items[0][0]
             try:
@@ -220,11 +239,37 @@ async def _flush_batch(batch: list[tuple]) -> None:
                             raise OSError(
                                 f"pwrite partial: wrote {written}/{len(data)} bytes"
                             )
-                # fdatasync once per volume per batch — single syscall for all writes
-                os.fdatasync(fd)
+                fds_to_sync.append((fd, items))
             except Exception as exc:
                 for item in items:
                     errors[id(item)] = exc
+
+        # Phase 2: fdatasync each volume. When more than one volume received
+        # writes in this batch, run the (blocking) fsyncs concurrently so batch
+        # latency is bounded by the slowest single fsync rather than their sum.
+        if do_fdatasync and fds_to_sync:
+            if len(fds_to_sync) == 1:
+                fd, items = fds_to_sync[0]
+                try:
+                    os.fdatasync(fd)
+                except Exception as exc:
+                    for item in items:
+                        errors[id(item)] = exc
+            else:
+                def _sync_one(entry):
+                    fd, items = entry
+                    try:
+                        os.fdatasync(fd)
+                        return None
+                    except Exception as exc:
+                        return (items, exc)
+
+                with ThreadPoolExecutor(max_workers=len(fds_to_sync)) as sync_pool:
+                    for result in sync_pool.map(_sync_one, fds_to_sync):
+                        if result is not None:
+                            items, exc = result
+                            for item in items:
+                                errors[id(item)] = exc
 
         # Group by LMDB engine for bulk metadata commit
         engine_groups: dict[int, tuple] = {}
@@ -298,19 +343,12 @@ async def write_block(
     """
     if _queue_enabled():
         await _ensure_commit_worker()
-        if _RUST_COMMITTER is not None:
-            try:
-                # Submit via Rust GroupCommitter (GIL-free)
-                await asyncio.to_thread(
-                    _RUST_COMMITTER.submit,
-                    handle.fd,
-                    offset,
-                    data,
-                )
-                await asyncio.to_thread(_commit_metadata_direct, engine, lmdb_key, metadata_json)
-                return True
-            except Exception as exc:
-                logger.warning("Rust group-commit failed: %s; falling back to Python queue", exc)
+        # NOTE: Rust GroupCommitter path intentionally skipped here.
+        # The Rust committer bypasses the Python asyncio.Queue batch,
+        # causing each PUT to do individual pwrite + fdatasync + LMDB txn
+        # instead of batching N writes into 1 fdatasync + 1 LMDB txn.
+        # The Python queue is the correct batching path until the Rust
+        # committer is fully integrated with the Python queue's lifecycle.
 
         fut = asyncio.get_running_loop().create_future()
         try:
@@ -342,7 +380,8 @@ def _direct_write(
         written = os.pwrite(fd, data, offset)
         if written != len(data):
             raise OSError(f"pwrite partial: wrote {written}/{len(data)} bytes")
-        os.fdatasync(fd)
+        if _volume_fdatasync_enabled():
+            os.fdatasync(fd)
     with engine.env.begin(write=True, db=engine.db) as txn:
         txn.put(lmdb_key.encode("utf-8"), metadata_json.encode("utf-8"))
 

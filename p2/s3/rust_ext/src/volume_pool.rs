@@ -1,5 +1,4 @@
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use parking_lot::Mutex;
@@ -171,7 +170,6 @@ impl VolumePool {
                     let file = OpenOptions::new()
                         .read(true)
                         .write(true)
-                        .custom_flags(libc::O_DSYNC)
                         .open(&path)?;
                     let size = metadata.len();
                     // We assume write_head is at the current end of file or scan for non-zero bytes (for simplicity, use file size)
@@ -201,13 +199,13 @@ impl VolumePool {
         let path_str = self.get_volume_path(&uuid_str);
         let path = Path::new(&path_str);
 
-        // Open with custom O_DSYNC flag for safe group commit writing
+        // O_DSYNC removed — the Python group committer calls fdatasync() after
+        // each batch, so per-write sync flags are redundant and destroy throughput.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .custom_flags(libc::O_DSYNC)
             .open(path)?;
 
         let fd = file.as_raw_fd();

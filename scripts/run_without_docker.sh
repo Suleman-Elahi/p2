@@ -223,6 +223,12 @@ fi
 info "Syncing dependencies..."
 uv sync --python 3.12
 
+# Rebuild Rust extensions after uv sync (which may have uninstalled them)
+if [ -d "$REPO_ROOT/p2/s3/rust_ext" ]; then
+    info "Building Rust extensions..."
+    (cd "$REPO_ROOT/p2/s3/rust_ext" && maturin develop --release 2>&1 | tail -3)
+fi
+
 if ! command -v redis-cli &>/dev/null; then
     warn "redis-cli not found; cannot verify local Dragonfly/Redis availability."
 else

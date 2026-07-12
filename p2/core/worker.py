@@ -61,8 +61,11 @@ async def run_expire(ctx):
 
 async def run_compaction(ctx):
     """Periodic volume compaction — reclaims dead space in sealed .bin files."""
-    from p2.s3.compaction import run_compaction as _compact
-    await _compact(ctx)
+    try:
+        from p2.s3.compaction import run_compaction as _compact
+        await _compact(ctx)
+    except Exception as exc:
+        logger.warning("compaction failed (non-fatal): %s", exc)
 
 
 async def on_startup(ctx):

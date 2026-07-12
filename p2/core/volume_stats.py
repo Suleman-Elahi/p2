@@ -82,40 +82,21 @@ async def _flush_loop():
 
 async def adjust_volume_stats(volume, object_delta=0, bytes_delta=0):
     """Atomically adjust persisted counters for a volume using Redis and background SQLite flushing."""
-    if not volume.tags.get(STATS_INITIALIZED_TAG):
-        volume.tags[STATS_INITIALIZED_TAG] = True
-        await volume.asave(update_fields=["tags"])
-
     vol_uuid = volume.uuid.hex
-    success = False
     try:
         r = _get_redis()
         key = f"p2:volume:{vol_uuid}:stats"
-        
-        # Initialize hash if it doesn't exist
-        exists = await r.exists(key)
-        if not exists:
-            await r.hset(key, mapping={
-                "object_count": str(volume.object_count),
-                "space_used_bytes": str(volume.space_used_bytes)
-            })
-            await r.expire(key, 86400 * 7)  # expire in 7 days
-            
-        await r.hincrby(key, "object_count", object_delta)
-        await r.hincrby(key, "space_used_bytes", bytes_delta)
-        
-        _DIRTY_VOLUMES.add(vol_uuid)
-        success = True
-    except Exception as exc:
-        logger.warning("Failed to update volume stats in Redis: %s. Falling back to direct database update.", exc)
 
-    if not success:
-        # Direct fallback path (direct SQLite write)
-        await Volume.objects.filter(pk=volume.pk).aupdate(
-            object_count=Greatest(Value(0), F("object_count") + Value(object_delta)),
-            space_used_bytes=Greatest(Value(0), F("space_used_bytes") + Value(bytes_delta)),
-        )
-        return
+        # Pipeline all Redis ops into a single roundtrip
+        pipe = r.pipeline(transaction=False)
+        pipe.hincrby(key, "object_count", object_delta)
+        pipe.hincrby(key, "space_used_bytes", bytes_delta)
+        pipe.expire(key, 86400 * 7)
+        await pipe.execute()
+
+        _DIRTY_VOLUMES.add(vol_uuid)
+    except Exception as exc:
+        logger.warning("Failed to update volume stats in Redis: %s", exc)
 
     # Trigger background loop if not already running
     global _FLUSH_LOOP_TASK

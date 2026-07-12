@@ -5,11 +5,15 @@ All header parsing is done once per request and shared across detection,
 routing, auth, and the handler itself.
 """
 import asyncio
+import datetime as _dt
+import hashlib
 import json
 import logging
 import os
 import time
 import urllib.parse
+import uuid
+from email.utils import format_datetime
 
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
@@ -17,7 +21,10 @@ from django.http import QueryDict
 
 from p2.core.models import Volume
 from p2.s3.auth.aws_v4 import AWSV4Authentication
-from p2.s3.cache import get_cached_metadata, set_cached_metadata, invalidate_metadata
+from p2.s3.cache import (
+    get_cached_metadata, set_cached_metadata, invalidate_metadata,
+    get_cached_volume, set_cached_volume,
+)
 from p2.s3.engine import get_engine
 from p2.s3.errors import AWSError
 from p2.s3.fastpath import (
@@ -38,6 +45,17 @@ except ImportError:
 
 LOGGER = logging.getLogger(__name__)
 
+# Strong references to fire-and-forget background tasks. asyncio only holds a
+# weak reference to tasks, so without this they can be GC'd before completion.
+_BG_TASKS: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
 ATTR_BLOB_MIME = "blob.p2.io/mime"
 ATTR_BLOB_SIZE_BYTES = "blob.p2.io/size/bytes"
 ATTR_BLOB_IS_FOLDER = "blob.p2.io/is_folder"
@@ -47,11 +65,12 @@ ATTR_BLOB_STAT_CTIME = "blob.p2.io/stat/ctime"
 # Cache the S3 base domain at module level — never changes at runtime.
 _S3_BASE_DOMAIN: str | None = None
 
+from django.utils.dateparse import parse_datetime
+import datetime as _dt
+
 def _parse_stored_timestamp(ts_str: str):
     """Parse a stored mtime/ctime value, handling both ISO 8601 (current)
     and legacy Unix epoch floats from objects written before the timestamp fix."""
-    from django.utils.dateparse import parse_datetime
-    import datetime as _dt
     dt = parse_datetime(ts_str)
     if dt is None:
         try:
@@ -192,7 +211,7 @@ def S3ProxyASGIApp(django_app):
         if not bucket or not key:
             return await django_app(scope, receive, send)
 
-        if method not in ('GET', 'PUT'):
+        if method not in ('GET', 'PUT', 'DELETE'):
             return await django_app(scope, receive, send)
 
         # ── Auth (reuses pre-built meta dict) ─────────────────────────────
@@ -219,7 +238,6 @@ def S3ProxyASGIApp(django_app):
 
         # ── Volume lookup ─────────────────────────────────────────────────
         try:
-            from p2.s3.cache import get_cached_volume, set_cached_volume
             volume = get_cached_volume(bucket)
             if not volume:
                 volume = await Volume.objects.aget(name=bucket)
@@ -241,7 +259,10 @@ def S3ProxyASGIApp(django_app):
             attributes = get_cached_metadata(vol_hex, key)
             if attributes is None:
                 engine = get_engine(volume)
-                raw = await asyncio.to_thread(engine.get, key)
+                # LMDB get is a lock-free read over an mmap (~1-5us). Dispatching
+                # it to a thread costs more (~30-100us) than the read itself, so
+                # run it inline in the event loop.
+                raw = engine.get(key)
                 if not raw:
                     return await _s3_error(send, 404, 'NoSuchKey', volume=volume, origin=origin)
                 attributes = json.loads(raw)
@@ -256,7 +277,6 @@ def S3ProxyASGIApp(django_app):
             size = int(attributes.get('size', attributes.get('blob.p2.io/size/bytes', 0)) or 0)
             etag = attributes.get('etag', attributes.get('blob.p2.io/hash/md5', ''))
 
-            from email.utils import format_datetime
             lm = b''
             lm_str = attributes.get('mtime', attributes.get('blob.p2.io/stat/mtime', ''))
             if lm_str:
@@ -307,7 +327,8 @@ def S3ProxyASGIApp(django_app):
 
         # ── PUT ───────────────────────────────────────────────────────────
         if method == 'PUT':
-            if (volume.tags or {}).get('versioning') == 'true':
+            is_versioned = (volume.tags or {}).get('versioning') == 'true'
+            if is_versioned:
                 return await django_app(scope, receive, send)
 
             try:
@@ -327,9 +348,6 @@ def S3ProxyASGIApp(django_app):
 
             if content_length > 67108864 or content_length == -1:
                 return await django_app(scope, receive, send)
-
-            import hashlib
-            import datetime as _dt
 
             pool = VolumePool.get()
             chunks_body = []
@@ -369,7 +387,13 @@ def S3ProxyASGIApp(django_app):
 
             now_iso = _dt.datetime.now(_dt.UTC).isoformat()
             engine = get_engine(volume)
-            existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+
+            # Skip LMDB read for non-versioned buckets — no need to check
+            # if the object already exists (saves 1 LMDB transaction per PUT).
+            if is_versioned:
+                existing_json, existing_size, existing_counted = await existing_object_state(engine, key)
+            else:
+                existing_json, existing_size, existing_counted = None, 0, False
 
             if blob_size > 0:
                 handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
@@ -380,7 +404,6 @@ def S3ProxyASGIApp(django_app):
                 offset = 0
                 blocks = []
 
-            import uuid
             blob_uuid = uuid.uuid4().hex
             internal_path = f"/internal-storage/volumes/{vol_hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
 
@@ -406,14 +429,19 @@ def S3ProxyASGIApp(django_app):
             if existing_json:
                 from p2.s3.cache import invalidate_volume_global
                 invalidate_volume_global(bucket)
-            await update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
+            # Volume stats are approximate and flushed to the DB every ~2s, so
+            # don't gate the HTTP 200 on the Redis round-trip — fire it in the
+            # background. adjust_volume_stats swallows its own exceptions.
+            _spawn_bg(
+                update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
+            )
 
             if async_events:
                 event = make_event(blob_uuid=os.urandom(8).hex(), volume_uuid=vol_hex, event_type='blob_post_save')
                 event['blob_path'] = key
                 event['mime'] = client_ct
                 event['blocks'] = [b.to_dict() for b in blocks]
-                asyncio.create_task(publish_event(STREAM_BLOB_POST_SAVE, event))
+                _spawn_bg(publish_event(STREAM_BLOB_POST_SAVE, event))
 
             resp_h = [
                 (b'etag', f'"{final_md5}"'.encode('utf-8')),
@@ -422,6 +450,25 @@ def S3ProxyASGIApp(django_app):
             ]
             _apply_asgi_cors(resp_h, volume, origin, method)
             await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
+            await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})
+            return
+
+        # ── DELETE ─────────────────────────────────────────────────────────
+        if method == 'DELETE':
+            try:
+                await require_volume_permission(user, volume, 'delete', bucket, key)
+            except AWSError as e:
+                return await _s3_error(send, e.status, e.code, volume=volume, origin=origin)
+
+            engine = get_engine(volume)
+            await asyncio.to_thread(engine.delete, key)
+            invalidate_metadata(vol_hex, key)
+
+            resp_h = [
+                (b'content-length', b'0'),
+            ]
+            _apply_asgi_cors(resp_h, volume, origin, method)
+            await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 204, 'headers': resp_h})
             await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})
             return
 

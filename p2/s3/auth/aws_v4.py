@@ -29,6 +29,13 @@ except ImportError:
 _SIGNING_KEY_CACHE: dict[tuple[str, str, str, str], tuple[bytes, float]] = {}
 _SIGNING_KEY_TTL_SECONDS = 900.0
 
+# Remembers which (quote_path, use_fallback_hash) signing variant last matched
+# for a given access key. A given SDK/client consistently uses the same
+# canonicalization, so trying the remembered variant first collapses the
+# 4-way retry loop into a single canonical-request + SHA256 + HMAC on the
+# hot path. Keyed by access_key -> (quote_path, use_fallback_hash).
+_SIG_VARIANT_HINT: dict[str, tuple[bool, bool]] = {}
+
 
 def _hmac_sign(key: bytes, msg: str) -> bytes:
     if _RUST_AVAILABLE:
@@ -213,7 +220,7 @@ class AWSV4Authentication(BaseAuth):
         """Lookup access_key in database, return APIKey if found otherwise None.
         Uses in-memory cache to avoid database round-trips on hot paths."""
         from p2.s3.cache import get_cached_apikey, set_cached_apikey
-        
+
         # Check cache first — stores the already-decrypted secret, no Fernet on hot path
         cached = get_cached_apikey(access_key)
         if cached:
@@ -233,11 +240,11 @@ class AWSV4Authentication(BaseAuth):
                     return self._secret
 
             return CachedAPIKey(access_key, secret_key, user)
-        
+
         # Cache miss - hit database
         apikey = await APIKey.objects.select_related('user').filter(access_key=access_key).afirst()
         if apikey:
-            set_cached_apikey(access_key, apikey.decrypt_secret_key(), apikey.user_id, 
+            set_cached_apikey(access_key, apikey.decrypt_secret_key(), apikey.user_id,
                             apikey.user.username, apikey.user.is_superuser)
         return apikey
 
@@ -269,14 +276,14 @@ class AWSV4Authentication(BaseAuth):
         # would consume the stream before the view can process it.
         if self.request.method in ('PUT', 'POST'):
             return
-        
+
         # Shortcut empty requests bypassing lazy `.body` stream evaluation
         if self.request.method in ('GET', 'HEAD', 'OPTIONS'):
             request_body_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         else:
             # For small requests (DELETE, etc.) verify the hash
             request_body_hash = hashlib.sha256(self.request.body).hexdigest()
-            
+
         if auth_request.hash != request_body_hash:
             LOGGER.warning("CONTENT_SHA256 Header/param incorrect: theirs=%s ours=%s",
                            auth_request.hash, request_body_hash)
@@ -309,46 +316,64 @@ class AWSV4Authentication(BaseAuth):
         our_signature = None
         matched_quote_path = True
         matched_hash = auth_request.hash
+        matched_canonical_request = None
+        matched_string_to_sign = None
 
         # Standard hash and empty body fallback hash
         candidate_hashes = [auth_request.hash]
         if auth_request.hash == UNSIGNED_PAYLOAD:
             candidate_hashes.append("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
 
+        # Build the list of (quote_path, hash) variants to try. A client uses a
+        # stable canonicalization, so if we've matched this access key before we
+        # try that exact variant first and usually finish in one HMAC.
+        variants: list[tuple[bool, str]] = []
+        hint = _SIG_VARIANT_HINT.get(auth_request.access_key)
+        if hint is not None:
+            hint_qp, hint_fallback = hint
+            hint_hval = candidate_hashes[1] if (hint_fallback and len(candidate_hashes) > 1) else candidate_hashes[0]
+            variants.append((hint_qp, hint_hval))
         for qp in (True, False):
             for hval in candidate_hashes:
-                # Temporarily swap hash for canonical request construction
-                original_hash = auth_request.hash
-                auth_request.hash = hval
-                canonical_request = self._get_canonical_request(auth_request, quote_path=qp)
-                auth_request.hash = original_hash
+                if (qp, hval) not in variants:
+                    variants.append((qp, hval))
 
-                string_to_sign = '\n'.join([
-                    auth_request.algorithm,
-                    auth_request.date_long,
-                    auth_request.credentials,
-                    self._get_sha256(canonical_request.encode('utf-8')),
-                ])
-                sig = self._sign(signing_key, string_to_sign).hex()
-                if auth_request.signature == sig:
-                    our_signature = sig
-                    matched_quote_path = qp
-                    matched_hash = hval
-                    break
-            if our_signature:
+        for qp, hval in variants:
+            # Temporarily swap hash for canonical request construction
+            original_hash = auth_request.hash
+            auth_request.hash = hval
+            canonical_request = self._get_canonical_request(auth_request, quote_path=qp)
+            auth_request.hash = original_hash
+
+            string_to_sign = '\n'.join([
+                auth_request.algorithm,
+                auth_request.date_long,
+                auth_request.credentials,
+                self._get_sha256(canonical_request.encode('utf-8')),
+            ])
+            sig = self._sign(signing_key, string_to_sign).hex()
+            if auth_request.signature == sig:
+                our_signature = sig
+                matched_quote_path = qp
+                matched_hash = hval
+                matched_canonical_request = canonical_request
+                matched_string_to_sign = string_to_sign
+                # Remember which variant matched so subsequent requests from
+                # this client skip straight to it.
+                use_fallback = (len(candidate_hashes) > 1 and hval == candidate_hashes[1])
+                _SIG_VARIANT_HINT[auth_request.access_key] = (qp, use_fallback)
                 break
 
-        # Re-canonicalize with the matched settings, or fallback to default settings for the mismatch log
-        auth_request.hash = matched_hash
-        canonical_request = self._get_canonical_request(auth_request, quote_path=matched_quote_path)
-        string_to_sign = '\n'.join([
-            auth_request.algorithm,
-            auth_request.date_long,
-            auth_request.credentials,
-            self._get_sha256(canonical_request.encode('utf-8')),
-        ])
-
         if auth_request.signature != our_signature:
+            # Only re-canonicalize on mismatch (for debug logging)
+            auth_request.hash = matched_hash
+            canonical_request = self._get_canonical_request(auth_request, quote_path=matched_quote_path)
+            string_to_sign = '\n'.join([
+                auth_request.algorithm,
+                auth_request.date_long,
+                auth_request.credentials,
+                self._get_sha256(canonical_request.encode('utf-8')),
+            ])
             LOGGER.warning("Signature mismatch debug: path=%s, method=%s, query=%s, signed_headers=%s",
                         self.request.META.get('PATH_INFO'), self.request.META.get('REQUEST_METHOD'),
                         self.request.META.get('QUERY_STRING'), auth_request.signed_headers)
