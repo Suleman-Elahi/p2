@@ -487,7 +487,7 @@ class ObjectView(S3View):
 
         # ── Group-commit: write data + metadata atomically ────────────────
         if handle is not None:
-            await write_block(handle, offset, data, engine, path, metadata_json)
+            await write_block(handle, offset, data, engine, path, metadata_json, md5_h.digest())
         else:
             await asyncio.to_thread(engine.put, path, metadata_json)
 
