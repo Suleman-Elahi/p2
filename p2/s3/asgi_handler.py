@@ -379,6 +379,7 @@ def S3ProxyASGIApp(django_app):
             body = b''.join(chunks_body)
             final_md5 = md5_hasher.hexdigest()
             final_sha256 = sha256_hasher.hexdigest()
+            md5_hash_bytes = md5_hasher.digest()  # 16-byte binary MD5 for write_block
 
             try:
                 validate_fast_put_integrity(hdrs, b'', final_md5, final_sha256, blob_size=blob_size)
@@ -421,7 +422,7 @@ def S3ProxyASGIApp(django_app):
             meta_json = json.dumps(meta_payload)
 
             if handle is not None:
-                await write_block(handle, offset, body, engine, key, meta_json)
+                await write_block(handle, offset, body, engine, key, meta_json, md5_hash_bytes)
             else:
                 await asyncio.to_thread(engine.put, key, meta_json)
 
