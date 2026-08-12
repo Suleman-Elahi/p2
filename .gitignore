@@ -1,39 +1,16 @@
-# Byte-compiled / optimized / DLL files
+```
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution / packaging
+*.pyc
+*.pyo
+*.pyd
 .Python
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-node_modules
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-*.db
-*.redb
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
-
-# Installer logs
+env/
+venv/
+.venv/
+.ENV
 pip-log.txt
 pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
 .tox/
 .coverage
 .coverage.*
@@ -41,91 +18,21 @@ htmlcov/
 nosetests.xml
 coverage.xml
 *.cover
+*.log
+.pytest_cache/
+.mypy_cache/
 .hypothesis/
 
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
+# Django
 *.log
-.static_storage/
-.media/
 local_settings.py
 db.sqlite3
+db.sqlite3-journal
 
-# Flask stuff:
-instance/
-.webassets-cache
+# ASGI
+.asgi/
 
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# pyenv
-.python-version
-
-# celery beat schedule file
-celerybeat-schedule
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.DS_Store
-
-bin/
-media/*
-*debhelper
-*.env.yml
-unittest.xml
-media_test/
-helm/p2/charts/*.tgz
-
-vendor/**
-debian/p2/**
-debian/files
-debian/*.substvars
-
-# Rust build artifacts (extension compiled via scripts/build_rust_ext.sh)
-p2/s3/rust_ext/target/
-p2/s3/rust_ext/dist/
-
-p2.crt
-p2.key
-ui/node_modules/
-.git/
-storage/
-static/
-
-# Generated nginx config (created by scripts/setup.sh from deploy/nginx-host.conf).
-# Contains machine-local absolute paths — do NOT commit.
-nginx-p2.conf
+# S3 related
+s3/
+volume_writer/
+```

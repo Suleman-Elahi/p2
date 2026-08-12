@@ -318,17 +318,23 @@ async def stream_sliced_blocks(
 
 async def read_object(pool: VolumePool, blocks: list[BlockCoord]) -> bytes:
     """Read a complete object into memory.
-
-    For small objects (≤ 64 KiB), pread inline in the event loop.
-    The syscall completes in ~1-5us for page-cache hits, avoiding the
-    ~30-100us asyncio.to_thread dispatch overhead.
-
-    For medium/large objects, dispatch to the thread pool so the event
-    loop stays responsive under concurrent load.
+    
+    CRITICAL OPTIMIZATION: Small objects (≤ 64 KiB) are read inline with pread
+    directly in the event loop. The syscall completes in ~1-5us for page-cache
+    hits, avoiding the ~30-100us asyncio.to_thread dispatch overhead.
+    
+    This is safe because:
+    1. pread is a single non-blocking syscall
+    2. FD cache eliminates open/close overhead
+    3. No thread hop = 10x faster for small objects
+    
+    Medium/large objects still use thread pool to avoid blocking the loop.
     """
     obj_size = total_size(blocks)
     if obj_size <= _SMALL_MAX:
+        # INLINE READ - no thread hop!
         return _read_blocks_full(pool, blocks)
+    # Large objects: thread pool
     return await asyncio.to_thread(_read_blocks_full, pool, blocks)
 
 
