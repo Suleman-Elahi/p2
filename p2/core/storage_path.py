@@ -19,7 +19,11 @@ def storage_path(*parts) -> str:
 
 
 def internal_to_fs(internal_path: str) -> str:
-    """Convert an /internal-storage/... path to a real filesystem path."""
+    """Resolve a stored ``/internal-storage/...`` locator to a filesystem path.
+
+    Still required: legacy per-blob objects persist this locator in their
+    metadata, and download/delete/compaction/versioning all resolve it here.
+    """
     return internal_path.replace('/internal-storage/', storage_root().rstrip('/') + '/')
 
 
@@ -37,7 +41,14 @@ def blob_dir(volume_uuid: str, blob_uuid: str) -> str:
 
 
 def blob_internal_path(volume_uuid: str, blob_uuid: str) -> str:
-    """Return internal Nginx path for blob payload."""
+    """Return the stored ``internal_path`` locator for a legacy blob payload.
+
+    This is a storage-relative locator persisted in blob metadata, resolved back
+    to a real filesystem path by :func:`internal_to_fs`. It is not an HTTP path:
+    the ``/internal-storage/`` prefix is a historical artifact of the removed
+    nginx X-Accel-Redirect setup and is retained only so existing metadata keeps
+    resolving.
+    """
     parts = "/".join(blob_shard_parts(blob_uuid))
     return f"/internal-storage/volumes/{volume_uuid}/{parts}/{blob_uuid}"
 

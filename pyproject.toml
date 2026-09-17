@@ -54,6 +54,7 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "whitenoise>=6.12.0",
     "granian[dotenv,uvloop]>=2.7.2",
+    "liburing>=2026.3.30",
 ]
 
 [project.optional-dependencies]

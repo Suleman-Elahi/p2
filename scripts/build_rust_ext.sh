@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
-# Build the p2_s3_crypto Rust extension and place it in p2/s3/.
+# Build both Rust extensions (p2_s3_crypto, p2_s3_checksum) and install them
+# into the project venv.
 #
 # Automatically installs Rust (via rustup) and maturin if not present.
 # Supported: Debian/Ubuntu, Arch Linux, macOS (Homebrew or standalone rustup).
 #
-# Run once before `docker compose up`, and again whenever p2/s3/rust_ext/ changes.
-# The compiled .so is committed to the repo — Docker needs no Rust toolchain.
+# Run whenever p2/s3/rust_ext/ or p2/s3/checksum_ext/ changes.
+#
+# This script used to copy each .so into p2/s3/ and instruct you to commit it,
+# while run_without_docker.sh separately ran `maturin develop` into the venv.
+# Two destinations meant two loadable copies of the same extension: the tree
+# copy went stale (missing write_blocks_uring) while callers using a different
+# import spelling kept loading it, and nothing failed because every call site
+# swallowed ImportError. The venv is now the only destination. See p2/s3/_native.py.
+#
+# Wheels are also left in wheels/ so the Docker build can install them without
+# needing a Rust toolchain.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEST="$REPO_ROOT/p2/s3"
+VENV="$REPO_ROOT/.venv"
+WHEELHOUSE="$REPO_ROOT/wheels"
 
 # ── Colours ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -35,6 +46,17 @@ info "Detected OS: $OS"
 
 # ── Install system build dependencies ─────────────────────────────────────────
 install_build_deps() {
+    # Skip the package manager entirely when the toolchain is already present.
+    # This script runs on every `run_without_docker.sh` start, and an
+    # unconditional `sudo apt-get update` both costs several seconds and can
+    # block on a password prompt before the server comes up.
+    if command -v gcc &>/dev/null \
+        && command -v pkg-config &>/dev/null \
+        && command -v curl &>/dev/null; then
+        info "Build dependencies already present — skipping package manager."
+        return
+    fi
+
     case "$OS" in
         debian)
             info "Installing build dependencies (apt)..."
@@ -138,12 +160,22 @@ ensure_maturin() {
 }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
-# Target Python 3.12 (Docker) by default. Override with: PYTHON_TARGET=python3.13 ./scripts/build_rust_ext.sh
+# Default to the venv interpreter, NOT a bare `python3.12` from PATH.
+#
+# PyO3's build config is keyed on the interpreter path, so building with a
+# different interpreter invalidates the cargo fingerprint and forces a full
+# rebuild of pyo3 + the crate (~22s) instead of a cache hit (~0.4s). The venv
+# interpreter is also the one that actually loads the extension at runtime, so
+# it is the correct target. Override with:
+#   PYTHON_TARGET=python3.13 bash scripts/build_rust_ext.sh
+if [[ -z "${PYTHON_TARGET:-}" && -x "$VENV/bin/python" ]]; then
+    PYTHON_TARGET="$VENV/bin/python"
+fi
 PYTHON_TARGET="${PYTHON_TARGET:-python3.12}"
 
 ensure_target_python() {
     if command -v "$PYTHON_TARGET" &>/dev/null; then
-        info "Target Python: $($PYTHON_TARGET --version)"
+        info "Target Python: $($PYTHON_TARGET --version) ($PYTHON_TARGET)"
         return
     fi
 
@@ -160,10 +192,52 @@ ensure_target_python() {
     die "Python $ver not found and uv not available to install it."
 }
 
+# Return 0 when the installed extension is newer than every relevant source
+# file, i.e. there is nothing to do. Set FORCE_REBUILD=1 to always rebuild.
+#
+# Without this, every server start reinstalled the wheel even when no Rust
+# changed. Cargo would cache the compile, but the uninstall/reinstall churn
+# still ran and made it look like a full rebuild each time.
+ext_is_current() {
+    local name="$1"
+    local ext_dir="$2"
+
+    [[ -n "${FORCE_REBUILD:-}" ]] && return 1
+    [[ -x "$VENV/bin/python" ]] || return 1
+
+    local installed
+    installed="$("$VENV/bin/python" -c "
+import importlib.util, pathlib, sys
+spec = importlib.util.find_spec('$name')
+if spec is None or not spec.origin:
+    sys.exit(1)
+so = sorted(pathlib.Path(spec.origin).parent.glob('*.so'))
+if not so:
+    sys.exit(1)
+print(so[0], end='')
+" 2>/dev/null)" || return 1
+    [[ -n "$installed" && -f "$installed" ]] || return 1
+
+    # Any tracked source newer than the installed binary means it is stale.
+    local newer
+    newer="$(find "$ext_dir" \
+        \( -path '*/target' -o -path '*/dist' \) -prune -o \
+        \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \
+           -o -name '*.pyi' -o -name 'config.toml' -o -name 'build.sh' \) \
+        -newer "$installed" -print -quit 2>/dev/null)"
+
+    [[ -z "$newer" ]]
+}
+
 build_extension() {
     local name="$1"
     local ext_dir="$2"
     local out_dir="$ext_dir/dist"
+
+    if ext_is_current "$name" "$ext_dir"; then
+        info "$name is up to date — skipping build (FORCE_REBUILD=1 to override)."
+        return
+    fi
 
     info "Building $name (release) for $($PYTHON_TARGET --version)..."
     rm -rf "$out_dir"
@@ -171,30 +245,54 @@ build_extension() {
     cd "$ext_dir"
     maturin build --release --interpreter "$PYTHON_TARGET" --out "$out_dir"
 
-    # maturin outputs a .whl — extract the .so from it
-    WHL=$(find "$out_dir" -name "${name}*.whl" | head -1)
-    if [[ -n "$WHL" ]]; then
-        unzip -o -j "$WHL" "*.so" -d "$out_dir" 2>/dev/null || true
+    WHL=$(find "$out_dir" -name "${name}-*.whl" | head -1)
+    [[ -z "$WHL" ]] && die "No wheel found in $out_dir after build."
+
+    # Install into the venv — the single import source. Never copy a bare .so
+    # into p2/s3/; that is what caused the stale-build divergence.
+    mkdir -p "$WHEELHOUSE"
+    cp "$WHL" "$WHEELHOUSE/"
+
+    if [[ -x "$VENV/bin/python" ]]; then
+        VIRTUAL_ENV="$VENV" uv pip install --reinstall --no-deps "$WHL"
+        info "Installed into venv: $name"
+    else
+        warn "No venv at $VENV — wheel staged in wheels/ but not installed."
     fi
-
-    SO=$(find "$out_dir" -name "${name}*.so" | head -1)
-    [[ -z "$SO" ]] && die "No .so found in $out_dir after build."
-
-    cp "$SO" "$DEST/${name}.so"
-    info "Installed: $DEST/${name}.so"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-install_build_deps
-ensure_rust
-ensure_maturin
-ensure_target_python
-build_extension "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext"
-build_extension "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"
+# Fast path. This script runs on every native start, so when nothing has
+# changed skip the whole toolchain bootstrap (apt/rustup/maturin probing) and
+# go straight to verification. Set FORCE_REBUILD=1 to bypass.
+if ext_is_current "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext" \
+   && ext_is_current "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"; then
+    info "Both Rust extensions are up to date — nothing to build."
+else
+    install_build_deps
+    ensure_rust
+    ensure_maturin
+    ensure_target_python
+    build_extension "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext"
+    build_extension "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"
+fi
+
+# Verify both extensions load and expose the full expected surface. Fails here
+# rather than silently degrading to the Python fallback at runtime.
+if [[ -x "$VENV/bin/python" ]]; then
+    info "Verifying extensions..."
+    P2_REQUIRE_NATIVE=1 "$VENV/bin/python" -c "
+import p2_s3_crypto, p2_s3_checksum
+print('  p2_s3_crypto  :', p2_s3_crypto.__file__)
+print('  p2_s3_checksum:', p2_s3_checksum.__file__)
+" || die "Extensions built but failed verification."
+fi
 
 echo ""
-echo -e "${GREEN}Done.${NC} Commit the .so files and run: docker compose up"
-echo "  git add p2/s3/p2_s3_crypto.so p2/s3/p2_s3_checksum.so"
+echo -e "${GREEN}Done.${NC} Extensions installed into $VENV"
+echo "Wheels staged in $WHEELHOUSE (used by the Docker build)."
 echo ""
-warn "NOTE: .so files are built with abi3 (stable ABI, Python ≥ 3.12)."
-warn "They are forward-compatible with Python 3.13+ including 3.14."
+warn "NOTE: wheels are abi3 (stable ABI, Python >= 3.12) and forward-compatible"
+warn "with 3.13+. But rust_ext/.cargo/config.toml sets target-cpu=native, so a"
+warn "wheel built here will NOT run on an older CPU. Override RUSTFLAGS if you"
+warn "need a portable build (the Dockerfile does exactly that)."

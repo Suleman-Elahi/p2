@@ -1,0 +1,81 @@
+To regain and exceed your previous performance (targeting 10k+ PUTs and 20k+ GETs), you need to strip the design down to its bare metal essentials. The current implementation is "over-engineered" with safety and abstraction layers that kill throughput.
+Here is the strategic roadmap to fix p2:
+1. What to REMOVE Immediately (The "Extra" Work)
+These components are actively destroying your performance. Remove or bypass them:
+❌ Remove asyncio.to_thread for I/O:
+Why: You are paying the cost of thread pool scheduling (context switch + queue latency) for every single operation.
+Fix: Use Non-Blocking I/O (os.open with O_DIRECT or O_NONBLOCK) or rely on the OS page cache with standard async file handles. If you must block, do it in a dedicated writer thread that processes a queue, not one thread per request.
+❌ Remove Per-Request fdatasync:
+Why: Calling fdatasync forces the disk head to seek and flush immediately. This caps throughput at ~100-200 ops/sec on spinning rust and limits SSDs significantly.
+Fix: Rely on the OS writeback cache. Only fsync when rotating volumes or on graceful shutdown. If durability is critical, use a Write-Ahead Log (WAL) that is fsynced in large batches, not per object.
+❌ Remove JSON Metadata Parsing in Hot Path:
+Why: Parsing JSON strings for block coordinates on every GET is CPU-intensive.
+Fix: Store metadata in LMDB as binary structs (e.g., Python struct.pack or raw bytes) representing [volume_id, offset, length]. No JSON serialization/deserialization.
+❌ Remove "Batch Window" Logic for Single Writes:
+Why: Waiting for a timer or batch size adds latency.
+Fix: Implement a Ring Buffer or Memory Mapped File (mmap) approach. Writers just copy bytes into a shared memory segment; a single background thread flushes that segment to disk sequentially.
+2. The High-Performance Architecture (The "New" Strategy)
+To double your performance, switch to this model:
+A. The "Zero-Copy" Write Path (PUT)
+Instead of Receive -> Buffer -> Hash -> Thread -> Lock -> Write -> Sync, do this:
+Pre-Allocation: Pre-allocate volume files (e.g., 1GB chunks) using fallocate. This removes filesystem fragmentation overhead.
+Atomic Offset Counter: Use a simple atomic integer (or a locked integer in a dedicated writer thread) to claim space.
+Thread A claims: Offset 1000, Length 500.
+Thread B claims: Offset 1500, Length 200.
+No locks needed during the actual write if offsets don't overlap.
+Direct Memory Copy:
+If using Python: mmap the volume file. Copy incoming bytes directly into the mmap region.
+This bypasses the kernel syscall overhead of write().
+Async Metadata Commit:
+Push the (key, volume_id, offset, length) tuple into a lock-free queue.
+A dedicated "Metadata Flusher" thread pops batches of 100-1000 items and writes them to LMDB in a single transaction.
+Result: 1000 objects = 1 DB transaction instead of 1000.
+B. The "Fast-Path" Read Path (GET)
+Instead of Lookup JSON -> Open FD -> Seek -> Read -> Close, do this:
+Binary Lookup: Query LMDB for binary struct. Unpack instantly.
+Persistent Mmap: Keep volume files memory-mapped permanently.
+Do not open/close files.
+Access data via mmap_obj[offset : offset+length].
+This is essentially a RAM read if the OS cache is warm.
+Zero-Copy Response: Stream the mmap slice directly to the RSGI response body without copying to a temporary buffer.
+3. Specific Code Changes Required
+Component
+Current State (Slow)
+Target State (Fast)
+Storage Engine
+Append-only with fdatasync
+Memory Mapped (mmap) Circular Buffers
+Metadata
+JSON strings in LMDB
+Binary Structs (<IQI - VolID, Offset, Len)
+Concurrency
+asyncio.to_thread per req
+Single Writer Thread with Lock-Free Queue
+Durability
+Sync every write
+Group Commit (Sync every 10ms or 1000 ops)
+File Handles
+Open/Close per batch
+Pre-opened & Mmapped at startup
+Locking
+Per-volume asyncio.Lock
+Atomic Offset Counter (no lock for data write)
+4. Implementation Plan (Step-by-Step)
+Switch to Binary Metadata:
+Change your LMDB put logic to store struct.pack('<IQI', volume_id, offset, size) instead of JSON. This alone saves significant CPU cycles.
+Implement the "Single Writer" Pattern:
+Create a single background thread that owns the file descriptors.
+Main async loop receives data -> pushes (data, callback) to a queue.Queue.
+Writer thread pops, writes sequentially to the mmap'd volume, updates the atomic offset, and triggers the callback with the coordinates.
+Benefit: Eliminates all file locking contention.
+Enable Huge Pages / Readahead:
+Ensure your OS is tuned.
+bash
+
+1234
+Remove the "Group Commit" Timer:
+Don't wait for a timer. Just flush the metadata queue whenever it hits N items (e.g., 500). If traffic is low, flush every 10ms anyway. This ensures high throughput under load and low latency under idle.
+Summary of the Fix
+Your current design treats every S3 PUT like a database transaction (ACID, immediate sync, isolated). High-performance object storage treats PUTs like log entries: fire-and-forget into a memory segment, with a background process handling the messy disk I/O and indexing in bulk.
+Expected Outcome:
+By removing thread hops, switching to mmap, batching metadata transactions, and eliminating per-write syncs, you should see PUTs jump from 300 to 5000+ and GETs from 2000 to 15000+ (limited mostly by network and CPU hashing speed).

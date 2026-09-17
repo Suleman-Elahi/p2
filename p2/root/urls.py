@@ -20,7 +20,8 @@ handler500 = ServerErrorView.as_view()
 
 # S3 URLs get routed via middleware
 urlpatterns = [
-    # Frappe UI static assets (served by Django when Nginx isn't available)
+    # Frappe UI static assets. Served by Django since there is no reverse proxy;
+    # Granian's --static-path-route can take this over if you want it out of Python.
     re_path(r'^assets/(?P<asset_path>.+)$', SpaIndexView.as_view(), name='spa-asset'),
     # Frappe UI SPA routes — serves index.html for SPA frontend routing.
     re_path(r'^(?:$|(?:login|buckets|settings)(?:/.*)?$)', SpaIndexView.as_view(), name='spa-index'),

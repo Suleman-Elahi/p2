@@ -8,7 +8,6 @@ from typing import List, Optional
 
 from asgiref.sync import async_to_sync
 from django.utils.timezone import now
-from django.conf import settings
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from ninja import Router, File
@@ -349,9 +348,8 @@ def create_folder(request, volume_uuid: str, payload: FolderCreateSchema):
 def blob_download(request, volume_uuid: str, key: str = "", download: bool = False):
     """Serve blob content for preview or download.
 
-    Uses X-Accel-Redirect when Nginx is proxying (detected via X-Real-IP),
-    falling back to FileResponse for pure-Python serving.
-    Set ?download=1 to force Content-Disposition: attachment.
+    Serves the file directly via FileResponse. Set ?download=1 to force
+    Content-Disposition: attachment.
     """
     vol = get_object_or_404(Volume, uuid=volume_uuid)
     if not _check_permission(request.user, vol, 'read'):
@@ -380,22 +378,6 @@ def blob_download(request, volume_uuid: str, key: str = "", download: bool = Fal
     filename = key.rsplit('/', 1)[-1] if '/' in key else key
     etag = attributes.get('blob.p2.io/hash/md5', '')
 
-    USE_ACCEL = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
-
-    if USE_ACCEL and request.META.get('HTTP_X_REAL_IP'):
-        # X-Accel-Redirect to Nginx — zero-copy sendfile path
-        response = HttpResponse()
-        response['X-Accel-Redirect'] = internal_path
-        response['Content-Type'] = mime
-        if etag:
-            response['ETag'] = f'"{etag}"'
-        if download:
-            response['Content-Disposition'] = f'attachment; filename="{filename}"'
-        else:
-            response['Content-Disposition'] = 'inline'
-        return response
-
-    # Pure-Python fallback
     import os as _os
     if not _os.path.exists(fs_path):
         raise Http404(f"File not found on disk: {key}")

@@ -49,8 +49,8 @@
     </div>
     <div class="card">
       <div class="card-icon">📡</div>
-      <h3>Zero-Copy Reads</h3>
-      <p>GET operations use Nginx <code>X-Accel-Redirect</code> to serve files via kernel-level <code>sendfile()</code>, bypassing Python entirely.</p>
+      <h3>Proxy-Free Reads</h3>
+      <p>GET operations resolve an object's block ranges from LMDB and stream them straight out of the append-only volume files. No reverse proxy in the path.</p>
     </div>
     <div class="card">
       <div class="card-icon">🚀</div>
@@ -99,7 +99,7 @@
         <li><code>p2_s3_crypto</code> computes hashes without stalling the event loop</li>
         <li>Payload streamed directly to disk</li>
         <li>Metadata pushed to LMDB via batched async queue</li>
-        <li>Nginx sendfile() for zero-copy GET responses</li>
+        <li>GET responses streamed from volume block ranges by Granian</li>
       </ul>
     </div>
   </div>
@@ -129,7 +129,8 @@
     </div>
   </div>
 
-  <p class="bench-summary">p2 delivers <strong>22% faster GET throughput</strong> than RustFS thanks to Nginx zero-copy sendfile(). PUT throughput trades off against Python's write path — the raw ASGI interceptor + Rust hashing keeps it competitive at <strong>1,293 obj/s</strong>.</p>
+  <p class="bench-summary">p2 led on GET throughput in this run and trailed on PUT, where the per-request Python path dominates.</p>
+  <p class="bench-note"><strong>Historical run.</strong> These figures were captured on different hardware, before the Nginx <code>X-Accel-Redirect</code> read path was removed, and the GET advantage was previously attributed to <code>sendfile()</code> — an attribution the current architecture no longer supports. Treat the table as a point-in-time comparison, not a claim about today's build. Current single-host numbers, with their caveats, are in the project README. A note on method: the load generator ran on the same machine as the server, so both sides were competing for CPU.</p>
 
   <div class="bench-screenshot">
     <img src="Screenshot_2026-04-15_18-58-33.png" alt="p2 vs RustFS warp benchmark terminal output" loading="lazy">
@@ -149,7 +150,7 @@
         <li>Install and run Dragonfly or another Redis-compatible server first</li>
         <li>Auto-installs Python dependencies</li>
         <li>Binds Granian to <code>localhost:8787</code></li>
-        <li>Generates the host Nginx config for your local storage path</li>
+        <li>Builds and installs the Rust extensions into the venv</li>
         <li>Set <code>P2_DEBUG=true</code> in <code>.env</code> for verbose logs</li>
         <li>~586 MiB RAM across 4 Granian workers at idle</li>
       </ul>
@@ -160,7 +161,7 @@
       <pre><code>bash scripts/setup.sh</code></pre>
       <ul>
         <li>Use this for the first Docker setup</li>
-        <li>Creates or updates <code>.env</code>, installs Nginx config, and starts the stack</li>
+        <li>Creates or updates <code>.env</code> and starts the stack</li>
         <li>Web server on <code>localhost:8787</code></li>
         <li>Includes Dragonfly/Redis-compatible broker + arq workers</li>
         <li>Storage auto-mounted at <code>./storage/</code></li>
@@ -174,11 +175,9 @@
 docker compose down
 docker compose logs -f web</code></pre>
 
-  <h3>Nginx Zero-Copy Setup</h3>
-  <p>For maximum GET performance, pair with Nginx:</p>
-  <pre><code># .env
-P2_STORAGE__USE_X_ACCEL_REDIRECT=true</code></pre>
-  <p>Point Nginx at <code>http://127.0.0.1:8787</code> (Granian). The setup scripts generate the host config automatically.</p>
+  <h3>Reverse Proxy</h3>
+  <p>Not required. Granian binds <code>:8787</code> and serves the S3 data plane, the Django control plane, and the SPA directly.</p>
+  <p>p2 used to hand object reads to Nginx via <code>X-Accel-Redirect</code> so the kernel could <code>sendfile()</code> them. That fit the old one-file-per-object layout; under the append-only design an object is block ranges <em>inside</em> a shared volume file, so there is no single file to hand off and the redirect was removed. You can still front p2 with a proxy for TLS or routing — it just is not needed to serve bytes.</p>
 
   <h3>Use with AWS CLI</h3>
   <pre><code>aws configure set default.s3.signature_version s3v4

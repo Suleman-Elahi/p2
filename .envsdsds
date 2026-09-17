@@ -13,17 +13,17 @@ P2_DEBUG=false
 # ── Redis ─────────────────────────────────────────────────────────────────────
 # Use 'redis' for Docker, '127.0.0.1' for local dev.
 
-P2_REDIS__HOST=redis
+P2_REDIS__HOST=127.0.0.1
 P2_REDIS__PASSWORD=
 P2_REDIS__CACHE_DB=0
 P2_REDIS__MESSAGE_QUEUE_DB=1
-P2_REDIS__ARQ_URL=redis://redis:6379/1
+P2_REDIS__ARQ_URL=redis://127.0.0.1:6379/1
 
 # ── Encryption ────────────────────────────────────────────────────────────────
 # REQUIRED — encrypts API key secrets at rest (Fernet symmetric encryption).
 # Generate with: python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-P2_FERNET_KEY=CHANGE-ME-generate-a-real-key
+P2_FERNET_KEY=NGNrhUS6QaeGQnBY5VEb0N96WWddylTTxNU5Xxi0JbM=
 
 # ── S3 ────────────────────────────────────────────────────────────────────────
 
@@ -36,45 +36,31 @@ P2_S3__BASE_DOMAIN=s3.example.com
 
 # Root directory for blob payloads and LMDB metadata.
 # Docker: /storage (mapped volume). Local dev: ./storage (relative to repo root).
-P2_STORAGE__ROOT=/storage
+P2_STORAGE__ROOT=/home/ilfs/Public/p2/storage
 
 # Host path that Docker mounts into the container at /storage.
 # May be absolute or relative to the repo root.
 P2_HOST_STORAGE_ROOT=./storage
 
-# ── LMDB Metadata ────────────────────────────────────────────────────────────
-# These knobs trade metadata durability for PUT throughput. LMDB never corrupts
-# — at worst you lose the last few writes on an OS crash / power failure.
+# Let nginx serve blobs via X-Accel-Redirect (zero-copy sendfile).
+# When true AND Nginx is proxying (X-Real-IP header present), Granian returns
+# an empty 0-byte response with x-accel-redirect header. Nginx intercepts this
+# and serves the file directly from disk using kernel sendfile().
+# When Nginx is NOT detected (direct access to port 8787), the full file body
+# is served regardless of this setting.
+# Requires nginx to be configured. Leave false for pure-Python serving.
+P2_STORAGE__USE_X_ACCEL_REDIRECT=false
 
-# fsync() after every metadata write transaction.
-#   true  = durable (safe for production). Each PUT waits for disk flush.
-#   false = fast. Data sits in OS buffer cache, flushed to disk ~every 30 s.
-# Expected impact on 4 KiB PUTs: true ≈ 1 400 obj/s, false ≈ 3 500 obj/s.
-P2_S3__METADATA__LMDB__SYNC=true
+# ── Write Durability ─────────────────────────────────────────────────────────
+# ONE lever controls whether a PUT's HTTP 200 is only sent after both the
+# object bytes and the metadata index are fsynced to disk. Writes are always
+# batched (group commit), so full durability is not a real throughput
+# tradeoff — batching amortises the fsync cost across every PUT in a batch.
+P2_S3__DURABLE_WRITES=true
 
-# fsync() only on metadata page renames (less critical than data sync).
-#   true  = safe default, follows sync above.
-#   false = further reduces disk I/O under heavy write concurrency.
-P2_S3__METADATA__LMDB__METASYNC=true
-
-# ── Metadata Write Queue ─────────────────────────────────────────────────────
-# Coalesces concurrent PUTs into batched LMDB transactions instead of one
-# transaction per PUT. Under high concurrency this can reduce LMDB writer-lock
-# contention and amortise any remaining fsync cost across multiple writes.
-
-# Enable the in-process batching queue.
-#   true  = batch writes, single LMDB txn per batch → higher throughput.
-#   false = one LMDB txn per PUT → lower latency for light workloads.
-P2_S3__METADATA__WRITE_QUEUE__ENABLED=false
-
-# Maximum items in the queue before falling back to direct (unbatched) writes.
+# Metadata write batching (always on). These only bound batch/queue size.
 P2_S3__METADATA__WRITE_QUEUE__MAX_SIZE=8192
-
-# Maximum items to commit in a single LMDB transaction.
-P2_S3__METADATA__WRITE_QUEUE__BATCH_SIZE=64
-
-# Max milliseconds to wait for more items when only 1 is queued. 0 = no wait.
-P2_S3__METADATA__WRITE_QUEUE__BATCH_WINDOW_MS=5.0
+P2_S3__METADATA__WRITE_QUEUE__BATCH_SIZE=128
 
 # ── S3 Event Publishing ──────────────────────────────────────────────────────
 
@@ -97,26 +83,9 @@ P2_S3__EVENT_QUEUE__WAIT_FOR_ACK=false
 # at petabyte scale. Depth 1 is simpler but may slow down at extreme object counts.
 P2_S3__BLOB__SHARD_DEPTH=2
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Performance Quick-Reference
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-# Production (safe, durable):
-#   P2_S3__METADATA__LMDB__SYNC=true
-#   P2_S3__METADATA__LMDB__METASYNC=true
-#   P2_S3__METADATA__WRITE_QUEUE__ENABLED=false
-#   → ~1 400 PUT obj/s, data survives power loss
-#
-# Benchmarking (fast, relaxed):
-#   P2_S3__METADATA__LMDB__SYNC=false
-#   P2_S3__METADATA__LMDB__METASYNC=false
-#   P2_S3__METADATA__WRITE_QUEUE__ENABLED=true
-#   P2_S3__ASYNC_EVENT_PUBLISH=true
-#   → ~3 500+ PUT obj/s, up to ~30 s of writes at risk on OS crash
-#
 # ⚠ Config key naming: double underscores (__) separate hierarchy levels.
-#   P2_S3__METADATA__LMDB__SYNC  →  s3.metadata.lmdb.sync  ✅
-#   P2_S3_METADATA__LMDB__SYNC   →  s3_metadata.lmdb.sync  ❌ (won't apply)
+#   P2_S3__DURABLE_WRITES        →  s3.durable_writes      ✅
+#   P2_S3_DURABLE_WRITES         →  s3_durable_writes       ❌ (won't apply)
 
 # ── Observability (optional) ──────────────────────────────────────────────────
 
@@ -129,15 +98,8 @@ OTEL_SERVICE_NAME=p2
 HOST=0.0.0.0
 PORT=8787
 
-# ── Native extensions ─────────────────────────────────────────────────────────
-# The S3 data plane relies on two compiled Rust extensions (p2_s3_crypto,
-# p2_s3_checksum). When one fails to load, p2 falls back to pure-Python paths
-# that are substantially slower, and by default only logs about it.
-#
-# Set this to 1 to turn a missing OR stale extension into a hard startup
-# failure. Strongly recommended when benchmarking, so a silent fallback can
-# never be mistaken for a real result. See p2/s3/_native.py.
-#
-# Note: this is read directly from the environment, not through the P2_ config
-# prefix, because it must be available before Django settings are loaded.
-P2_REQUIRE_NATIVE=0
+P2_STORAGE__VOLUME_SIZE_BYTES=104857600
+
+P2_STORAGE__VOLUME_ACTIVE_POOL_SIZE=2
+
+P2_SECURITY__SSL_REDIRECT=false

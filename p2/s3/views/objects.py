@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import binascii
-import hashlib
 import json
 import logging
 import uuid
@@ -49,6 +48,7 @@ from p2.s3.utils import decode_aws_chunked, iter_request_body
 from p2.s3.cache import (
     get_cached_metadata, set_cached_metadata, invalidate_metadata, invalidate_volume_global,
 )
+from p2.s3.fastpath import hash_put_body
 from p2.s3.volume_pool import BlockCoord, VolumePool
 from p2.s3.volume_reader import (
     read_object, read_range, slice_blocks, stream_blocks, stream_sliced_blocks, total_size,
@@ -290,26 +290,6 @@ class ObjectView(S3View):
                 resp["ETag"] = etag
                 return await self._apply_cors(request, resp, volume)
 
-        # X-Accel-Redirect: Django hands off to Nginx sendfile() — zero-copy.
-        use_accel = getattr(settings, "USE_X_ACCEL_REDIRECT", False) and ("HTTP_X_REAL_IP" in request.META)
-        if use_accel:
-            internal_path = meta.get("internal_path", f"/internal-storage/volumes/{volume.uuid.hex}/{path}")
-            response = HttpResponse(status=200)
-            response["X-Accel-Redirect"] = internal_path
-            response["X-P2-Accel"] = "1"
-            response["Content-Type"] = content_type
-            lm = _fmt_http_date(meta.get("mtime", ""))
-            if lm:
-                response["Last-Modified"] = lm
-            if etag:
-                response["ETag"] = f'"{etag}"'
-            response["Accept-Ranges"] = "bytes"
-            if "response-content-type" in request.GET:
-                response["Content-Type"] = request.GET["response-content-type"]
-            if "response-content-disposition" in request.GET:
-                response["Content-Disposition"] = request.GET["response-content-disposition"]
-            return await self._apply_cors(request, response, volume)
-
         range_header = request.META.get("HTTP_RANGE")
         if range_header and obj_size > 0:
             return await self._range_response(request, pool, blocks, content_type, obj_size, etag, meta, range_header, volume)
@@ -408,8 +388,6 @@ class ObjectView(S3View):
         is_aws_chunked = "aws-chunked" in content_encoding or decoded_length
 
         # ── Read body ────────────────────────────────────────────────────
-        md5_h = hashlib.md5()
-        sha256_h = hashlib.sha256()
         chunks: list[bytes] = []
 
         if is_aws_chunked:
@@ -422,16 +400,18 @@ class ObjectView(S3View):
 
         data = b"".join(chunks)
         blob_size = len(data)
-        md5_h.update(data)
-        sha256_h.update(data)
-        final_md5 = md5_h.hexdigest()
-        final_sha256 = sha256_h.hexdigest()
+        # Hashing pins the event loop for the duration of the call (hashlib
+        # releases the GIL internally, but this coroutine still can't yield to
+        # any other request on this worker until it returns), so large bodies
+        # are dispatched to a thread — see hash_put_body().
+        md5_digest, final_sha256 = await hash_put_body(data)
+        final_md5 = md5_digest.hex()
 
         # ── Integrity checks ─────────────────────────────────────────────
         expected_md5 = request.META.get("HTTP_CONTENT_MD5")
         if expected_md5:
             import base64
-            computed = base64.b64encode(md5_h.digest()).decode("ascii")
+            computed = base64.b64encode(md5_digest).decode("ascii")
             if computed != expected_md5:
                 raise AWSBadDigest
 
@@ -487,7 +467,7 @@ class ObjectView(S3View):
 
         # ── Group-commit: write data + metadata atomically ────────────────
         if handle is not None:
-            await write_block(handle, offset, data, engine, path, metadata_json)
+            await write_block(handle, offset, data, engine, path, metadata_json, md5_digest)
         else:
             await asyncio.to_thread(engine.put, path, metadata_json)
 

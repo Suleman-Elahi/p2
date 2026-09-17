@@ -1,387 +1,295 @@
-"""Group Committer — Batched async writes to volume files + LMDB metadata.
+"""Batched io_uring writes and atomic JSON metadata publication.
 
-Architecture
-------------
-Each Granian worker process runs exactly one ``_commit_worker`` asyncio Task.
-
-When a PUT request calls ``write_block``:
-
-1. The payload bytes, pre-computed hashes, and a ``asyncio.Future`` (ack) are
-   pushed onto the in-process ``asyncio.Queue``.
-2. The PUT coroutine ``await``s the Future — it is *suspended* (non-blocking)
-   until the group commit is done.
-3. The commit worker drains up to ``BATCH_SIZE`` items, calls the Rust engine's
-   ``pwrite`` (or Python ``os.pwrite``) for each item's payload, then commits
-   ALL metadata entries in one LMDB write transaction and resolves every Future.
-
-This collapses N concurrent PUTs into ≈1 ``fdatasync`` + 1 LMDB commit
-instead of N of each, cutting I/O overhead proportionally while still
-guaranteeing that the HTTP 200 is only sent after data is safely on disk.
-
-Fallback
---------
-If the queue is full, the write falls back to a direct synchronous path.
+Each Granian worker owns a bounded queue.  PUTs wait for their own futures, but
+writes arriving within a short window are submitted as one native tokio-uring
+batch and their metadata is committed in one LMDB transaction per engine.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+import json
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Union, Dict, Any
 
 from django.conf import settings
+
+from p2.s3._native import crypto as p2_s3_crypto
+
+if p2_s3_crypto is None:
+    # This module has no pure-Python fallback: every write goes through
+    # ``write_blocks_uring``. Fail at import rather than at the first PUT, which
+    # is what a plain ``import p2_s3_crypto`` used to do here. See p2.s3._native
+    # for the diagnostics and for P2_REQUIRE_NATIVE.
+    raise ImportError(
+        "p2.s3.volume_writer requires the p2_s3_crypto Rust extension, which "
+        "failed to load or is stale. Build it with: bash p2/s3/rust_ext/build.sh"
+    )
 
 if TYPE_CHECKING:
     from p2.s3.volume_pool import VolumeHandle
 
 logger = logging.getLogger(__name__)
 
-try:
-    from p2.s3.p2_s3_crypto import GroupCommitter as RustGroupCommitter
-except ImportError:
-    RustGroupCommitter = None
+_BATCH_WINDOW_SECONDS = 0.001
+_QUEUE: asyncio.Queue["WriteJob"] | None = None
+_WORKER: asyncio.Task[None] | None = None
+_STATE_LOOP: asyncio.AbstractEventLoop | None = None
+_INIT_LOCK: asyncio.Lock | None = None
 
-_RUST_COMMITTER: RustGroupCommitter | None = None
 
-
-# ---------------------------------------------------------------------------
-# Per-event-loop state (each Granian worker has its own event loop)
-# ---------------------------------------------------------------------------
-
-_COMMIT_QUEUE: asyncio.Queue | None = None
-_COMMIT_WORKER_TASK: asyncio.Task | None = None
-_COMMIT_INIT_LOCK: asyncio.Lock | None = None
-# Dedicated single-thread executor for I/O + LMDB commits — avoids contention
-# with the shared asyncio threadpool.
-_IO_EXECUTOR: ThreadPoolExecutor | None = None
-
-# ---------------------------------------------------------------------------
-# Settings helpers
-# ---------------------------------------------------------------------------
-
-def _queue_enabled() -> bool:
-    return bool(getattr(settings, "S3_METADATA_WRITE_QUEUE_ENABLED", True))
+@dataclass(slots=True)
+class WriteJob:
+    handle: "VolumeHandle"
+    offset: int
+    data: bytes
+    engine: object
+    lmdb_key: str
+    metadata_json: Union[str, Dict[str, Any]]
+    completion: asyncio.Future[bool]
 
 
 def _queue_max_size() -> int:
-    return max(1, int(getattr(settings, "S3_METADATA_WRITE_QUEUE_MAX_SIZE", 8192)))
+    return max(1, int(getattr(settings, "S3_METADATA_WRITE_QUEUE_MAX_SIZE", 32768)))
 
 
 def _batch_size() -> int:
-    return max(1, int(getattr(settings, "S3_METADATA_WRITE_BATCH_SIZE", 64)))
+    return max(1, int(getattr(settings, "S3_METADATA_WRITE_BATCH_SIZE", 128)))
 
 
-def _batch_window_ms() -> float:
-    """Max milliseconds to wait for stragglers before flushing an incomplete batch.
+def _batch_window_seconds() -> float:
+    """Coalescing wait (seconds) for small batches.
 
-    Default 0: the non-blocking drain loop already coalesces every request that
-    is *already* queued into one batch. Waiting for *more* stragglers only helps
-    when the arrival rate exceeds the flush rate — otherwise the queue is empty
-    between requests and this wait becomes pure added latency on every PUT. At
-    the low per-worker concurrency a multi-worker deployment actually sees
-    (~2-3 conns/worker), a non-zero window is a self-reinforcing latency trap:
-    measured 7.3ms/op at 5ms window vs 1.3ms/op at 0ms window (conc=1).
+    Reads the documented ``S3_METADATA_WRITE_BATCH_WINDOW_MS`` setting
+    instead of the previous hardcoded ``_BATCH_WINDOW_SECONDS`` constant, so
+    the value is actually tunable (see docs/milliscale_optimization_plan.md,
+    #3). Falls back to the module constant's prior default (1ms) if unset.
     """
-    return max(0.0, float(getattr(settings, "S3_METADATA_WRITE_BATCH_WINDOW_MS", 0.0)))
+    ms = float(getattr(settings, "S3_METADATA_WRITE_BATCH_WINDOW_MS", _BATCH_WINDOW_SECONDS * 1000))
+    return max(0.0, ms) / 1000.0
 
 
-def _volume_fdatasync_enabled() -> bool:
-    """Whether to fdatasync the volume file after each batch (data durability)."""
-    return bool(getattr(settings, "S3_VOLUME_FDATASYNC", True))
+async def _ensure_batch_worker() -> asyncio.Queue[WriteJob]:
+    """Return the queue associated with this Granian worker's event loop."""
+    global _QUEUE, _WORKER, _STATE_LOOP, _INIT_LOCK
+
+    loop = asyncio.get_running_loop()
+    if _STATE_LOOP is loop and _QUEUE is not None and _WORKER is not None and not _WORKER.done():
+        return _QUEUE
+
+    if _STATE_LOOP is not loop:
+        _QUEUE = None
+        _WORKER = None
+        _INIT_LOCK = None
+        _STATE_LOOP = loop
+
+    if _INIT_LOCK is None:
+        _INIT_LOCK = asyncio.Lock()
+
+    async with _INIT_LOCK:
+        if _QUEUE is None:
+            _QUEUE = asyncio.Queue(maxsize=_queue_max_size())
+        if _WORKER is None or _WORKER.done():
+            if _WORKER is not None and not _WORKER.cancelled():
+                exception = _WORKER.exception()
+                if exception:
+                    logger.error("io_uring batch worker stopped: %s", exception)
+            _WORKER = asyncio.create_task(_batch_worker(_QUEUE), name="p2-io-uring-batch-writer")
+        return _QUEUE
 
 
-# ---------------------------------------------------------------------------
-# Worker lifecycle
-# ---------------------------------------------------------------------------
+def _resolve_future(fut: "asyncio.Future[bool]", value: bool) -> None:
+    """Resolve *fut* with *value*. Safe if already done."""
+    if not fut.done():
+        fut.set_result(value)
 
-async def _ensure_commit_worker() -> None:
-    """Start the group-commit worker task if not already running."""
-    global _COMMIT_QUEUE, _COMMIT_WORKER_TASK, _COMMIT_INIT_LOCK, _IO_EXECUTOR, _RUST_COMMITTER
 
-    current_loop = asyncio.get_running_loop()
+def _fail_future(fut: "asyncio.Future[bool]", exc: BaseException) -> None:
+    """Fail *fut* with *exc*. Safe if already done."""
+    if not fut.done():
+        fut.set_exception(exc)
 
-    if RustGroupCommitter is not None and _RUST_COMMITTER is None:
-        _RUST_COMMITTER = RustGroupCommitter(_batch_size(), int(_batch_window_ms()))
 
-    if _COMMIT_WORKER_TASK is not None and not _COMMIT_WORKER_TASK.done():
+def _threadsafe_resolver(loop: asyncio.AbstractEventLoop):
+    """Build a resolver that schedules completion callbacks onto *loop*.
+
+    Used by the batch worker, which runs this function via
+    ``asyncio.to_thread`` while the loop itself is elsewhere running the
+    coroutine that awaits each job's completion.
+    """
+
+    def resolve(job: WriteJob, exc: BaseException | None) -> None:
+        if exc is None:
+            loop.call_soon_threadsafe(_resolve_future, job.completion, True)
+        else:
+            loop.call_soon_threadsafe(_fail_future, job.completion, exc)
+
+    return resolve
+
+
+def _inline_resolver():
+    """Build a resolver that resolves completions synchronously, in-thread.
+
+    Used by ``_direct_write``, which calls ``_write_and_commit_batch``
+    directly without an active event loop backing the future — there is no
+    loop to schedule a threadsafe callback onto, so resolve immediately.
+    """
+
+    def resolve(job: WriteJob, exc: BaseException | None) -> None:
+        if exc is None:
+            _resolve_future(job.completion, True)
+        else:
+            _fail_future(job.completion, exc)
+
+    return resolve
+
+
+def _write_and_commit_batch(batch: list[WriteJob], resolve) -> None:
+    """Perform native writes, then atomically publish metadata per LMDB engine.
+
+    Each engine's jobs are committed and their completions resolved
+    independently via *resolve* (job, exc_or_None): a PUT going to a quiet
+    volume must not wait on an unrelated volume's LMDB commit just because
+    both writes landed in the same batching window
+    (see docs/milliscale_optimization_plan.md, #1).
+    """
+    write_jobs = [job for job in batch if job.data]
+    if write_jobs:
+        p2_s3_crypto.write_blocks_uring(
+            [(job.handle.fd, job.offset, job.data) for job in write_jobs]
+        )
+
+        # One fdatasync per unique volume fd touched by this batch, issued
+        # once data is on disk and before any metadata commit references it.
+        # Amortizes the durability syscall across the whole batch instead of
+        # per write, and keeps the write-ahead ordering (data durable before
+        # metadata says it exists) intact for every engine below.
+        if getattr(settings, "S3_VOLUME_FDATASYNC", True):
+            synced_fds: set[int] = set()
+            for job in write_jobs:
+                fd = job.handle.fd
+                if fd not in synced_fds:
+                    p2_s3_crypto.fdatasync_uring(fd)
+                    synced_fds.add(fd)
+
+    by_engine: dict[int, tuple[object, list[WriteJob]]] = {}
+    for job in batch:
+        group = by_engine.setdefault(id(job.engine), (job.engine, []))
+        group[1].append(job)
+
+    for engine, jobs in by_engine.values():
         try:
-            # Check loop binding to avoid Task from a previous closed event loop
-            if _COMMIT_WORKER_TASK.get_loop() == current_loop:
-                return
-        except AttributeError:
-            pass
+            # Pre-serialize all JSON outside the write transaction to minimize lock time
+            serialized_jobs = []
+            for job in jobs:
+                meta_str = json.dumps(job.metadata_json) if isinstance(job.metadata_json, dict) else job.metadata_json
+                serialized_jobs.append((job.lmdb_key.encode("utf-8"), meta_str.encode("utf-8")))
 
-    if _COMMIT_INIT_LOCK is None or getattr(_COMMIT_INIT_LOCK, "_loop", None) != current_loop:
-        _COMMIT_INIT_LOCK = asyncio.Lock()
-
-    async with _COMMIT_INIT_LOCK:
-        if _COMMIT_QUEUE is None or getattr(_COMMIT_QUEUE, "_loop", None) != current_loop:
-            _COMMIT_QUEUE = asyncio.Queue(maxsize=_queue_max_size())
-        if _IO_EXECUTOR is None:
-            _IO_EXECUTOR = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="p2-vol-writer",
-            )
-        if _COMMIT_WORKER_TASK is None or _COMMIT_WORKER_TASK.done():
-            if _COMMIT_WORKER_TASK is not None and _COMMIT_WORKER_TASK.done():
-                exc = _COMMIT_WORKER_TASK.exception()
-                if exc:
-                    logger.error("group-commit worker crashed, restarting: %s", exc)
-            _COMMIT_WORKER_TASK = asyncio.create_task(
-                _commit_worker(), name="p2-group-commit-worker"
-            )
+            with engine.env.begin(write=True, db=engine.db) as txn:
+                for key, val in serialized_jobs:
+                    txn.put(key, val)
+        except Exception as exc:  # noqa: BLE001 - isolate failure to this engine's jobs only
+            logger.exception("LMDB commit failed for engine batch of %d objects", len(jobs))
+            for job in jobs:
+                resolve(job, exc)
+        else:
+            for job in jobs:
+                resolve(job, None)
 
 
-# ---------------------------------------------------------------------------
-# Group Commit Worker
-# ---------------------------------------------------------------------------
-
-async def _commit_worker() -> None:
-    """Drain the queue in batches, write data, then commit metadata in bulk."""
-    assert _COMMIT_QUEUE is not None
+async def _batch_worker(queue: asyncio.Queue[WriteJob]) -> None:
     max_batch = _batch_size()
-    window_s = _batch_window_ms() / 1000.0
-
-    try:
-        while True:
-            batch: list[tuple] = []
-            try:
-                first = await _COMMIT_QUEUE.get()
-                batch.append(first)
-            except asyncio.CancelledError:
-                break
-
-            # Drain everything already queued immediately — key optimization
+    batch_window = _batch_window_seconds()
+    loop = asyncio.get_running_loop()
+    resolve = _threadsafe_resolver(loop)
+    while True:
+        first = await queue.get()
+        batch = [first]
+        try:
+            # Drain whatever is already queued immediately — under real
+            # concurrency, other PUTs have usually already enqueued by the
+            # time this task resumes, so this costs no extra latency.
             while len(batch) < max_batch:
                 try:
-                    batch.append(_COMMIT_QUEUE.get_nowait())
+                    batch.append(queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
 
-            # Wait briefly for stragglers if batch is small and window is set
-            if len(batch) == 1 and window_s > 0:
-                deadline = asyncio.get_event_loop().time() + window_s
+            # Only pay the coalescing tax when the batch is still small,
+            # i.e. genuinely low concurrency where a short wait can still
+            # pick up a few more writers without hurting solo-request p50.
+            if len(batch) < 4 and batch_window > 0:
+                await asyncio.sleep(batch_window)
                 while len(batch) < max_batch:
-                    remaining = deadline - asyncio.get_event_loop().time()
-                    if remaining <= 0:
-                        break
                     try:
-                        item = await asyncio.wait_for(
-                            _COMMIT_QUEUE.get(), timeout=remaining
-                        )
-                        batch.append(item)
-                        # Got a second item — drain immediately
-                        while len(batch) < max_batch:
-                            try:
-                                batch.append(_COMMIT_QUEUE.get_nowait())
-                            except asyncio.QueueEmpty:
-                                break
-                        break
-                    except asyncio.TimeoutError:
+                        batch.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
                         break
 
-            await _flush_batch(batch)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        # Drain remaining items on shutdown so no writes are lost
-        remaining_batch: list[tuple] = []
-        assert _COMMIT_QUEUE is not None
-        while not _COMMIT_QUEUE.empty():
-            try:
-                remaining_batch.append(_COMMIT_QUEUE.get_nowait())
-            except asyncio.QueueEmpty:
-                break
-        if remaining_batch:
-            logger.info(
-                "group-commit worker draining %d remaining items on shutdown",
-                len(remaining_batch),
-            )
-            await _flush_batch(remaining_batch)
-
-
-async def _flush_batch(batch: list[tuple]) -> None:
-    """Write all batch items to disk and commit their metadata to LMDB.
-
-    Each item is a tuple:
-        (handle, offset, data_bytes, engine, lmdb_key, metadata_json, future_or_None)
-
-    Items sharing the same volume file are written in one ``pwrite`` loop.
-    All LMDB metadata updates go in a single write transaction per engine.
-    """
-    assert _IO_EXECUTOR is not None
-
-    do_fdatasync = _volume_fdatasync_enabled()
-
-    def _do_flush(batch=batch) -> list[tuple]:
-        """Runs on the dedicated IO thread."""
-        # Group by volume handle for bulk pwrite
-        vol_groups: dict[str, list[tuple]] = {}
-        for item in batch:
-            handle, offset, data, engine, lmdb_key, meta_json, fut = item
-            vol_groups.setdefault(handle.uuid_hex, []).append(item)
-
-        errors: dict[int, Exception] = {}  # id(item) -> exc
-
-        # Phase 1: issue all pwrites for every volume first (cheap, no blocking
-        # on disk flush). Collect the fds that need syncing.
-        fds_to_sync: list[tuple[int, list[tuple]]] = []
-        for uid, items in vol_groups.items():
-            handle = items[0][0]
-            try:
-                fd = handle.fd
-                for item in items:
-                    _, off, data, *_ = item
-                    if data:
-                        written = os.pwrite(fd, data, off)
-                        if written != len(data):
-                            raise OSError(
-                                f"pwrite partial: wrote {written}/{len(data)} bytes"
-                            )
-                fds_to_sync.append((fd, items))
-            except Exception as exc:
-                for item in items:
-                    errors[id(item)] = exc
-
-        # Phase 2: fdatasync each volume. When more than one volume received
-        # writes in this batch, run the (blocking) fsyncs concurrently so batch
-        # latency is bounded by the slowest single fsync rather than their sum.
-        if do_fdatasync and fds_to_sync:
-            if len(fds_to_sync) == 1:
-                fd, items = fds_to_sync[0]
-                try:
-                    os.fdatasync(fd)
-                except Exception as exc:
-                    for item in items:
-                        errors[id(item)] = exc
-            else:
-                def _sync_one(entry):
-                    fd, items = entry
-                    try:
-                        os.fdatasync(fd)
-                        return None
-                    except Exception as exc:
-                        return (items, exc)
-
-                with ThreadPoolExecutor(max_workers=len(fds_to_sync)) as sync_pool:
-                    for result in sync_pool.map(_sync_one, fds_to_sync):
-                        if result is not None:
-                            items, exc = result
-                            for item in items:
-                                errors[id(item)] = exc
-
-        # Group by LMDB engine for bulk metadata commit
-        engine_groups: dict[int, tuple] = {}
-        for item in batch:
-            _, _, _, engine, lmdb_key, meta_json, _ = item
-            eid = id(engine)
-            if eid not in engine_groups:
-                engine_groups[eid] = (engine, [])
-            engine_groups[eid][1].append(item)
-
-        for engine, items in engine_groups.values():
-            group_error = None
-            try:
-                with engine.env.begin(write=True, db=engine.db) as txn:
-                    for item in items:
-                        if id(item) in errors:
-                            continue
-                        _, _, _, _, lmdb_key, meta_json, _ = item
-                        txn.put(
-                            lmdb_key.encode("utf-8"),
-                            meta_json.encode("utf-8"),
-                        )
-            except Exception as exc:
-                group_error = exc
-                for item in items:
-                    if id(item) not in errors:
-                        errors[id(item)] = exc
-
-        # Return resolution results: (item, exc_or_None)
-        return [(item, errors.get(id(item))) for item in batch]
-
-    loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(_IO_EXECUTOR, _do_flush)
-
-    for item, exc in results:
-        fut = item[6]
-        if fut is None or fut.done():
-            continue
-        if exc is not None:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(True)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def _commit_metadata_direct(engine, lmdb_key: str, metadata_json: str) -> None:
-    with engine.env.begin(write=True, db=engine.db) as txn:
-        txn.put(lmdb_key.encode("utf-8"), metadata_json.encode("utf-8"))
+            # Completions are resolved per-engine inside _write_and_commit_batch
+            # as soon as that engine's own write + LMDB commit finishes,
+            # rather than after the whole batch returns — this avoids
+            # coupling unrelated volumes/engines that happened to land in
+            # the same batching window.
+            await asyncio.to_thread(_write_and_commit_batch, batch, resolve)
+        except asyncio.CancelledError:
+            for job in batch:
+                if not job.completion.done():
+                    job.completion.cancel()
+            raise
+        except Exception as exc:
+            # Only reached if _write_and_commit_batch raised before it could
+            # isolate the failure to individual engines (e.g. the shared
+            # io_uring write call itself failed).
+            logger.exception("io_uring batch write failed for %d objects", len(batch))
+            for job in batch:
+                if not job.completion.done():
+                    job.completion.set_exception(exc)
+        finally:
+            for _ in batch:
+                queue.task_done()
 
 
 async def write_block(
     handle: "VolumeHandle",
     offset: int,
     data: bytes,
-    engine,
+    engine: object,
     lmdb_key: str,
-    metadata_json: str,
+    metadata_json: Union[str, Dict[str, Any]],
+    md5_hash: bytes | None = None,
 ) -> bool:
-    """Write *data* to *handle* at *offset* and commit *metadata_json* to LMDB.
+    """Queue a write and wait until its data and metadata are both visible."""
+    del md5_hash
+    loop = asyncio.get_running_loop()
+    queue = await _ensure_batch_worker()
+    completion: asyncio.Future[bool] = loop.create_future()
+    job = WriteJob(handle, offset, data, engine, lmdb_key, metadata_json, completion)
 
-    When the queue is enabled:
-      - Suspends the caller (non-blocking) until the batch commit resolves.
-      - Multiple concurrent callers are coalesced into one fdatasync + one LMDB txn.
-
-    Falls back to direct I/O + LMDB when queue is full or disabled.
-
-    Returns True on success, raises on failure.
-    """
-    if _queue_enabled():
-        await _ensure_commit_worker()
-        # NOTE: Rust GroupCommitter path intentionally skipped here.
-        # The Rust committer bypasses the Python asyncio.Queue batch,
-        # causing each PUT to do individual pwrite + fdatasync + LMDB txn
-        # instead of batching N writes into 1 fdatasync + 1 LMDB txn.
-        # The Python queue is the correct batching path until the Rust
-        # committer is fully integrated with the Python queue's lifecycle.
-
-        fut = asyncio.get_running_loop().create_future()
-        try:
-            assert _COMMIT_QUEUE is not None
-            _COMMIT_QUEUE.put_nowait((handle, offset, data, engine, lmdb_key, metadata_json, fut))
-            await fut
-            return True
-        except asyncio.QueueFull:
-            logger.warning(
-                "group-commit queue full; falling back to direct write for key=%s", lmdb_key
-            )
-
-    # Direct path — one fdatasync + one LMDB txn, no batching
-    await asyncio.to_thread(_direct_write, handle, offset, data, engine, lmdb_key, metadata_json)
-    return True
+    # Awaiting bounded queue capacity applies backpressure rather than growing
+    # memory without limit when clients exceed storage service capacity.
+    await queue.put(job)
+    return await completion
 
 
 def _direct_write(
     handle: "VolumeHandle",
     offset: int,
     data: bytes,
-    engine,
+    engine: object,
     lmdb_key: str,
-    metadata_json: str,
+    metadata_json: Union[str, Dict[str, Any]],
 ) -> None:
-    """Synchronous direct write — used as fallback path."""
-    if data:
-        fd = handle.fd
-        written = os.pwrite(fd, data, offset)
-        if written != len(data):
-            raise OSError(f"pwrite partial: wrote {written}/{len(data)} bytes")
-        if _volume_fdatasync_enabled():
-            os.fdatasync(fd)
-    with engine.env.begin(write=True, db=engine.db) as txn:
-        txn.put(lmdb_key.encode("utf-8"), metadata_json.encode("utf-8"))
-
+    """Synchronous compatibility path with the same native batch primitive."""
+    loop = asyncio.new_event_loop()
+    try:
+        completion = loop.create_future()
+        _write_and_commit_batch(
+            [WriteJob(handle, offset, data, engine, lmdb_key, metadata_json, completion)],
+            _inline_resolver(),
+        )
+        if completion.done():
+            completion.result()
+    finally:
+        loop.close()

@@ -74,8 +74,6 @@ CORS_ORIGIN_ALLOW_ALL = DEBUG
 SECURE_SSL_REDIRECT = CONFIG.y_bool('security.ssl_redirect', default=not DEBUG and not TEST)
 X_FRAME_OPTIONS = "SAMEORIGIN"
 
-# Set True in production when Nginx handles X-Accel-Redirect (zero-copy reads)
-USE_X_ACCEL_REDIRECT = CONFIG.y_bool("storage.use_x_accel_redirect", default=False)
 # Publish S3 post-save events without blocking PUT response.
 S3_ASYNC_EVENT_PUBLISH = CONFIG.y_bool("s3.async_event_publish", default=False)
 # Optional bounded queue for Redis Stream publishing (experimental, off by default).
@@ -107,6 +105,7 @@ S3_METADATA_WRITE_BATCH_SIZE = int(CONFIG.y("s3.metadata.write_queue.batch_size"
 # coalesces all queued requests; a non-zero wait only adds latency at the low
 # per-worker concurrency real deployments see (measured 7.3ms vs 1.3ms/op).
 S3_METADATA_WRITE_BATCH_WINDOW_MS = float(CONFIG.y("s3.metadata.write_queue.batch_window_ms", default=0.0))
+S3_BENCHMARK_TIMINGS = CONFIG.y_bool("s3.benchmark_timings", default=False)
 # In-process hot-path cache TTLs (seconds) for S3 auth/ACL checks.
 S3_CACHE_APIKEY_TTL_SECONDS = float(CONFIG.y("s3.cache.apikey_ttl_seconds", default=600))
 S3_CACHE_VOLUME_TTL_SECONDS = float(CONFIG.y("s3.cache.volume_ttl_seconds", default=600))

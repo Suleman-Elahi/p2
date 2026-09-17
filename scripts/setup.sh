@@ -83,7 +83,9 @@ _ensure_generated_secret() {
 }
 
 # ── Resolve host storage root ────────────────────────────────────────────────
-# Host nginx needs the real host path; containers still use /storage internally.
+# docker-compose bind-mounts this host path to /storage in every service (see
+# P2_HOST_STORAGE_ROOT in docker-compose.yml); containers always use /storage
+# internally.
 _resolve_host_storage_root() {
     local val=""
 
@@ -132,74 +134,15 @@ _set_env_value "P2_REDIS__HOST" "redis"
 _set_env_value "P2_REDIS__ARQ_URL" "redis://redis:6379/1"
 _set_env_value "P2_SECURITY__SSL_REDIRECT" "false"
 
-# ── Nginx config ───────────────────────────────────────────────────────────────
-_install_nginx() {
-    local template="$REPO_ROOT/deploy/nginx-host.conf"
-    [[ -f "$template" ]] || die "nginx template not found: $template"
-
-    local dest_available="/etc/nginx/sites-available/p2"
-    local dest_enabled="/etc/nginx/sites-enabled/p2"
-    local legacy_available="/etc/nginx/sites-available/p2.conf"
-    local legacy_enabled="/etc/nginx/sites-enabled/p2.conf"
-    # Also write the root-level convenience copy (gitignored)
-    local dev_copy="$REPO_ROOT/nginx-p2.conf"
-
-    # Substitute both __STORAGE_PATH__ and __STATIC_PATH__ from the template.
-    local rendered
-    rendered="$(sed \
-        -e "s|__STORAGE_PATH__|${HOST_STORAGE_ROOT}|g" \
-        -e "s|__STATIC_PATH__|${STATIC_ROOT}|g" \
-        "$template")"
-
-    # Write the system-installed config (requires sudo)
-    sudo mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-    echo "$rendered" | sudo tee "$dest_available" > /dev/null
-    # Remove legacy p2.conf installs so nginx does not load the same upstream twice.
-    sudo rm -f "$legacy_enabled" /etc/nginx/sites-enabled/default
-    if [[ -f "$legacy_available" ]]; then
-        sudo rm -f "$legacy_available"
-    fi
-    sudo ln -sf "$dest_available" "$dest_enabled"
-
-    # Write the local dev copy (no sudo needed, gitignored)
-    echo "$rendered" > "$dev_copy"
-    info "Written local nginx config: $dev_copy"
-
-    # Patch nginx.conf include on Arch Linux / minimal installs
-    if ! grep -q "sites-enabled" /etc/nginx/nginx.conf; then
-        info "Patching /etc/nginx/nginx.conf to include sites-enabled..."
-        sudo sed -i '/http {/a \    include /etc/nginx/sites-enabled/*;\n    types_hash_max_size 2048;\n    types_hash_bucket_size 64;' /etc/nginx/nginx.conf
-    fi
-
-    sudo nginx -t || die "nginx config test failed — fix errors above then re-run."
-
-    if command -v systemctl &>/dev/null; then
-        if systemctl is-active --quiet nginx; then
-            sudo systemctl reload nginx
-        else
-            sudo systemctl enable --now nginx
-        fi
-    else
-        sudo nginx -s reload 2>/dev/null || sudo nginx
-    fi
-
-    info "Nginx configured and reloaded."
-}
-
-if ! command -v nginx &>/dev/null; then
-    warn "nginx not found. Installing..."
-    sudo apt-get update && sudo apt-get install -y nginx
-fi
-
-if command -v nginx &>/dev/null; then
-    info "Installing nginx config..."
-    _install_nginx
-    _set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "true"
-else
-    warn "nginx not found — skipping nginx setup (X-Accel-Redirect will be unavailable)."
-    warn "Set P2_STORAGE__USE_X_ACCEL_REDIRECT=false in .env to use pure-Python file serving."
-    _set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "false"
-fi
+# ── Reverse proxy ──────────────────────────────────────────────────────────────
+# p2 no longer needs one. Granian serves the S3 data plane, the Django control
+# plane and the SPA directly on port 8787.
+#
+# This step used to install an nginx site so object reads could be handed off via
+# X-Accel-Redirect. That made sense when each object was its own file on disk.
+# With the append-only volume layout an object's bytes are one or more block
+# ranges inside a shared volume file, so there is no single file for sendfile()
+# to hand out and the redirect has nothing to point at.
 
 # ── Docker ─────────────────────────────────────────────────────────────────────
 info "Building and starting Docker services..."
@@ -208,5 +151,5 @@ docker compose up --build -d
 info "Recalculating volume stats from metadata..."
 docker compose exec -T web python manage.py recalculate_space_used
 
-info "Done. p2 should be available at http://localhost"
+info "Done. p2 should be available at http://localhost:8787"
 info "Default login: admin / admin"

@@ -12,7 +12,7 @@ It is designed to cleanly handle petabyte-scale metadata via LMDB and process co
 
 - **S3 API Compatibility:** Plugs seamlessly into AWS SDKs, MinIO tools (`warp`), Cyberduck, and standard REST tooling.
 - **Microsecond Cryptography:** File hash pipelines (MD5, SHA256) are offloaded to `p2_s3_crypto`, a custom Rust implementation that unlocks the Python GIL and streams payloads concurrently.
-- **Zero-Copy Reads:** Read operations utilize strictly natively configured Nginx `X-Accel-Redirect` bindings to drop the Python loop entirely and feed object bytes to external networks utilizing kernel-level `sendfile()`.
+- **Proxy-Free Reads:** Granian serves object bytes itself. Reads resolve an object's block ranges from LMDB and stream them straight out of the append-only volume files, with no reverse proxy and no `sendfile()` handoff in the path.
 - **Framework-less Write Bypassing:** Write performance acts identically to compiled Rust backends by using a Raw ASGI protocol Interceptor that steals the active raw byte sequence off the Granian sockets prior to Django initialization.
 - **Control-Plane Interface:** Features a modern management interface and fully typed OpenAPI documentation cleanly maintained under Django Ninja.
 
@@ -36,7 +36,7 @@ Core `PUT` and `GET` S3 transaction traffic goes through a hyper-optimized sub-a
 
 ### Running with Docker
 
-For the first Docker boot, use the setup script instead of calling `docker compose up` directly. It creates or updates `.env`, prepares storage paths, installs the host nginx config, runs the Docker stack, and recalculates persisted volume stats.
+For the first Docker boot, use the setup script instead of calling `docker compose up` directly. It creates or updates `.env`, prepares storage paths, runs the Docker stack, and recalculates persisted volume stats.
 
 ```bash
 bash scripts/setup.sh
@@ -62,7 +62,6 @@ Before starting the native flow:
 
 - Copy `.env.example` to `.env` and review the values if you want custom secrets, storage paths, or hostnames.
 - Ensure a local Dragonfly or Redis-compatible server is installed and reachable for cache + ARQ. The native script does not provision it for you.
-- Ensure nginx can be installed or is already available if you want `X-Accel-Redirect`.
 
 Then use the native bootloader:
 
@@ -73,25 +72,38 @@ bash scripts/run_without_docker.sh
 - Creates `.env` from `.env.example` if it is missing.
 - Constructs and binds `P2_STORAGE__ROOT` to your project structure.
 - Triggers `granian` asynchronously to evaluate socket requests natively without the Docker Network overhead.
+- No reverse proxy involved — Granian serves the S3 data plane, Django, and the SPA directly on `localhost:8787`. This is now the only deployment topology; Docker uses it too.
 - By default, verbose Web UI and `granian` access logs are **disabled** for maximized performance profiling. You can temporarily enable debug tracing by pushing `P2_DEBUG=true` safely into your `.env` manifest before launch.
 - **Memory footprint:** ~586 MiB total across 4 Granian workers at idle.
 
-## 🔧 Nginx Configuration (X-Accel-Redirect)
+## 🔧 Reverse Proxy
 
-To trigger the `Zero-Copy` streaming architecture for GET operations, `p2` expects you to pair your deployment with Nginx natively forwarding traffic using proxy configurations.
+None required. Granian binds `:8787` and serves the S3 data plane, the Django control plane, and the SPA directly.
 
-The setup scripts generate the host nginx config for you based on the local storage path and expected Granian upstream.
+Earlier versions paired p2 with Nginx and handed object reads off via `X-Accel-Redirect`, so the kernel could `sendfile()` the object straight from disk. That worked when every object was its own file, but it does not fit the append-only design: an object's bytes are now one or more block ranges *inside* a shared volume file, alongside unrelated objects. There is no single file to hand to `sendfile()`, so the redirect had nothing meaningful to point at and has been removed along with the Nginx dependency.
 
-- You must deploy Nginx directing traffic pointing explicitly to `http://127.0.0.1:8787` (Granian process pipeline).
-- Ensure `.env` sets `P2_STORAGE__USE_X_ACCEL_REDIRECT=true`
+Reads are served by resolving an object's block list from LMDB and streaming those ranges out of the volume files (`p2/s3/volume_reader.py`).
 
-Once successfully mapped, Granian emits a specialized `0-byte` header interceptor payload commanding the Nginx Daemon daemon to rapidly broadcast and close out file chunks direct from file system IO mapping, achieving near-hardware network saturation limitations!
+You can of course still put a proxy in front of p2 for TLS termination, routing, or rate limiting — p2 just no longer needs one to serve object bytes.
 
 ---
 
 ## 📊 Benchmark Results (Native Execution)
 
-Below are the audited `warp` benchmark on quite a powerful machine, metrics captured locally bypassing Docker (reflects real-world Nginx/Granian saturation on localhost testing):
+`warp`, 4 KiB objects, concurrency 20, 30s, against Granian on `127.0.0.1:8787`:
 
-- **GET Throughput:** `~8,799 Objects/sec` (Avg: 34.37 MiB/s)
-- **PUT Throughput:** `~2,140 Objects/sec` (Avg: 8.36 MiB/s)
+| | observed range |
+|---|---|
+| **GET** | 4,900 – 7,100 obj/s (19 – 28 MiB/s), p50 2.5 – 3.9 ms |
+| **PUT** | 840 – 2,770 obj/s (3.3 – 10.8 MiB/s), p50 7.3 – 26 ms |
+
+**These are ranges because this setup is not reproducible run to run.** Four consecutive PUT runs on the same machine produced 2,770 / 1,690 / 840 / 1,440 obj/s — a 3.3x spread, with p50 swinging from 7 ms to 350 ms. Treat any single number from this configuration as noise. Known contributors:
+
+- **Worker load imbalance.** Sampling per-worker CPU during a run gave shares of 59% / 17% / 24% / **0%** across the four Granian workers — one worker served most of the traffic while another got none. With only 20 keep-alive connections spread over 4 workers, whichever way connections land at accept time decides the result. The tight 346 ms latency cluster in one run was queueing behind a single saturated worker, not slow code.
+- **The load generator shares the box.** `warp` runs on the same 4 cores as 4 Granian workers plus the arq worker and the gRPC server. Client and server compete for CPU. Run `warp` from a second machine before trusting any figure.
+- **Throughput degrades as the dataset grows** and partially recovers on server restart, so both on-disk size and per-process state are involved. Not yet diagnosed.
+- **Hardware:** Intel i5-6500T (4 cores, 2.5 GHz, 2015), SATA SSD, `btrfs`. Modest.
+- **Durability was off** (`P2_S3__VOLUME__FDATASYNC=false`). On this filesystem `fdatasync` costs ~1.5 ms median / ~6.4 ms p99, so enabling it changes PUT latency substantially.
+- Earlier figures measured on different hardware with the removed Nginx `X-Accel-Redirect` read path are not comparable.
+
+For context on where PUT time actually goes: a 4 KiB `pwrite` costs ~6 µs here, and profiling shows the io_uring write submission is ~6% of per-request CPU work while auth, the ORM, and Redis together are ~32%. This workload is bound by per-request Python overhead, not by disk.

@@ -45,6 +45,21 @@ _set_env_value() {
     fi
 }
 
+_set_env_default() {
+    local key="$1"
+    local value="$2"
+    local current
+
+    current="$(_get_env_value "$key")"
+    if [[ -n "$current" ]]; then
+        info "Preserving .env ${key}=${current}"
+        return
+    fi
+
+    info "Setting native default ${key}=${value}"
+    _set_env_value "$key" "$value"
+}
+
 _generate_secret_key() {
     if command -v python3 &>/dev/null; then
         python3 -c 'import secrets; print(secrets.token_urlsafe(64))'
@@ -102,7 +117,6 @@ _resolve_storage_root() {
 }
 
 STORAGE_ROOT="$(_resolve_storage_root)"
-STATIC_ROOT="$REPO_ROOT/static"
 
 # ── Dirs ───────────────────────────────────────────────────────────────────────
 info "Creating required directories..."
@@ -131,103 +145,49 @@ else
     warn "Frappe UI not found at $UI_DIR — skipping SPA build"
 fi
 
-info "Updating .env for native mode..."
+info "Applying native-mode defaults without overwriting user settings..."
 _ensure_generated_secret "P2_SECRET_KEY"
 _ensure_generated_secret "P2_FERNET_KEY"
-_set_env_value "P2_STORAGE__ROOT" "$STORAGE_ROOT"
-_set_env_value "P2_REDIS__HOST" "127.0.0.1"
-_set_env_value "P2_REDIS__ARQ_URL" "redis://127.0.0.1:6379/1"
-_set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "false"
-_set_env_value "P2_STORAGE__VOLUME_SIZE_BYTES" "104857600"
-_set_env_value "P2_STORAGE__VOLUME_ACTIVE_POOL_SIZE" "2"
-_set_env_value "P2_SECURITY__SSL_REDIRECT" "false"
+
+# /storage is the Docker-image default and does not point at this checkout.
+# Normalize only that placeholder; preserve any real user-selected storage root.
+CONFIGURED_STORAGE_ROOT="$(_get_env_value "P2_STORAGE__ROOT")"
+if [[ -z "$CONFIGURED_STORAGE_ROOT" || "$CONFIGURED_STORAGE_ROOT" == "/storage" ]]; then
+    info "Setting native storage root to $STORAGE_ROOT"
+    _set_env_value "P2_STORAGE__ROOT" "$STORAGE_ROOT"
+else
+    info "Preserving .env P2_STORAGE__ROOT=$CONFIGURED_STORAGE_ROOT"
+fi
+
+_set_env_default "P2_REDIS__HOST" "127.0.0.1"
+_set_env_default "P2_REDIS__ARQ_URL" "redis://127.0.0.1:6379/1"
+_set_env_default "P2_STORAGE__VOLUME_SIZE_BYTES" "104857600"
+_set_env_default "P2_STORAGE__VOLUME_ACTIVE_POOL_SIZE" "2"
+_set_env_default "P2_SECURITY__SSL_REDIRECT" "false"
+
+# Granian serves everything directly (S3 data plane, Django, and the SPA).
+# The X-Accel-Redirect handoff and its P2_STORAGE__USE_X_ACCEL_REDIRECT flag were
+# removed along with the nginx dependency; a leftover entry in .env is inert.
 
 # ── Port ───────────────────────────────────────────────────────────────────────
 PORT=8787
 
-# ── Nginx config (regenerate from template so paths are always correct) ─────────
-if ! command -v nginx &>/dev/null; then
-    warn "nginx not found. Installing..."
-    sudo apt-get update && sudo apt-get install -y nginx
-fi
-
-if command -v nginx &>/dev/null; then
-    DEV_CONF="$REPO_ROOT/nginx-p2.conf"
-    info "Generating nginx-p2.conf inline..."
-    UI_DIST="$REPO_ROOT/ui/dist"
-    cat > "$DEV_CONF" <<EOF
-upstream granian {
-    server 127.0.0.1:${PORT};
-    keepalive 128;
-}
-
-server {
-    listen 80;
-    server_name localhost _;
-
-    client_max_body_size 2G;
-    access_log off;
-
-    # ── Frappe UI SPA assets (served directly by nginx) ────────────────
-    location /assets/ {
-        alias ${UI_DIST}/assets/;
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # ── Django static files ────────────────────────────────────────────
-    location /_/static/ {
-        alias ${STATIC_ROOT}/;
-        expires 7d;
-    }
-
-    # ── Internal storage (X-Accel-Redirect) ────────────────────────────
-    location /internal-storage/ {
-        internal;
-        alias ${STORAGE_ROOT}/;
-        sendfile on;
-        tcp_nopush on;
-        aio threads;
-    }
-
-    # ── Everything else → Granian (S3 data plane + Django SPA) ─────────
-    location / {
-        proxy_pass http://granian;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host \$http_host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_redirect off;
-        proxy_request_buffering off;
-        proxy_buffering off;
-    }
-}
-EOF
-    info "nginx-p2.conf written (storage=\$STORAGE_ROOT, port=\$PORT)"
-
-    info "Replacing nginx config and reloading (may require sudo password)..."
-    sudo cp "$DEV_CONF" "/etc/nginx/sites-available/p2.conf"
-    sudo ln -sf "/etc/nginx/sites-available/p2.conf" "/etc/nginx/sites-enabled/p2.conf"
-    # Remove stale legacy symlinks that may point to old configs (e.g. port 8000)
-    sudo rm -f "/etc/nginx/sites-enabled/default" "/etc/nginx/sites-enabled/p2"
-    sudo systemctl reload nginx
-else
-    warn "nginx not found — X-Accel-Redirect will not work."
-    warn "Set P2_STORAGE__USE_X_ACCEL_REDIRECT=false in .env to use pure-Python serving."
-    _set_env_value "P2_STORAGE__USE_X_ACCEL_REDIRECT" "false"
-fi
-
 # ── Dependencies ───────────────────────────────────────────────────────────────
 info "Syncing dependencies..."
-uv sync --python 3.12
+# --inexact: the two Rust extensions (p2-s3-crypto, p2-s3-checksum) are built
+# from p2/s3/*_ext and are deliberately not in pyproject.toml/uv.lock, so a
+# plain `uv sync` considers them extraneous and uninstalls them on every run.
+# --inexact leaves packages it does not manage alone.
+uv sync --python 3.12 --inexact
 
-# Rebuild Rust extensions after uv sync (which may have uninstalled them)
-if [ -d "$REPO_ROOT/p2/s3/rust_ext" ]; then
-    info "Building Rust extensions..."
-    (cd "$REPO_ROOT/p2/s3/rust_ext" && maturin develop --release 2>&1 | tail -3)
-fi
+# Rebuild Rust extensions after uv sync (which may have uninstalled them).
+#
+# This previously built only rust_ext, so p2_s3_checksum was never installed
+# into the venv and p2.s3.checksum silently ran its pure-Python fallback.
+# Delegate to the canonical builder so both extensions are always built and
+# verified together.
+info "Building Rust extensions..."
+bash "$REPO_ROOT/scripts/build_rust_ext.sh"
 
 if ! command -v redis-cli &>/dev/null; then
     warn "redis-cli not found; cannot verify local Dragonfly/Redis availability."
@@ -237,7 +197,6 @@ else
     fi
 fi
 
-export HOST="127.0.0.1"
 export DJANGO_SETTINGS_MODULE="p2.core.settings"
 export P2_STORAGE__ROOT="$STORAGE_ROOT"
 
@@ -249,7 +208,7 @@ info "Collecting static files..."
 uv run python manage.py collectstatic --noinput
 
 # ── Launch ─────────────────────────────────────────────────────────────────────
-# Match Docker entrypoint: raise fd limit for 8 workers under high concurrency
+# Raise the descriptor limit for high concurrency across configured workers.
 ulimit -n 65536 2>/dev/null || true
 umask 022
 
@@ -262,8 +221,13 @@ uv run --env-file .env python manage.py grpc &
 GRPC_PID=$!
 
 CORES=$(nproc)
-WORKERS=$((CORES * 1))
-info "Starting granian (${WORKERS} workers based on ${CORES} CPU cores)..."
+WORKERS="$(_get_env_value "P2_GRANIAN_WORKERS")"
+if [[ -z "$WORKERS" ]]; then
+    WORKERS="$CORES"
+elif ! [[ "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    die "P2_GRANIAN_WORKERS must be a positive integer; got: $WORKERS"
+fi
+info "Starting granian (${WORKERS} workers; ${CORES} CPU cores)..."
 IS_DEBUG=false
 if grep -iq '^P2_DEBUG=true' .env 2>/dev/null; then
     IS_DEBUG=true

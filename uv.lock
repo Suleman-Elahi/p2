@@ -1301,6 +1301,14 @@ wheels = [
 ]
 
 [[package]]
+name = "liburing"
+version = "2026.3.30"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/de/89/e90f2b63fb5bd26a29f29a117ab8d4bcaebabd50d71949a429eba7e03295/liburing-2026.3.30-cp38-abi3-manylinux_2_17_x86_64.whl", hash = "sha256:dc607ad9b5acfd8efcb2b969e267b5b6b9d4434bbb45df48a06c6ef65a2fad31", size = 662158, upload-time = "2026-03-30T21:44:03.513Z" },
+]
+
+[[package]]
 name = "lmdb"
 version = "2.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1804,6 +1812,7 @@ dependencies = [
     { name = "grpcio" },
     { name = "grpcio-reflection" },
     { name = "libsql-experimental" },
+    { name = "liburing" },
     { name = "lmdb" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-instrumentation-django" },
@@ -1895,6 +1904,7 @@ requires-dist = [
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.13" },
     { name = "libsql-experimental", specifier = ">=0.0.31" },
+    { name = "liburing", specifier = ">=2026.3.30" },
     { name = "lmdb", specifier = ">=1.4" },
     { name = "moto", extras = ["s3"], marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "opentelemetry-exporter-otlp", specifier = ">=1.22" },

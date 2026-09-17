@@ -13,14 +13,9 @@ from base64 import b64encode
 
 LOGGER = logging.getLogger(__name__)
 
-try:
-    from p2.s3 import p2_s3_checksum as _rust
-    _HAS_RUST = True
-    LOGGER.debug("Using Rust p2_s3_checksum extension")
-except ImportError:
-    _rust = None
-    _HAS_RUST = False
-    LOGGER.debug("Rust p2_s3_checksum not available, using Python fallback")
+from p2.s3._native import checksum as _rust
+
+_HAS_RUST = _rust is not None
 
 
 def _py_compute_crc32c(data: bytes) -> str:

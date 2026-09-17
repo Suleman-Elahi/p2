@@ -1,10 +1,11 @@
 """Shared helpers for raw S3 data-plane handlers.
 
-Keep this module free of Django view dependencies so ASGI/RSGI fast paths can
+Keep this module free of Django view dependencies so the ASGI fast path can
 enforce the same safety checks without routing through the full middleware stack.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -74,6 +75,27 @@ def _b64_md5_from_hex(md5_hex: str) -> str:
 
 def _constant_time_equal(left: str, right: str) -> bool:
     return hmac.compare_digest(left, right)
+
+
+# Above this size, MD5/SHA256 hashing is dispatched to a thread rather than
+# run inline on the event loop. hashlib releases the GIL internally, but the
+# calling coroutine still can't yield to any other request on this worker
+# until the call returns, so large bodies would otherwise stall the loop.
+# Below the threshold, the asyncio.to_thread() dispatch overhead (~30-100us)
+# outweighs just hashing inline.
+HASH_INLINE_MAX_BYTES = 256 * 1024
+
+
+def _hash_body_sync(body: bytes) -> tuple[bytes, str]:
+    """Return (md5_digest_bytes, sha256_hexdigest) for a PUT body."""
+    return hashlib.md5(body).digest(), hashlib.sha256(body).hexdigest()
+
+
+async def hash_put_body(body: bytes) -> tuple[bytes, str]:
+    """Hash a PUT body, offloading to a thread only when it's worth it."""
+    if len(body) > HASH_INLINE_MAX_BYTES:
+        return await asyncio.to_thread(_hash_body_sync, body)
+    return _hash_body_sync(body)
 
 
 def validate_fast_put_integrity(
@@ -163,9 +185,9 @@ async def existing_object_state(engine, key: str) -> tuple[str | None, int, bool
     return metadata_json, size, True
 
 
-async def update_volume_stats_for_put(volume, existing_counted: bool, existing_size: int, new_size: int) -> None:
-    from p2.core.volume_stats import adjust_volume_stats
-    await adjust_volume_stats(
+def update_volume_stats_for_put(volume, existing_counted: bool, existing_size: int, new_size: int) -> None:
+    from p2.core.volume_stats import queue_volume_stats_update
+    queue_volume_stats_update(
         volume,
         object_delta=0 if existing_counted else 1,
         bytes_delta=new_size - existing_size,

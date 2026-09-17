@@ -18,13 +18,9 @@ LOGGER = logging.getLogger(__name__)
 UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD'
 
 # Use Rust HMAC extension when available — ~10x faster key derivation.
-try:
-    from p2.s3 import p2_s3_crypto as _rust_crypto
-    _RUST_AVAILABLE = True
-    LOGGER.debug("p2_s3_crypto Rust extension loaded")
-except ImportError:
-    _rust_crypto = None
-    _RUST_AVAILABLE = False
+from p2.s3._native import crypto as _rust_crypto
+
+_RUST_AVAILABLE = _rust_crypto is not None
 
 _SIGNING_KEY_CACHE: dict[tuple[str, str, str, str], tuple[bytes, float]] = {}
 _SIGNING_KEY_TTL_SECONDS = 900.0
@@ -174,8 +170,14 @@ class AWSV4Authentication(BaseAuth):
         only is already a small list (typically 3-4 headers from signed_headers).
         """
         canonical_headers = ""
+        has_hdrs = hasattr(self.request, 'hdrs')
         for key in sorted(only):
-            # Transform e.g. "host" -> "HTTP_HOST", "x-amz-date" -> "HTTP_X_AMZ_DATE"
+            if has_hdrs and key in self.request.hdrs:
+                value = str(self.request.hdrs[key]).strip()
+                canonical_headers += f"{key}:{value}\n"
+                continue
+
+            # Fallback to META for Django requests
             meta_key = 'HTTP_' + key.upper().replace('-', '_')
             if meta_key in self.request.META:
                 value = str(self.request.META[meta_key]).strip()

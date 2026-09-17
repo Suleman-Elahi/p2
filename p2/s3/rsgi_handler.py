@@ -350,6 +350,10 @@ def S3ProxyRSGIApp(django_fallback):
             meta_json = json.dumps(metadata_payload)
 
             if handle is not None:
+                # write_block routes through the group-commit batcher: pwrite
+                # + fdatasync + LMDB commit are coalesced with other
+                # concurrent PUTs into one batch instead of each PUT paying
+                # its own fsync + LMDB commit serially.
                 await write_block(handle, offset, body, engine, key, meta_json)
             else:
                 await asyncio.to_thread(engine.put, key, meta_json)

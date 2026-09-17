@@ -131,10 +131,9 @@ class VolumeHandle:
 # Global volume pool registry (one per process)
 # ---------------------------------------------------------------------------
 
-try:
-    from p2.s3.p2_s3_crypto import VolumePool as RustVolumePool
-except ImportError:
-    RustVolumePool = None
+from p2.s3._native import crypto as _native_crypto
+
+RustVolumePool = getattr(_native_crypto, "VolumePool", None)
 
 
 class VolumePool:

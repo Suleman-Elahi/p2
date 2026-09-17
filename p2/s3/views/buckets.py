@@ -473,34 +473,58 @@ class BucketView(S3View):
         deleted_objects = 0
         deleted_bytes = 0
 
-        for key in keys:
-            try:
-                meta_json = await asyncio.to_thread(engine.get, key)
-                if meta_json:
-                    attr = json.loads(meta_json)
-                    if not attr.get(ATTR_BLOB_IS_FOLDER, False):
-                        deleted_objects += 1
-                        deleted_bytes += int(attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
-                    internal_path = attr.get('internal_path')
-                    if internal_path:
-                        from p2.core.storage_path import internal_to_fs
-                        fs_path = internal_to_fs(internal_path)
-                        try:
-                            os.remove(fs_path)
-                        except OSError:
-                            pass
-                    await asyncio.to_thread(engine.delete, key)
-                    from p2.s3.cache import invalidate_metadata
-                    invalidate_metadata(volume.uuid.hex, key)
+        def _process_deletes():
+            del_objs = 0
+            del_bytes = 0
+            results_list = []
+            keys_to_delete = []
+            
+            for key in keys:
+                try:
+                    meta_json = engine.get(key)
+                    if meta_json:
+                        attr = json.loads(meta_json)
+                        if not attr.get(ATTR_BLOB_IS_FOLDER, False):
+                            del_objs += 1
+                            del_bytes += int(attr.get(ATTR_BLOB_SIZE_BYTES, 0) or 0)
+                        internal_path = attr.get('internal_path')
+                        if internal_path:
+                            from p2.core.storage_path import internal_to_fs
+                            fs_path = internal_to_fs(internal_path)
+                            try:
+                                os.remove(fs_path)
+                            except OSError:
+                                pass
+                        keys_to_delete.append(key)
+                    results_list.append((True, key, None))
+                except Exception as exc:
+                    LOGGER.warning("multi_delete: error deleting %s: %s", key, exc)
+                    results_list.append((False, key, str(exc)))
+                    
+            if keys_to_delete:
+                try:
+                    engine.delete_batch(keys_to_delete)
+                except Exception as exc:
+                    LOGGER.warning("multi_delete: batch delete failed: %s", exc)
+                    # mark all as failed
+                    results_list = [(False, k, str(exc)) for k in keys_to_delete]
+
+            return del_objs, del_bytes, results_list
+
+        deleted_objects, deleted_bytes, results_list = await asyncio.to_thread(_process_deletes)
+        
+        for success, key, exc_str in results_list:
+            if success:
+                from p2.s3.cache import invalidate_metadata
+                invalidate_metadata(volume.uuid.hex, key)
                 if not is_quiet:
                     deleted = ElementTree.SubElement(result, f'{{{XML_NAMESPACE}}}Deleted')
                     ElementTree.SubElement(deleted, f'{{{XML_NAMESPACE}}}Key').text = key
-            except Exception as exc:
-                LOGGER.warning("multi_delete: error deleting %s: %s", key, exc)
+            else:
                 error = ElementTree.SubElement(result, f'{{{XML_NAMESPACE}}}Error')
                 ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Key').text = key
                 ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Code').text = 'InternalError'
-                ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Message').text = str(exc)
+                ElementTree.SubElement(error, f'{{{XML_NAMESPACE}}}Message').text = exc_str
 
         if deleted_objects or deleted_bytes:
             from p2.core.volume_stats import adjust_volume_stats

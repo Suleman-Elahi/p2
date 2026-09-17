@@ -6,7 +6,6 @@ routing, auth, and the handler itself.
 """
 import asyncio
 import datetime as _dt
-import hashlib
 import json
 import logging
 import os
@@ -29,6 +28,7 @@ from p2.s3.engine import get_engine
 from p2.s3.errors import AWSError
 from p2.s3.fastpath import (
     existing_object_state,
+    hash_put_body,
     require_volume_permission,
     update_volume_stats_for_put,
     validate_fast_put_integrity,
@@ -38,10 +38,6 @@ from p2.s3.volume_writer import write_block
 from p2.s3.volume_reader import read_object, stream_blocks
 from p2.core.events import STREAM_BLOB_POST_SAVE, make_event, publish_event
 
-try:
-    from p2.s3 import p2_s3_crypto
-except ImportError:
-    p2_s3_crypto = None
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +92,44 @@ _PUT_RESPONSE_BODY_TYPE = 'http.response.body'
 _EMPTY_BODY = b''
 
 
+class _S3Request:
+    """Minimal request shim for the SigV4 authenticator.
+
+    ``AWSV4Authentication`` only needs ``method``, ``META``, ``hdrs``, ``body``
+    and ``GET``, so the fast path hands it this instead of building a real
+    Django ``HttpRequest``.
+
+    This used to be a ``class`` statement *inside* the request handler, which
+    meant every single request executed a class definition — building a fresh
+    namespace, type object and mappingproxy — just to hang five attributes off
+    it. It showed up at ~3% of per-request CPU work in profiles. Instantiating a
+    ``__slots__`` class is far cheaper.
+
+    ``GET`` is built on first access. ``can_handle`` only looks at it when the
+    request has no ``Authorization`` header, so header-authenticated clients
+    (the boto3/warp default) never pay for parsing the query string; only
+    presigned-URL requests do.
+    """
+
+    __slots__ = ('method', 'path', 'META', 'hdrs', 'body', '_qs', '_get')
+
+    def __init__(self, method, path, meta, hdrs, qs, body=_EMPTY_BODY):
+        self.method = method
+        self.path = path
+        self.META = meta
+        self.hdrs = hdrs
+        self.body = body
+        self._qs = qs
+        self._get = None
+
+    @property
+    def GET(self):
+        get = self._get
+        if get is None:
+            get = self._get = QueryDict(self._qs)
+        return get
+
+
 def _apply_asgi_cors(resp_headers: list, volume, origin: str, method: str) -> None:
     if not origin or not volume:
         return
@@ -139,9 +173,9 @@ async def _s3_error(send, status, code, volume=None, origin=''):
 def S3ProxyASGIApp(django_app):
     """ASGI wrapper: intercepts S3 GET/PUT, falls back to Django for everything else."""
 
-    # Cache USE_X_ACCEL_REDIRECT and S3_ASYNC_EVENT_PUBLISH at startup.
-    use_accel = getattr(settings, 'USE_X_ACCEL_REDIRECT', False)
+    # Cache S3_ASYNC_EVENT_PUBLISH at startup.
     async_events = getattr(settings, 'S3_ASYNC_EVENT_PUBLISH', False)
+    benchmark_timings = getattr(settings, 'S3_BENCHMARK_TIMINGS', False)
     s3_base = _get_s3_base_domain()
 
     async def app(scope, receive, send):
@@ -159,23 +193,18 @@ def S3ProxyASGIApp(django_app):
         # Build both the lowercase dict (for routing/PUT) and the META dict
         # (for auth) in a single pass over the raw ASGI headers.
         hdrs = {}          # lowercase str -> str
-        meta = {           # Django-style META dict for auth
-            'REQUEST_METHOD': method,
-            'PATH_INFO': urllib.parse.unquote(path),
-        }
-        qs_bytes = scope.get('query_string', b'')
-        qs = qs_bytes.decode('ascii')
-        meta['QUERY_STRING'] = qs
-
         for raw_name, raw_value in scope.get('headers', []):
             k = raw_name.decode('ascii').lower()
             v = raw_value.decode('latin1')
             hdrs[k] = v
-            if k == 'content-type':
-                meta['CONTENT_TYPE'] = v
-            elif k == 'content-length':
-                meta['CONTENT_LENGTH'] = v
-            meta[f'HTTP_{k.upper().replace("-", "_")}'] = v
+            
+        qs_bytes = scope.get('query_string', b'')
+        qs = qs_bytes.decode('ascii')
+
+        # The Django-style META dict is built further down, just before auth.
+        # Everything between here and there can still hand the request off to
+        # Django, and none of it reads META — so building it now would waste an
+        # unquote() and a dict on every SPA asset, API call and favicon request.
 
         # ── S3 detection ──────────────────────────────────────────────────
         is_s3 = (
@@ -214,20 +243,36 @@ def S3ProxyASGIApp(django_app):
         if method not in ('GET', 'PUT', 'DELETE'):
             return await django_app(scope, receive, send)
 
-        # ── Auth (reuses pre-built meta dict) ─────────────────────────────
-        class _Req:
-            __slots__ = ()
-            nonlocal meta, method, path, qs
-        _Req.method = method
-        _Req.path = path
-        _Req.META = meta
-        _Req.GET = QueryDict(qs)
-        _Req.body = _EMPTY_BODY
+        timings = {} if benchmark_timings and method == 'PUT' else None
+        stage_started = time.perf_counter() if timings is not None else 0.0
+        put_started = stage_started
+
+        # ── Auth ──────────────────────────────────────────────────────────
+        # Django-style META dict, built only now that the request is known to be
+        # S3 traffic we handle. Only the keys the SigV4 authenticator reads are
+        # copied; a full WSGI-style META would mean touching every header.
+        meta = {
+            'REQUEST_METHOD': method,
+            'PATH_INFO': urllib.parse.unquote(path),
+            'QUERY_STRING': qs,
+        }
+        if 'content-type' in hdrs:
+            meta['CONTENT_TYPE'] = hdrs['content-type']
+        if 'content-length' in hdrs:
+            meta['CONTENT_LENGTH'] = hdrs['content-length']
+        if 'authorization' in hdrs:
+            meta['HTTP_AUTHORIZATION'] = hdrs['authorization']
+        if 'x-amz-date' in hdrs:
+            meta['HTTP_X_AMZ_DATE'] = hdrs['x-amz-date']
+        if 'x-amz-content-sha256' in hdrs:
+            meta['HTTP_X_AMZ_CONTENT_SHA256'] = hdrs['x-amz-content-sha256']
+
+        s3_request = _S3Request(method, path, meta, hdrs, qs)
 
         try:
-            if not AWSV4Authentication.can_handle(_Req):
+            if not AWSV4Authentication.can_handle(s3_request):
                 return await django_app(scope, receive, send)
-            user = await AWSV4Authentication(_Req).validate()
+            user = await AWSV4Authentication(s3_request).validate()
             if not user:
                 return await _s3_error(send, 403, 'AccessDenied')
         except AWSError as e:
@@ -237,6 +282,9 @@ def S3ProxyASGIApp(django_app):
             return await _s3_error(send, 500, 'InternalError')
 
         # ── Volume lookup ─────────────────────────────────────────────────
+        if timings is not None:
+            timings['auth'] = (time.perf_counter() - stage_started) * 1000
+            stage_started = time.perf_counter()
         try:
             volume = get_cached_volume(bucket)
             if not volume:
@@ -247,6 +295,9 @@ def S3ProxyASGIApp(django_app):
 
         vol_hex = volume.uuid.hex
         origin = hdrs.get('origin', '')
+        if timings is not None:
+            timings['volume'] = (time.perf_counter() - stage_started) * 1000
+            stage_started = time.perf_counter()
 
 
         # ── GET ───────────────────────────────────────────────────────────
@@ -287,23 +338,6 @@ def S3ProxyASGIApp(django_app):
             blocks = [BlockCoord.from_dict(b) for b in blocks_raw]
             pool = VolumePool.get()
 
-            if use_accel and 'x-real-ip' in hdrs:
-                internal_path = attributes.get('internal_path', f"/internal-storage/volumes/{vol_hex}/{key}")
-                resp_h = [
-                    (b'x-accel-redirect', internal_path.encode('utf-8')),
-                    (b'x-p2-accel', b'1'),
-                    (b'content-type', ct.encode('utf-8')),
-                    (b'accept-ranges', b'bytes'),
-                ]
-                if etag:
-                    resp_h.append((b'etag', f'"{etag}"'.encode('utf-8')))
-                if lm:
-                    resp_h.append((b'last-modified', lm))
-                _apply_asgi_cors(resp_h, volume, origin, method)
-                await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
-                await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY, 'more_body': False})
-                return
-
             resp_h = [
                 (b'content-type', ct.encode('utf-8')),
                 (b'content-length', str(size).encode('ascii')),
@@ -335,6 +369,9 @@ def S3ProxyASGIApp(django_app):
                 await require_volume_permission(user, volume, 'write', bucket, key)
             except AWSError as e:
                 return await _s3_error(send, e.status, e.code, volume=volume, origin=origin)
+            if timings is not None:
+                timings['permission'] = (time.perf_counter() - stage_started) * 1000
+                stage_started = time.perf_counter()
 
             client_ct = hdrs.get('content-type', 'application/octet-stream')
             try:
@@ -351,9 +388,6 @@ def S3ProxyASGIApp(django_app):
 
             pool = VolumePool.get()
             chunks_body = []
-            blob_size = 0
-            md5_hasher = hashlib.md5()
-            sha256_hasher = hashlib.sha256()
 
             try:
                 while True:
@@ -366,9 +400,6 @@ def S3ProxyASGIApp(django_app):
                                 from p2.s3.utils import decode_aws_chunked
                                 chunk = decode_aws_chunked(chunk)
                             chunks_body.append(chunk)
-                            md5_hasher.update(chunk)
-                            sha256_hasher.update(chunk)
-                            blob_size += len(chunk)
                         if not message.get('more_body', False):
                             break
                     elif mtype == 'http.disconnect':
@@ -377,11 +408,15 @@ def S3ProxyASGIApp(django_app):
                 return await _s3_error(send, 500, 'InternalError')
 
             body = b''.join(chunks_body)
-            final_md5 = md5_hasher.hexdigest()
-            final_sha256 = sha256_hasher.hexdigest()
+            blob_size = len(body)
+            md5_hash_bytes, final_sha256 = await hash_put_body(body)
+            final_md5 = md5_hash_bytes.hex()
+            if timings is not None:
+                timings['body'] = (time.perf_counter() - stage_started) * 1000
+                stage_started = time.perf_counter()
 
             try:
-                validate_fast_put_integrity(hdrs, b'', final_md5, final_sha256, blob_size=blob_size)
+                validate_fast_put_integrity(hdrs, body, final_md5, final_sha256, blob_size=blob_size)
             except AWSError as e:
                 return await _s3_error(send, e.status, e.code, volume=volume, origin=origin)
 
@@ -396,13 +431,16 @@ def S3ProxyASGIApp(django_app):
                 existing_json, existing_size, existing_counted = None, 0, False
 
             if blob_size > 0:
-                handle, offset = await asyncio.to_thread(pool.allocate_block, blob_size)
+                handle, offset = pool.allocate_block(blob_size)
                 block = BlockCoord(vol_uuid=handle.uuid_hex, offset=offset, length=blob_size)
                 blocks = [block]
             else:
                 handle = None
                 offset = 0
                 blocks = []
+            if timings is not None:
+                timings['prepare_allocate'] = (time.perf_counter() - stage_started) * 1000
+                stage_started = time.perf_counter()
 
             blob_uuid = uuid.uuid4().hex
             internal_path = f"/internal-storage/volumes/{vol_hex}/{blob_uuid[0:2]}/{blob_uuid[2:4]}/{blob_uuid}"
@@ -418,23 +456,22 @@ def S3ProxyASGIApp(django_app):
                 'is_folder': False,
                 'internal_path': internal_path,
             }
-            meta_json = json.dumps(meta_payload)
 
             if handle is not None:
-                await write_block(handle, offset, body, engine, key, meta_json)
+                await write_block(handle, offset, body, engine, key, meta_payload, md5_hash_bytes)
             else:
-                await asyncio.to_thread(engine.put, key, meta_json)
+                await asyncio.to_thread(engine.put, key, json.dumps(meta_payload))
+            if timings is not None:
+                timings['write_metadata'] = (time.perf_counter() - stage_started) * 1000
+                stage_started = time.perf_counter()
 
             invalidate_metadata(vol_hex, key)
             if existing_json:
                 from p2.s3.cache import invalidate_volume_global
                 invalidate_volume_global(bucket)
-            # Volume stats are approximate and flushed to the DB every ~2s, so
-            # don't gate the HTTP 200 on the Redis round-trip — fire it in the
-            # background. adjust_volume_stats swallows its own exceptions.
-            _spawn_bg(
-                update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
-            )
+            # Stats are approximate and are coalesced in-process before one
+            # Redis pipeline per short batch. Do not create one task per PUT.
+            update_volume_stats_for_put(volume, existing_counted, existing_size, blob_size)
 
             if async_events:
                 event = make_event(blob_uuid=os.urandom(8).hex(), volume_uuid=vol_hex, event_type='blob_post_save')
@@ -448,6 +485,15 @@ def S3ProxyASGIApp(django_app):
                 (b'content-length', b'0'),
                 (b'x-p2-put-fastpath', b'1'),
             ]
+            if timings is not None:
+                timings['post'] = (time.perf_counter() - stage_started) * 1000
+                timings['total'] = (time.perf_counter() - put_started) * 1000
+                resp_h.append((
+                    b'server-timing',
+                    ', '.join(
+                        f"{name};dur={duration:.3f}" for name, duration in timings.items()
+                    ).encode('ascii'),
+                ))
             _apply_asgi_cors(resp_h, volume, origin, method)
             await send({'type': _PUT_RESPONSE_START_TYPE, 'status': 200, 'headers': resp_h})
             await send({'type': _PUT_RESPONSE_BODY_TYPE, 'body': _EMPTY_BODY})

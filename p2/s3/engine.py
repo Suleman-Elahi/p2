@@ -50,6 +50,20 @@ class LMDbEngine:
     def invalidate_cache(self, path: str) -> None:
         if not self.volume_uuid_hex:
             return
+        # Invalidate the ASGI fast-path's per-object metadata cache
+        # (p2.s3.cache._metadata_cache). Without this, any write that
+        # bypasses the asgi_handler PUT/DELETE call sites — most notably
+        # compaction migrating a block to a new volume and rewriting the
+        # object's LMDB entry — leaves stale block coordinates cached for
+        # up to S3_CACHE_METADATA_TTL_SECONDS (default 60s). If the old
+        # volume file is then deleted (compaction's normal last step),
+        # any request served from that stale cache entry gets a
+        # FileNotFoundError trying to pread a volume that no longer exists.
+        try:
+            from p2.s3.cache import invalidate_metadata
+            invalidate_metadata(self.volume_uuid_hex, path)
+        except Exception:
+            pass
         try:
             from django.core.cache import cache
             parts = path.split('/')
@@ -98,6 +112,14 @@ class LMDbEngine:
         with self.env.begin(write=True, db=self.db) as txn:
             txn.delete(path.encode('utf-8'))
         self.invalidate_cache(path)
+
+    def delete_batch(self, paths: list[str]) -> None:
+        """Delete multiple keys from LMDB in a single transaction."""
+        with self.env.begin(write=True, db=self.db) as txn:
+            for path in paths:
+                txn.delete(path.encode('utf-8'))
+        for path in paths:
+            self.invalidate_cache(path)
 
     def list(self, prefix: str, start_after: str | None = None, max_keys: int | None = 1000, use_cache: bool = True) -> list[tuple[str, str]]:
         """Scan keys matching `prefix` in LMDB B-Tree efficiently."""
