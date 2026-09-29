@@ -11,11 +11,17 @@ const user = getUser()
 // ── Login ────────────────────────────────────────────────────────────────
 // useFetch for login — uses a reactive ref for the POST body so execute()
 // sends the correct payload without destructuring issues.
+//
+// Login goes through /api/v1/auth/login rather than the raw ninja-jwt
+// /api/v1/auth/token/pair endpoint, because only /auth/login knows to hold
+// back the JWT pair and return an MFA challenge when the user has TOTP
+// two-factor auth enabled (see p2/auth/mfa_api.py). If the account has no
+// 2FA, the response shape is the same tokens as before, just one hop later.
 
 export function useLogin() {
   const loginBody = ref({ username: '', password: '' })
 
-  const { data, isFetching, error, execute } = useFetch('/api/v1/auth/token/pair', {
+  const { data, isFetching, error, execute } = useFetch('/api/v1/auth/login', {
     immediate: false,
     beforeFetch({ options }) {
       // login doesn't need auth header
@@ -30,6 +36,39 @@ export function useLogin() {
     await execute()
     if (error.value) throw error.value
     const result = data.value
+    if (result?.mfa_required) {
+      // Caller (LoginPage.vue) must prompt for a TOTP/recovery code and
+      // call useMfaVerify().verify(result.mfa_token, code) to finish login.
+      return { mfaRequired: true, mfaToken: result.mfa_token }
+    }
+    if (result?.access) {
+      saveTokens(result.access, result.refresh)
+      decodeUserFromToken(result.access)
+    }
+    return { mfaRequired: false, user: user.value }
+  }
+
+  return { login, loading: isFetching, error }
+}
+
+// ── MFA challenge verification (second factor) ──────────────────────────
+
+export function useMfaVerify() {
+  const verifyBody = ref({ mfa_token: '', code: '' })
+
+  const { data, isFetching, error, execute } = useFetch('/api/v1/auth/mfa/verify', {
+    immediate: false,
+    beforeFetch({ options }) {
+      return { options }
+    },
+  }).post(verifyBody).json()
+
+  async function verify(mfaToken, code) {
+    error.value = null
+    verifyBody.value = { mfa_token: mfaToken, code }
+    await execute()
+    if (error.value) throw error.value
+    const result = data.value
     if (result?.access) {
       saveTokens(result.access, result.refresh)
       decodeUserFromToken(result.access)
@@ -37,7 +76,7 @@ export function useLogin() {
     return user.value
   }
 
-  return { login, loading: isFetching, error }
+  return { verify, loading: isFetching, error }
 }
 
 // ── Token refresh ────────────────────────────────────────────────────────

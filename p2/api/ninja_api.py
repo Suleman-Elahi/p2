@@ -5,6 +5,7 @@ from ninja_jwt.authentication import JWTAuth
 from ninja.security import django_auth
 
 from p2.api.endpoints import router_user, router_key, router_config
+from p2.auth.mfa_api import router_login, router_mfa
 from p2.core.api.endpoints import router_volume, router_storage
 from p2.serve.api.endpoints import router_serve
 
@@ -22,6 +23,13 @@ api = NinjaAPI(
 # Authentication Endpoints (Simple JWT)
 api.add_router("/auth/token", obtain_pair_router)
 api.add_router("/auth/token/verify", verify_router)
+# Password login + optional TOTP 2FA gate. The SPA should call /auth/login
+# instead of /auth/token/pair directly, since only this endpoint knows to
+# hold back the JWT pair and issue an MFA challenge when the user has 2FA
+# enabled. Enrollment/verification endpoints (setup/confirm/status/disable/
+# verify) live under /auth/mfa/*. See p2/auth/mfa_api.py.
+api.add_router("/auth", router_login)
+api.add_router("/auth/mfa", router_mfa)
 
 # Register all subsystem routers
 api.add_router("/system/user", router_user)

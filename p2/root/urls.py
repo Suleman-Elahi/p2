@@ -30,6 +30,10 @@ urlpatterns = [
     path('api/', include('p2.api.urls', namespace='p2_api_public')),
     path('_/ui/', include('p2.ui.urls', namespace='p2_ui')),
     path('_/oidc/', include('p2.auth.urls', namespace='p2_auth')),
+    # django-allauth social/SSO login (any provider configured as a SocialApp
+    # in the admin). Mounted under _/accounts/ so it stays clear of the SPA's
+    # own /login route and catch-all regex above. e.g. /_/accounts/google/login/
+    path('_/accounts/', include('allauth.urls')),
     path('_/auth/password/', views.PasswordChangeView.as_view(), name='auth_password'),
     path('_/auth/login/', P2LoginView.as_view(), name='auth_login'),
     path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),

@@ -153,6 +153,21 @@ INSTALLED_APPS = [
     'django_filters',
     'crispy_forms',
     'crispy_bootstrap4',
+    # django-allauth — social/SSO login (any provider). Credentials for each
+    # provider are configured as SocialApp rows via /_/admin/socialaccount/socialapp/,
+    # no code changes needed to add a new provider once its provider app is listed here.
+    'allauth',
+    'allauth.account',
+    'allauth.socialaccount',
+    'allauth.socialaccount.providers.google',
+    'allauth.socialaccount.providers.microsoft',
+    'allauth.socialaccount.providers.github',
+    # allauth.mfa — TOTP two-factor auth. We only use its Authenticator model
+    # and TOTP/RecoveryCodes helpers (allauth.mfa.totp / .recovery_codes);
+    # its own session/HTML views are not mounted — p2's JWT login flow calls
+    # into those helpers directly from p2/auth/mfa_api.py instead. See
+    # docs/sso-and-2fa-setup.md for the enrollment/verification flow.
+    'allauth.mfa',
     # p2 - Core Components
     'p2.core.apps.P2CoreConfig',
     'p2.api.apps.P2APIConfig',
@@ -185,6 +200,7 @@ MIDDLEWARE = [
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'allauth.account.middleware.AccountMiddleware',
 ]
 
 ROOT_URLCONF = 'p2.root.urls'
@@ -296,12 +312,66 @@ OTEL_SERVICE_NAME = CONFIG.y('otel.service_name', os.getenv('OTEL_SERVICE_NAME',
 
 AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
+    'allauth.account.auth_backends.AuthenticationBackend',
 ]
 
 LOGIN_URL = 'auth_login'
 LOGIN_REDIRECT_URL = '/'
 
-# authlib OIDC configuration (replaces mozilla-django-oidc)
+# ---------------------------------------------------------------------------
+# django-allauth — social/SSO login (Google, Microsoft, GitHub, and any
+# other provider from allauth.socialaccount.providers.*).
+# ---------------------------------------------------------------------------
+# We only use allauth for the social login handshake, not for local
+# registration/password management — p2 already has its own login view
+# (P2LoginView) and its own JWT issuance (ninja-jwt) for the SPA. Keep
+# allauth's own account views disabled/unused; the "auth" for a normal user
+# is JWT, minted by our SocialAccountAdapter after allauth completes the
+# provider OAuth dance (see p2/auth/adapters.py).
+SITE_ID = 1
+SOCIALACCOUNT_ADAPTER = 'p2.auth.adapters.P2SocialAccountAdapter'
+SOCIALACCOUNT_LOGIN_ON_GET = True  # skip the intermediate "confirm" page, redirect straight to provider
+SOCIALACCOUNT_STORE_TOKENS = False  # we don't need to keep provider access tokens around
+# Local (non-social) allauth account features are not used — p2 has its own
+# login/password views — but the account app must stay installed since
+# socialaccount depends on it.
+ACCOUNT_LOGIN_METHODS = {'username', 'email'}
+ACCOUNT_EMAIL_VERIFICATION = 'none'
+ACCOUNT_ADAPTER = 'p2.auth.adapters.P2AccountAdapter'
+
+# Per-provider scopes. Client id/secret are NOT set here — they are configured
+# per-deployment as SocialApp rows via /_/admin/socialaccount/socialapp/,
+# so enabling a new provider for a given deployment is a config-only change
+# (add credentials in the admin), not a code change.
+SOCIALACCOUNT_PROVIDERS = {
+    'google': {
+        'SCOPE': ['profile', 'email'],
+        'AUTH_PARAMS': {'access_type': 'online'},
+        'OAUTH_PKCE_ENABLED': True,
+    },
+    'microsoft': {
+        'TENANT': CONFIG.y('sso.microsoft.tenant', 'common'),
+    },
+    'github': {
+        'SCOPE': ['user:email'],
+    },
+}
+
+# ---------------------------------------------------------------------------
+# allauth.mfa — TOTP two-factor auth (alternative to SSO; a user can enable
+# 2FA on their own local/password account instead of using a social login).
+# ---------------------------------------------------------------------------
+MFA_TOTP_ISSUER = CONFIG.y('mfa.totp_issuer', 'p2 Storage')
+# A short-lived, single-use "MFA challenge" token is minted after password
+# auth succeeds for a user with 2FA enabled, and must be exchanged (together
+# with a valid TOTP/recovery code) for the real ninja-jwt pair within this
+# window. See p2/auth/mfa_api.py: _issue_mfa_challenge / _consume_mfa_challenge.
+MFA_CHALLENGE_TTL_SECONDS = int(CONFIG.y('mfa.challenge_ttl_seconds', default=300))
+# Never set MFA_TOTP_INSECURE_BYPASS_CODE outside of local development —
+# allauth itself refuses to honor it unless DEBUG=True.
+
+# authlib OIDC configuration (legacy — superseded by allauth above, kept
+# for the single-provider deployments already configured via oidc.* env vars)
 OIDC_ENABLED = CONFIG.y_bool('oidc.enabled')
 AUTHLIB_OAUTH_CLIENTS = {
     'oidc': {
@@ -339,7 +409,6 @@ LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
-SITE_ID = 1
 
 # ---------------------------------------------------------------------------
 # Static files

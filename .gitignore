@@ -57,3 +57,7 @@ p2/s3/*/target/
 
 # Benchmark output
 warp-*.json.zst
+
+# Frontend (ui/) — Vite/Vue build artifacts and dependencies.
+ui/node_modules/
+ui/dist/

@@ -8,6 +8,7 @@ const {
   apiKeys, keysLoading, createApiKey, keyCreating, deleteApiKey,
   users, usersLoading, createUser, userCreating,
   policies, policiesLoading, createPolicy, updatePolicy, deletePolicy,
+  mfaEnabled, mfaStatusLoading, setupMfa, mfaSettingUp, confirmMfa, mfaConfirming, disableMfa, mfaDisabling,
 } = useSettingsSingleton()
 
 const activeTab = ref('keys')
@@ -146,6 +147,48 @@ function copyToClipboard(text) {
   navigator.clipboard.writeText(text)
   toast.success('Copied to clipboard')
 }
+
+// ── MFA (TOTP 2FA) enrollment dialog ────────────────────────────────────────
+const showMfaSetupDialog = ref(false)
+const mfaSetupData = ref(null) // { secret, otpauth_url, qr_svg }
+const mfaConfirmCode = ref('')
+const mfaRecoveryCodes = ref(null)
+
+async function startMfaSetup() {
+  try {
+    mfaSetupData.value = await setupMfa()
+    mfaConfirmCode.value = ''
+    mfaRecoveryCodes.value = null
+    showMfaSetupDialog.value = true
+  } catch (e) {
+    toast.error(e.message || 'Failed to start 2FA setup')
+  }
+}
+
+async function handleConfirmMfa() {
+  try {
+    const result = await confirmMfa(mfaConfirmCode.value)
+    mfaRecoveryCodes.value = result.recovery_codes
+    toast.success('Two-factor authentication enabled')
+  } catch (e) {
+    toast.error(e.message || 'Incorrect code')
+  }
+}
+
+const showMfaDisableDialog = ref(false)
+const mfaDisablePassword = ref('')
+
+watch(showMfaDisableDialog, (val) => { if (val) mfaDisablePassword.value = '' })
+
+async function handleDisableMfa(close) {
+  try {
+    await disableMfa(mfaDisablePassword.value)
+    toast.success('Two-factor authentication disabled')
+    close()
+  } catch (e) {
+    toast.error(e.message || 'Incorrect password')
+  }
+}
 </script>
 
 <template>
@@ -162,6 +205,7 @@ function copyToClipboard(text) {
         :buttons="[
           { label: 'API Keys', value: 'keys', icon: 'key' },
           { label: 'Users', value: 'users', icon: 'users' },
+          { label: 'Security', value: 'security', icon: 'lock' },
           { label: 'Policies', value: 'policies', icon: 'shield' },
           { label: 'System', value: 'config', icon: 'settings' },
         ]"
@@ -232,6 +276,39 @@ function copyToClipboard(text) {
                 <p class="text-xs text-ink-gray-5">{{ u.email || 'No email' }}</p>
               </div>
               <Badge :label="u.is_superuser ? 'Admin' : 'User'" :theme="u.is_superuser ? 'red' : 'gray'" variant="subtle" size="sm" />
+            </div>
+          </div>
+        </div>
+
+        <!-- ═══ Security (2FA) ═══ -->
+        <div v-if="activeTab === 'security'" class="space-y-4">
+          <h2 class="text-base font-medium text-ink-gray-8">Two-Factor Authentication</h2>
+          <p class="text-p-sm text-ink-gray-5">
+            Require a time-based one-time password (TOTP) from an authenticator
+            app in addition to your password. This is a per-account setting —
+            alternatively you can sign in with a social/SSO provider from the
+            login page instead of a password + 2FA.
+          </p>
+
+          <div v-if="mfaStatusLoading" class="py-8 text-center text-sm text-ink-gray-5">Loading...</div>
+
+          <div v-else class="rounded-md border border-outline-gray-1 bg-surface-white p-4">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <Badge :label="mfaEnabled ? 'Enabled' : 'Disabled'" :theme="mfaEnabled ? 'green' : 'gray'" variant="subtle" size="sm" />
+                <span class="text-sm text-ink-gray-7">Authenticator app (TOTP)</span>
+              </div>
+              <Button
+                v-if="!mfaEnabled"
+                variant="solid" theme="gray" label="Enable 2FA"
+                :loading="mfaSettingUp"
+                @click="startMfaSetup"
+              />
+              <Button
+                v-else
+                variant="outline" theme="red" label="Disable 2FA"
+                @click="showMfaDisableDialog = true"
+              />
             </div>
           </div>
         </div>
@@ -345,6 +422,82 @@ function copyToClipboard(text) {
             variant="solid" theme="gray" :label="policyEditing ? 'Update' : 'Create'"
             :loading="policySaving"
             @click="handleSavePolicy(close)"
+          />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Enable 2FA (QR + confirm) -->
+    <Dialog v-model="showMfaSetupDialog" :key="'mfa-setup-' + showMfaSetupDialog" :options="{ title: 'Enable Two-Factor Authentication', icon: { name: 'shield' }, size: 'lg' }">
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <template v-if="!mfaRecoveryCodes">
+            <p class="text-p-sm text-ink-gray-6">
+              Scan this QR code with your authenticator app (Google Authenticator,
+              Authy, 1Password, etc.), then enter the 6-digit code it generates.
+            </p>
+            <div v-if="mfaSetupData" class="flex justify-center rounded-md border border-outline-gray-1 bg-white p-4" v-html="mfaSetupData.qr_svg" />
+            <p v-if="mfaSetupData" class="text-center text-p-xs font-mono text-ink-gray-5 break-all">
+              {{ mfaSetupData.secret }}
+            </p>
+            <FormControl
+              v-model="mfaConfirmCode"
+              label="6-digit code"
+              type="text"
+              placeholder="123456"
+              autocomplete="one-time-code"
+            />
+          </template>
+          <template v-else>
+            <p class="text-p-sm font-medium text-ink-gray-9">
+              Save these recovery codes somewhere safe — each can be used once
+              to sign in if you lose access to your authenticator app. They
+              will not be shown again.
+            </p>
+            <div class="grid grid-cols-2 gap-2 rounded-md border border-outline-gray-1 bg-surface-gray-1 p-4 font-mono text-sm">
+              <span v-for="rc in mfaRecoveryCodes" :key="rc">{{ rc }}</span>
+            </div>
+            <Button label="Copy all" @click="copyToClipboard(mfaRecoveryCodes.join('\n'))" />
+          </template>
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button v-if="!mfaRecoveryCodes" label="Cancel" @click="close" />
+          <Button
+            v-if="!mfaRecoveryCodes"
+            variant="solid" theme="gray" label="Verify & Enable"
+            :loading="mfaConfirming" :disabled="!mfaConfirmCode.trim()"
+            @click="handleConfirmMfa"
+          />
+          <Button v-else variant="solid" theme="gray" label="Done" @click="close" />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Disable 2FA -->
+    <Dialog v-model="showMfaDisableDialog" :key="'mfa-disable-' + showMfaDisableDialog" :options="{ title: 'Disable Two-Factor Authentication', icon: { name: 'shield-off' }, size: 'lg' }">
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <p class="text-p-sm text-ink-gray-6">
+            Confirm your password to turn off two-factor authentication.
+          </p>
+          <FormControl
+            v-model="mfaDisablePassword"
+            type="password"
+            label="Password"
+            placeholder="••••••••"
+            required
+          />
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button label="Cancel" @click="close" />
+          <Button
+            variant="solid" theme="red" label="Disable 2FA"
+            :loading="mfaDisabling" :disabled="!mfaDisablePassword.trim()"
+            @click="handleDisableMfa(close)"
           />
         </div>
       </template>

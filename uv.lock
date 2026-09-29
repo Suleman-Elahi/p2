@@ -644,6 +644,26 @@ wheels = [
 ]
 
 [[package]]
+name = "django-allauth"
+version = "65.19.5"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "asgiref" },
+    { name = "django" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/03/0d/ca8cc8244849299160c433b7738a3f318eaad1967761083b44b0b2bee80c/django_allauth-65.19.5.tar.gz", hash = "sha256:03fdb1431e8cecd55071e6c3a3006f2fe1a45b916ee2bf5d14ed0fdadea3b7e5", size = 2294382, upload-time = "2026-09-28T19:45:56.88Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/c5/6500f20404c8fe31ef328ffd4f165f0517c7cb8c189cf2f91c7b6f9ae687/django_allauth-65.19.5-py3-none-any.whl", hash = "sha256:eda48d77cd790d2e60862993fe19e59ff2e18c6be8aa490d407e0ee1108dd385", size = 2076097, upload-time = "2026-09-28T19:45:54.025Z" },
+]
+
+[package.optional-dependencies]
+socialaccount = [
+    { name = "oauthlib" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "requests" },
+]
+
+[[package]]
 name = "django-crispy-forms"
 version = "2.6"
 source = { registry = "https://pypi.org/simple" }
@@ -778,6 +798,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/0a/ed/86ed74d8829c3bc565025c1c9efaf8518c9165fbf8c9cc2c026c8ed21bd9/fakeredis-2.36.2.tar.gz", hash = "sha256:c37a0b307fae3f27ec7c19e59519e57b8c52782e00303df9075361b5ba441be6", size = 213336, upload-time = "2026-06-17T13:25:38.934Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fd/4d/e6e40f93031adbf654d34e542bd396e9f3bc1c6209b40c920d58c9e1317a/fakeredis-2.36.2-py3-none-any.whl", hash = "sha256:84cbb9c74ca8946c0d2499daadf3a5d0bfe3cfbac71e3398316d1a1eab3421c4", size = 141039, upload-time = "2026-06-17T13:25:36.638Z" },
+]
+
+[[package]]
+name = "fido2"
+version = "2.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/ea/6f08c354b7aeb8019249d46a86c2153f8218499cced4d21bf16b6d49fc16/fido2-2.2.1.tar.gz", hash = "sha256:85787428a94c3f8eaf72f0ff30afba983b559a1b1b795c93318c81b4ad4062c4", size = 327147, upload-time = "2026-06-29T17:41:11.927Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/84/198d99c3312557ef6121cf78c38281efe9b3bc88cba0e2c05446f38a024d/fido2-2.2.1-py3-none-any.whl", hash = "sha256:ed397da981b9ab133da6ead7309e41f924b566b749956129efe286fae097749f", size = 238354, upload-time = "2026-06-29T17:41:09.921Z" },
 ]
 
 [[package]]
@@ -1610,6 +1642,15 @@ wheels = [
 ]
 
 [[package]]
+name = "oauthlib"
+version = "3.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/5f/19930f824ffeb0ad4372da4812c50edbd1434f678c90c2733e1188edfc63/oauthlib-3.3.1.tar.gz", hash = "sha256:0f0f8aa759826a193cf66c12ea1af1637f87b9b4622d46e866952bb022e538c9", size = 185918, upload-time = "2025-06-19T22:48:08.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/be/9c/92789c596b8df838baa98fa71844d84283302f7604ed565dafe5a6b5041a/oauthlib-3.3.1-py3-none-any.whl", hash = "sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1", size = 160065, upload-time = "2025-06-19T22:48:06.508Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1803,11 +1844,13 @@ dependencies = [
     { name = "crispy-bootstrap4" },
     { name = "cryptography" },
     { name = "django" },
+    { name = "django-allauth", extra = ["socialaccount"] },
     { name = "django-crispy-forms" },
     { name = "django-filter" },
     { name = "django-libsql" },
     { name = "django-ninja" },
     { name = "django-ninja-jwt" },
+    { name = "fido2" },
     { name = "granian", extra = ["dotenv", "uvloop"] },
     { name = "grpcio" },
     { name = "grpcio-reflection" },
@@ -1824,6 +1867,7 @@ dependencies = [
     { name = "python-magic" },
     { name = "pytz" },
     { name = "pyyaml" },
+    { name = "qrcode" },
     { name = "redis", extra = ["hiredis"] },
     { name = "ruamel-yaml" },
     { name = "uvicorn", extra = ["standard"] },
@@ -1889,6 +1933,7 @@ requires-dist = [
     { name = "crispy-bootstrap4", specifier = ">=2022.1" },
     { name = "cryptography", specifier = ">=42.0" },
     { name = "django", specifier = ">=5.0" },
+    { name = "django-allauth", extras = ["socialaccount"], specifier = ">=65.19.5" },
     { name = "django-crispy-forms", specifier = ">=2.0" },
     { name = "django-debug-toolbar", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "django-extensions", marker = "extra == 'dev'", specifier = ">=3.2" },
@@ -1897,6 +1942,7 @@ requires-dist = [
     { name = "django-ninja", specifier = ">=1.1.0" },
     { name = "django-ninja-jwt", specifier = ">=5.3.2" },
     { name = "fakeredis", marker = "extra == 'dev'", specifier = ">=2.21" },
+    { name = "fido2", specifier = ">=1.1" },
     { name = "granian", extras = ["dotenv", "uvloop"], specifier = ">=2.7.2" },
     { name = "grpcio", specifier = ">=1.60" },
     { name = "grpcio-reflection", specifier = ">=1.60" },
@@ -1923,6 +1969,7 @@ requires-dist = [
     { name = "python-magic", specifier = ">=0.4" },
     { name = "pytz", specifier = ">=2024.1" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "qrcode", specifier = ">=7.4" },
     { name = "redis", extras = ["hiredis"], specifier = ">=5.0" },
     { name = "ruamel-yaml", specifier = ">=0.18" },
     { name = "unittest-xml-reporting", marker = "extra == 'dev'", specifier = ">=3.2" },
@@ -2548,6 +2595,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/da/92/1446574745d74df0c92e6aa4a7b0b3130706a4142b2d1a5869f2eaa423c6/pyyaml-6.0.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:16249ee61e95f858e83976573de0f5b2893b3677ba71c9dd36b9cf8be9ac6d65", size = 829923, upload-time = "2025-09-25T21:32:54.537Z" },
     { url = "https://files.pythonhosted.org/packages/f0/7a/1c7270340330e575b92f397352af856a8c06f230aa3e76f86b39d01b416a/pyyaml-6.0.3-cp314-cp314t-win_amd64.whl", hash = "sha256:4ad1906908f2f5ae4e5a8ddfce73c320c2a1429ec52eafd27138b7f1cbe341c9", size = 174062, upload-time = "2025-09-25T21:32:55.767Z" },
     { url = "https://files.pythonhosted.org/packages/f1/12/de94a39c2ef588c7e6455cfbe7343d3b2dc9d6b6b2f40c4c6565744c873d/pyyaml-6.0.3-cp314-cp314t-win_arm64.whl", hash = "sha256:ebc55a14a21cb14062aa4162f906cd962b28e2e9ea38f9b4391244cd8de4ae0b", size = 149341, upload-time = "2025-09-25T21:32:56.828Z" },
+]
+
+[[package]]
+name = "qrcode"
+version = "8.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8f/b2/7fc2931bfae0af02d5f53b174e9cf701adbb35f39d69c2af63d4a39f81a9/qrcode-8.2.tar.gz", hash = "sha256:35c3f2a4172b33136ab9f6b3ef1c00260dd2f66f858f24d88418a015f446506c", size = 43317, upload-time = "2025-05-01T15:44:24.726Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/dd/b8/d2d6d731733f51684bbf76bf34dab3b70a9148e8f2cef2bb544fccec681a/qrcode-8.2-py3-none-any.whl", hash = "sha256:16e64e0716c14960108e85d853062c9e8bba5ca8252c0b4d0231b9df4060ff4f", size = 45986, upload-time = "2025-05-01T15:44:22.781Z" },
 ]
 
 [[package]]

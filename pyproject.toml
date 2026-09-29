@@ -55,6 +55,9 @@ dependencies = [
     "whitenoise>=6.12.0",
     "granian[dotenv,uvloop]>=2.7.2",
     "liburing>=2026.3.30",
+    "django-allauth[socialaccount]>=65.19.5",
+    "qrcode>=7.4",
+    "fido2>=1.1",
 ]
 
 [project.optional-dependencies]

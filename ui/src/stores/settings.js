@@ -174,6 +174,52 @@ export function useSettings() {
     }
   }
 
+  // ── MFA (TOTP two-factor auth) ──────────────────────────────────────────
+  const { data: mfaStatusData, isFetching: mfaStatusLoading, execute: fetchMfaStatus } = useApi(
+    '/auth/mfa/status',
+    { refetch: true },
+  ).json()
+
+  const mfaEnabled = computed(() => !!mfaStatusData.value?.enabled)
+
+  const { execute: mfaSetupExecute, data: mfaSetupData, isFetching: mfaSettingUp, error: mfaSetupError } = useApi(
+    '/auth/mfa/setup',
+    { immediate: false },
+  ).post().json()
+
+  async function setupMfa() {
+    await mfaSetupExecute()
+    if (mfaSetupError.value) throw mfaSetupError.value
+    return mfaSetupData.value // { secret, otpauth_url, qr_svg }
+  }
+
+  const mfaConfirmBody = ref({})
+  const { execute: mfaConfirmExecute, data: mfaConfirmData, isFetching: mfaConfirming, error: mfaConfirmError } = useApi(
+    '/auth/mfa/confirm',
+    { immediate: false },
+  ).post(mfaConfirmBody).json()
+
+  async function confirmMfa(code) {
+    mfaConfirmBody.value = { code }
+    await mfaConfirmExecute()
+    if (mfaConfirmError.value) throw mfaConfirmError.value
+    await fetchMfaStatus()
+    return mfaConfirmData.value // { recovery_codes }
+  }
+
+  const mfaDisableBody = ref({})
+  const { execute: mfaDisableExecute, isFetching: mfaDisabling, error: mfaDisableError } = useApi(
+    '/auth/mfa/disable',
+    { immediate: false },
+  ).post(mfaDisableBody).json()
+
+  async function disableMfa(password) {
+    mfaDisableBody.value = { password }
+    await mfaDisableExecute()
+    if (mfaDisableError.value) throw mfaDisableError.value
+    await fetchMfaStatus()
+  }
+
   return {
     // Config
     config: cfg,
@@ -203,6 +249,16 @@ export function useSettings() {
     policyUpdating,
     deletePolicy,
     policyDeleting,
+    // MFA
+    mfaEnabled,
+    mfaStatusLoading,
+    fetchMfaStatus,
+    setupMfa,
+    mfaSettingUp,
+    confirmMfa,
+    mfaConfirming,
+    disableMfa,
+    mfaDisabling,
   }
 }
 
