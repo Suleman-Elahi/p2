@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { Button, Badge, Tooltip, toast, FeatherIcon, confirmDialog, Dialog, FormControl } from 'frappe-ui'
 import {
   formatBytes,
@@ -18,6 +18,10 @@ const props = defineProps({
 const emit = defineEmits(['close', 'preview', 'deleted'])
 
 const { deleteObject } = useFilesSingleton()
+
+// The panel is shown to read-only members too, so management actions must be
+// gated on the bucket permissions the caller actually holds.
+const canDelete = computed(() => !!activeBucket.value?.canDelete)
 
 const showPresignDialog = ref(false)
 const expiresIn = ref(3600)
@@ -74,11 +78,15 @@ function promptDelete() {
     onConfirm: async ({ hideDialog }) => {
       const uuid = activeBucket.value?.uuid
       if (!uuid) return
-      await deleteObject(uuid, props.object.key)
-      toast.success(`Deleted "${props.object.name}"`)
-      emit('deleted')
-      emit('close')
-      hideDialog()
+      try {
+        await deleteObject(uuid, props.object.key)
+        toast.success(`Deleted "${props.object.name}"`)
+        emit('deleted')
+        emit('close')
+        hideDialog()
+      } catch (e) {
+        toast.error(e.message || 'Delete failed')
+      }
     },
   })
 }
@@ -120,7 +128,7 @@ function featherIcon(contentType) {
         <Tooltip text="Presigned URL">
           <Button icon="link" @click="showPresignDialog = true" />
         </Tooltip>
-        <Tooltip text="Delete">
+        <Tooltip v-if="canDelete" text="Delete">
           <Button icon="trash-2" theme="red" @click="promptDelete" />
         </Tooltip>
       </div>

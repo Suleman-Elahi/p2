@@ -38,7 +38,14 @@ class SpaIndexView(View):
                 '</body></html>',
                 content_type='text/html',
             )
-        return FileResponse(open(index_path, 'rb'), content_type='text/html')
+        # Never cache index.html: it references content-hashed asset bundles,
+        # and a stale copy keeps pointing at chunks deleted by the next build
+        # (producing 404s until a hard refresh).
+        response = FileResponse(open(index_path, 'rb'), content_type='text/html')
+        response['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        response['Pragma'] = 'no-cache'
+        response['Expires'] = '0'
+        return response
 
 
 def _is_unsafe_path(file_path, base_dir):

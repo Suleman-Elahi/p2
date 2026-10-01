@@ -6,10 +6,18 @@ from typing import Dict, Any, Optional, List
 class VolumeSchema(ModelSchema):
     object_count: int = 0
     space_used_bytes: int = 0
+    # Permissions the *requesting* user holds on this volume. Lets the UI show
+    # management controls only where the user actually has 'admin' access.
+    # Populated by the endpoint via the `_p2_permissions` attribute.
+    permissions: List[str] = []
 
     class Meta:
         model = Volume
         fields = ['uuid', 'name', 'storage', 'tags', 'object_count', 'space_used_bytes']
+
+    @staticmethod
+    def resolve_permissions(obj):
+        return getattr(obj, '_p2_permissions', [])
 
 class VolumeCreateSchema(Schema):
     name: str

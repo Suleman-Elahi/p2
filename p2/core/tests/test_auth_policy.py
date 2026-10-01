@@ -302,3 +302,192 @@ class AuthPolicyAndSSOEndpointsTests(TestCase):
         self.assertEqual(data["username"], "standardtester")
         self.assertFalse(data["is_superuser"])
 
+
+def _login(client, username, password):
+    resp = client.post(
+        "/api/v1/auth/login",
+        data=json.dumps({"username": username, "password": password}),
+        content_type="application/json",
+    )
+    assert resp.status_code == 200, resp.content
+    return {"HTTP_AUTHORIZATION": f"Bearer {resp.json()['access']}"}
+
+
+class VolumeVisibilityTests(TestCase):
+    """A user must only see buckets they own or were granted access to."""
+
+    def setUp(self):
+        self.client = Client()
+        self.admin = User.objects.create_superuser(username="adminuser", password="adminpassword123")
+        self.member = User.objects.create_user(username="tester", password="testerpassword123")
+        self.storage = get_test_storage()
+        self.vol = Volume.objects.create(name="private-bucket", storage=self.storage)
+        self.admin_headers = _login(self.client, "adminuser", "adminpassword123")
+        self.member_headers = _login(self.client, "tester", "testerpassword123")
+
+    def test_unassigned_user_cannot_see_or_open_bucket(self):
+        resp = self.client.get("/api/v1/core/volume/", **self.member_headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+        resp = self.client.get(f"/api/v1/core/volume/{self.vol.uuid}/", **self.member_headers)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_granted_user_can_see_bucket(self):
+        VolumeACL.objects.create(volume=self.vol, user=self.member, permissions=["read", "list"])
+
+        resp = self.client.get("/api/v1/core/volume/", **self.member_headers)
+        self.assertEqual(resp.status_code, 200)
+        names = [v["name"] for v in resp.json()]
+        self.assertIn("private-bucket", names)
+
+    def test_superuser_sees_all_buckets(self):
+        resp = self.client.get("/api/v1/core/volume/", **self.admin_headers)
+        self.assertEqual(resp.status_code, 200)
+        names = [v["name"] for v in resp.json()]
+        self.assertIn("private-bucket", names)
+
+    def test_non_superuser_cannot_create_bucket(self):
+        resp = self.client.post(
+            "/api/v1/core/volume/",
+            data=json.dumps({"name": "nope-bucket"}),
+            content_type="application/json",
+            **self.member_headers,
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(Volume.objects.filter(name="nope-bucket").exists())
+
+    def test_superuser_can_create_bucket(self):
+        resp = self.client.post(
+            "/api/v1/core/volume/",
+            data=json.dumps({"name": "admin-bucket"}),
+            content_type="application/json",
+            **self.admin_headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(Volume.objects.filter(name="admin-bucket").exists())
+
+    def test_permissions_are_reported(self):
+        VolumeACL.objects.create(volume=self.vol, user=self.member, permissions=["read", "list"])
+        resp = self.client.get("/api/v1/core/volume/", **self.member_headers)
+        self.assertEqual(resp.status_code, 200)
+        vol = next(v for v in resp.json() if v["name"] == "private-bucket")
+        self.assertEqual(set(vol["permissions"]), {"read", "list"})
+        self.assertFalse(vol["permissions"] == ["admin"])
+
+    def test_superuser_gets_admin_permission(self):
+        resp = self.client.get(f"/api/v1/core/volume/{self.vol.uuid}/", **self.admin_headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("admin", resp.json()["permissions"])
+
+
+class BucketAdminGranteesTests(TestCase):
+    """A non-superuser bucket owner can populate the access-assignment list."""
+
+    def setUp(self):
+        self.client = Client()
+        self.owner = User.objects.create_user(username="bucketowner", password="ownerpassword123")
+        self.other = User.objects.create_user(username="tester", password="testerpassword123")
+        self.storage = get_test_storage()
+        self.vol = Volume.objects.create(name="owner-bucket", storage=self.storage)
+        VolumeACL.objects.create(
+            volume=self.vol, user=self.owner,
+            permissions=["read", "write", "delete", "list", "admin"],
+        )
+        self.owner_headers = _login(self.client, "bucketowner", "ownerpassword123")
+
+    def test_bucket_admin_lists_grantables(self):
+        resp = self.client.get(
+            f"/api/v1/core/volumes/{self.vol.uuid}/acl/grantables/",
+            **self.owner_headers,
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        usernames = [u["username"] for u in data["users"]]
+        self.assertIn("tester", usernames)
+
+    def test_non_admin_cannot_list_grantables(self):
+        other_headers = _login(self.client, "tester", "testerpassword123")
+        resp = self.client.get(
+            f"/api/v1/core/volumes/{self.vol.uuid}/acl/grantables/",
+            **other_headers,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+class PublicSsoProviderTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+
+    def test_public_providers_requires_no_auth(self):
+        resp = self.client.get("/api/v1/system/sso-providers/public/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.json(), list)
+
+
+class ServeRuleAuthorizationTests(TestCase):
+    """Serve rules are system-level routing config and must be admin-only."""
+
+    def setUp(self):
+        self.client = Client()
+        self.admin = User.objects.create_superuser(username="adminuser", password="adminpassword123")
+        self.member = User.objects.create_user(username="memberuser", password="memberpassword123")
+        self.admin_headers = _login(self.client, "adminuser", "adminpassword123")
+        self.member_headers = _login(self.client, "memberuser", "memberpassword123")
+
+    def test_member_cannot_list_serve_rules(self):
+        resp = self.client.get("/api/v1/tier0/policy/", **self.member_headers)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_member_cannot_create_serve_rule(self):
+        resp = self.client.post(
+            "/api/v1/tier0/policy/",
+            data=json.dumps({"name": "evil", "blob_query": "SELECT 1"}),
+            content_type="application/json",
+            **self.member_headers,
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_superuser_can_list_serve_rules(self):
+        resp = self.client.get("/api/v1/tier0/policy/", **self.admin_headers)
+        self.assertEqual(resp.status_code, 200)
+
+
+class PresignAuthorizationTests(TestCase):
+    """Generating a presigned URL must respect the bucket ACL."""
+
+    def setUp(self):
+        self.client = Client()
+        self.member = User.objects.create_user(username="reader", password="readerpassword123")
+        self.outsider = User.objects.create_user(username="outsider", password="outsiderpassword123")
+        self.storage = get_test_storage()
+        self.vol = Volume.objects.create(name="presign-bucket", storage=self.storage)
+        VolumeACL.objects.create(volume=self.vol, user=self.member, permissions=["read", "list"])
+        self.reader_headers = _login(self.client, "reader", "readerpassword123")
+        self.outsider_headers = _login(self.client, "outsider", "outsiderpassword123")
+
+    def _presign(self, headers, method):
+        return self.client.post(
+            "/api/v1/s3/presign/",
+            data=json.dumps({"bucket": "presign-bucket", "key": "file.txt", "method": method}),
+            content_type="application/json",
+            **headers,
+        )
+
+    def test_readonly_member_cannot_presign_put(self):
+        resp = self._presign(self.reader_headers, "PUT")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_non_member_cannot_presign_get(self):
+        resp = self._presign(self.outsider_headers, "GET")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_missing_bucket_returns_404(self):
+        resp = self.client.post(
+            "/api/v1/s3/presign/",
+            data=json.dumps({"bucket": "does-not-exist", "key": "file.txt", "method": "GET"}),
+            content_type="application/json",
+            **self.reader_headers,
+        )
+        self.assertEqual(resp.status_code, 404)
+

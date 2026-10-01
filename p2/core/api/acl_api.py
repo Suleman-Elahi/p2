@@ -37,6 +37,23 @@ class VolumeACLCreateSchema(Schema):
     permissions: List[str]  # e.g. ["read", "write", "delete", "list", "admin"]
 
 
+class GranteeUserSchema(Schema):
+    id: int
+    username: str
+    email: Optional[str] = None
+
+
+class GranteeGroupSchema(Schema):
+    id: int
+    name: str
+    user_count: int
+
+
+class GrantablesSchema(Schema):
+    users: List[GranteeUserSchema]
+    groups: List[GranteeGroupSchema]
+
+
 def _require_bucket_admin(user, volume: Volume):
     if not async_to_sync(has_volume_permission)(user, volume, "admin"):
         raise PermissionDenied("You do not have 'admin' permission on this bucket.")
@@ -62,6 +79,32 @@ def list_acl(request, volume_uuid: str):
     _require_bucket_admin(request.user, vol)
     acls = VolumeACL.objects.filter(volume=vol).select_related("user", "group")
     return [_acl_to_schema(a) for a in acls]
+
+
+@router_acl.get("/volumes/{volume_uuid}/acl/grantables/", response=GrantablesSchema)
+@router_acl.get("/volume/{volume_uuid}/acl/grantables/", response=GrantablesSchema)
+def list_grantables(request, volume_uuid: str):
+    """Users and groups a bucket admin can grant access to.
+
+    The generic /system/user and auth-policy group endpoints are
+    superuser-only, so a non-superuser bucket owner could not populate the
+    assignment dialog. This endpoint scopes the listing to bucket admins.
+    """
+    vol = get_object_or_404(Volume, uuid=volume_uuid)
+    _require_bucket_admin(request.user, vol)
+
+    users = User.objects.filter(is_active=True).order_by("username")
+    groups = Group.objects.all().order_by("name")
+    return GrantablesSchema(
+        users=[
+            GranteeUserSchema(id=u.id, username=u.username, email=u.email or "")
+            for u in users
+        ],
+        groups=[
+            GranteeGroupSchema(id=g.id, name=g.name, user_count=g.user_set.count())
+            for g in groups
+        ],
+    )
 
 
 @router_acl.post("/volumes/{volume_uuid}/acl/", response=VolumeACLSchema)

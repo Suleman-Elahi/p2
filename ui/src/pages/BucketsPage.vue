@@ -3,6 +3,7 @@ import { ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { Button, Badge, Dialog, FormControl, toast, FeatherIcon, confirmDialog } from 'frappe-ui'
 import { useBucketsSingleton } from '../stores/buckets'
+import { isSuperAdmin } from '../stores/auth'
 
 const router = useRouter()
 const { buckets, createBucket, creating, deleteBucket, deleting, updateBucket, updating, selectBucket } = useBucketsSingleton()
@@ -148,15 +149,25 @@ async function fetchBucketAcls(uuid) {
 }
 
 async function fetchGrantees() {
+  if (!selectedBucket.value) return
   const token = localStorage.getItem('p2_token') || ''
   try {
-    const [usersResp, groupsResp] = await Promise.all([
-      fetch('/api/v1/system/user/', { headers: { Authorization: `Bearer ${token}` } }),
-      fetch('/api/v1/system/auth-policy/groups/', { headers: { Authorization: `Bearer ${token}` } }),
-    ])
-    if (usersResp.ok) allUsers.value = await usersResp.json()
-    if (groupsResp.ok) allGroups.value = await groupsResp.json()
-  } catch {}
+    const resp = await fetch(
+      `/api/v1/core/volumes/${selectedBucket.value.uuid}/acl/grantables/`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    )
+    if (resp.ok) {
+      const data = await resp.json()
+      allUsers.value = data.users || []
+      allGroups.value = data.groups || []
+    } else {
+      allUsers.value = []
+      allGroups.value = []
+    }
+  } catch {
+    allUsers.value = []
+    allGroups.value = []
+  }
 }
 
 function openGrantAccess() {
@@ -244,7 +255,14 @@ function promptRevokeAcl(acl) {
     <!-- Header -->
     <header class="sticky top-0 z-10 flex min-h-12 items-center justify-between border-b border-outline-gray-1 bg-surface-white px-3 sm:px-5">
       <h1 class="text-2xl font-semibold text-ink-gray-9">Buckets</h1>
-      <Button variant="solid" theme="gray" icon-left="database" label="Create Bucket" @click="showCreate = true" />
+      <Button
+        v-if="isSuperAdmin"
+        variant="solid"
+        theme="gray"
+        icon-left="database"
+        label="Create Bucket"
+        @click="showCreate = true"
+      />
     </header>
 
     <!-- Content -->
@@ -269,9 +287,9 @@ function promptRevokeAcl(acl) {
             <Badge v-if="b.versioning" label="Versioned" theme="blue" variant="subtle" size="sm" />
             <Badge :label="b.accessPolicy" :theme="accessTheme(b.accessPolicy)" variant="subtle" size="sm" />
             <Badge :label="b.encryption" theme="gray" variant="subtle" size="sm" />
-            <Button icon="shield" variant="ghost" theme="gray" size="sm" title="Bucket Permissions" @click.stop="openAclDialog(b)" />
-            <Button icon="settings" variant="ghost" theme="gray" size="sm" @click.stop="openEditBucket(b)" />
-            <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteBucket(b)" />
+            <Button v-if="b.canAdmin" icon="shield" variant="ghost" theme="gray" size="sm" title="Bucket Permissions" @click.stop="openAclDialog(b)" />
+            <Button v-if="b.canAdmin" icon="settings" variant="ghost" theme="gray" size="sm" @click.stop="openEditBucket(b)" />
+            <Button v-if="b.canAdmin" icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteBucket(b)" />
             <Button icon="chevron-right" variant="ghost" size="sm" @click="openBucket(b)" />
           </div>
         </div>
@@ -282,9 +300,23 @@ function promptRevokeAcl(acl) {
         <div class="rounded-full bg-surface-gray-2 p-4">
           <FeatherIcon name="database" class="h-6 w-6 text-ink-gray-5" />
         </div>
-        <p class="text-base text-ink-gray-7">No buckets yet</p>
-        <p class="text-p-sm text-ink-gray-5">Create your first bucket to start storing objects.</p>
-        <Button variant="solid" theme="gray" icon-left="plus" label="Create Bucket" class="mt-2" @click="showCreate = true" />
+        <p class="text-base text-ink-gray-7">
+          {{ isSuperAdmin ? 'No buckets yet' : 'No buckets shared with you' }}
+        </p>
+        <p class="text-p-sm text-ink-gray-5">
+          {{ isSuperAdmin
+            ? 'Create your first bucket to start storing objects.'
+            : 'An administrator can grant you access to a bucket.' }}
+        </p>
+        <Button
+          v-if="isSuperAdmin"
+          variant="solid"
+          theme="gray"
+          icon-left="plus"
+          label="Create Bucket"
+          class="mt-2"
+          @click="showCreate = true"
+        />
       </div>
     </div>
 

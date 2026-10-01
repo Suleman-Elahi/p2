@@ -14,8 +14,10 @@
 # import spelling kept loading it, and nothing failed because every call site
 # swallowed ImportError. The venv is now the only destination. See p2/s3/_native.py.
 #
-# Wheels are also left in wheels/ so the Docker build can install them without
-# needing a Rust toolchain.
+# The prebuilt wheels in wheels/ are the primary install source for both this
+# native script and the Docker image, so neither needs a Rust toolchain for a
+# normal run. Rust is only bootstrapped below when a wheel is missing or older
+# than the Rust sources (i.e. someone edited p2/s3/*_ext), or FORCE_REBUILD=1.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -229,6 +231,78 @@ print(so[0], end='')
     [[ -z "$newer" ]]
 }
 
+# ── Prebuilt wheels ───────────────────────────────────────────────────────────
+# Path to the newest committed wheel for an extension, or empty if none.
+find_wheel() {
+    local name="$1"
+    ls -1 "$WHEELHOUSE/${name}"-*.whl 2>/dev/null | sort | tail -1
+}
+
+# A wheel is usable as-is when it exists and no tracked Rust source is newer
+# than it. If a source is newer the wheel is stale and must be rebuilt.
+wheel_is_current() {
+    local name="$1"
+    local ext_dir="$2"
+
+    [[ -n "${FORCE_REBUILD:-}" ]] && return 1
+
+    local whl
+    whl="$(find_wheel "$name")"
+    [[ -n "$whl" && -f "$whl" ]] || return 1
+
+    local newer
+    newer="$(find "$ext_dir" \
+        \( -path '*/target' -o -path '*/dist' \) -prune -o \
+        \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' \
+           -o -name '*.pyi' -o -name 'config.toml' -o -name 'build.sh' \) \
+        -newer "$whl" -print -quit 2>/dev/null)"
+
+    [[ -z "$newer" ]]
+}
+
+install_prebuilt_wheel() {
+    local name="$1"
+    local whl="$2"
+    info "Installing prebuilt wheel for $name: $(basename "$whl")"
+    if command -v uv &>/dev/null; then
+        VIRTUAL_ENV="$VENV" uv pip install --reinstall --no-deps "$whl"
+    else
+        "$VENV/bin/pip" install --force-reinstall --no-deps "$whl"
+    fi
+}
+
+# Verify a wheel can actually be imported on THIS machine before installing it.
+#
+# `pip`/`uv` only validate the ABI and platform tags; they cannot see CPU
+# instructions baked in through target-cpu=native. Loading such a wheel on an
+# older CPU raises SIGILL and kills the process. So extract it to a temp dir and
+# import it in a throwaway subprocess — a crash or ImportError means "not
+# compatible here" (return non-zero) and the caller falls back to a source build.
+wheel_loads_here() {
+    local name="$1"
+    local whl="$2"
+    local tmp rc
+
+    [[ -x "$VENV/bin/python" ]] || return 0  # no interpreter to test with
+    [[ -f "$whl" ]] || return 1
+
+    tmp="$(mktemp -d)"
+    if ! "$VENV/bin/python" -m zipfile -e "$whl" "$tmp" >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    P2_REQUIRE_NATIVE=1 "$VENV/bin/python" - "$tmp" "$name" >/dev/null 2>&1 <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+__import__(sys.argv[2])
+PY
+    rc=$?
+
+    rm -rf "$tmp"
+    return $rc
+}
+
 build_extension() {
     local name="$1"
     local ext_dir="$2"
@@ -262,19 +336,54 @@ build_extension() {
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
-# Fast path. This script runs on every native start, so when nothing has
-# changed skip the whole toolchain bootstrap (apt/rustup/maturin probing) and
-# go straight to verification. Set FORCE_REBUILD=1 to bypass.
-if ext_is_current "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext" \
-   && ext_is_current "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"; then
-    info "Both Rust extensions are up to date — nothing to build."
-else
+# This runs on every native start, so the common case must stay toolchain-free.
+# Per extension:
+#   1. already installed and newer than the sources -> skip
+#   2. a current prebuilt wheel exists               -> install it (no Rust)
+#   3. otherwise                                     -> bootstrap Rust + build
+#
+# Rust is only required when a wheel is missing or older than the Rust sources
+# (i.e. someone edited p2/s3/*_ext) or when FORCE_REBUILD=1 is set.
+EXTENSIONS=(
+    "p2_s3_crypto:$REPO_ROOT/p2/s3/rust_ext"
+    "p2_s3_checksum:$REPO_ROOT/p2/s3/checksum_ext"
+)
+
+need_source_build=0
+for entry in "${EXTENSIONS[@]}"; do
+    name="${entry%%:*}"
+    ext_dir="${entry#*:}"
+
+    if ext_is_current "$name" "$ext_dir"; then
+        info "$name is up to date — skipping."
+        continue
+    fi
+
+    whl="$(find_wheel "$name")"
+    if [[ -n "$whl" ]] && wheel_is_current "$name" "$ext_dir"; then
+        info "Checking prebuilt wheel for $name compatibility..."
+        if wheel_loads_here "$name" "$whl"; then
+            install_prebuilt_wheel "$name" "$whl"
+            continue
+        fi
+        warn "Prebuilt wheel for $name is incompatible with this CPU — falling back to a source build."
+    else
+        info "$name has no current prebuilt wheel."
+    fi
+
+    need_source_build=1
+done
+
+if [[ "$need_source_build" == 1 ]]; then
     install_build_deps
     ensure_rust
     ensure_maturin
     ensure_target_python
-    build_extension "p2_s3_crypto"   "$REPO_ROOT/p2/s3/rust_ext"
-    build_extension "p2_s3_checksum" "$REPO_ROOT/p2/s3/checksum_ext"
+    for entry in "${EXTENSIONS[@]}"; do
+        name="${entry%%:*}"
+        ext_dir="${entry#*:}"
+        build_extension "$name" "$ext_dir"
+    done
 fi
 
 # Verify both extensions load and expose the full expected surface. Fails here
@@ -290,9 +399,11 @@ fi
 
 echo ""
 echo -e "${GREEN}Done.${NC} Extensions installed into $VENV"
-echo "Wheels staged in $WHEELHOUSE (used by the Docker build)."
+echo "Wheels in $WHEELHOUSE are the install source for native runs and Docker."
 echo ""
 warn "NOTE: wheels are abi3 (stable ABI, Python >= 3.12) and forward-compatible"
-warn "with 3.13+. But rust_ext/.cargo/config.toml sets target-cpu=native, so a"
-warn "wheel built here will NOT run on an older CPU. Override RUSTFLAGS if you"
-warn "need a portable build (the Dockerfile does exactly that)."
+warn "with 3.13+. rust_ext/.cargo/config.toml pins target-cpu=native, so a wheel"
+warn "built here is tuned to THIS CPU and may fault (SIGILL) on an older one."
+warn "Native runs and Docker both install these wheels, so rebuild portably"
+warn "before shipping them:"
+warn "  FORCE_REBUILD=1 RUSTFLAGS='-C target-cpu=x86-64-v2' bash scripts/build_rust_ext.sh"

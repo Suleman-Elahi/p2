@@ -2,11 +2,14 @@
 import json
 import logging
 
+from asgiref.sync import async_to_sync
 from django.http import JsonResponse
 from django.views import View
 from ninja_jwt.authentication import JWTAuth
 from ninja_jwt.exceptions import InvalidToken
 
+from p2.core.acl import has_volume_permission
+from p2.core.models import Volume
 from p2.s3.presign import generate_presigned_url
 
 LOGGER = logging.getLogger(__name__)
@@ -64,6 +67,16 @@ class PresignedURLView(View):
             return JsonResponse({"error": "bucket and key are required"}, status=400)
         if method not in ("GET", "PUT", "HEAD"):
             return JsonResponse({"error": "method must be GET, PUT, or HEAD"}, status=400)
+
+        # Signing a URL hands out access to the object for the URL's lifetime,
+        # so the caller must actually hold the matching permission on the
+        # bucket. GET/HEAD need 'read'; PUT needs 'write'.
+        volume = Volume.objects.filter(name=bucket).first()
+        if volume is None:
+            return JsonResponse({"error": "bucket not found"}, status=404)
+        required = "write" if method == "PUT" else "read"
+        if not async_to_sync(has_volume_permission)(request.user, volume, required):
+            return JsonResponse({"error": "permission denied"}, status=403)
 
         key = key.lstrip('/')  # no leading slash — matches URL router capture
         object_url = f"{base_url}/{bucket}/{key}"

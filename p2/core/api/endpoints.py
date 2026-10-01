@@ -7,13 +7,15 @@ import uuid
 from typing import List, Optional
 
 from asgiref.sync import async_to_sync
+from django.contrib.auth.models import Group
+from django.db.models import Q
 from django.utils.timezone import now
 from django.http import FileResponse, Http404, HttpResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
 from ninja import Router, File
 from ninja.files import UploadedFile
 
-from p2.core.acl import has_volume_permission
+from p2.core.acl import VolumeACL, has_volume_permission
 from p2.core.api.schemas import (
     StorageSchema, VolumeSchema, VolumeCreateSchema, VolumeUpdateSchema,
     UploadResponseSchema, BlobSchema, BlobListResponse,
@@ -35,20 +37,84 @@ def _check_permission(user, volume, permission):
     return async_to_sync(has_volume_permission)(user, volume, permission)
 
 
+ALL_VOLUME_PERMISSIONS = ('read', 'write', 'delete', 'list', 'admin')
+
+
+def _permission_map(user, volumes):
+    """Map volume pk -> set of permissions held by *user*.
+
+    Batched so listing many buckets doesn't issue one ACL query per bucket.
+    """
+    result = {str(v.pk): set() for v in volumes}
+    if getattr(user, 'is_superuser', False):
+        for pk in result:
+            result[pk] = set(ALL_VOLUME_PERMISSIONS)
+        return result
+    if getattr(user, 'is_authenticated', False):
+        group_ids = list(
+            Group.objects.filter(user=user).values_list('pk', flat=True)
+        )
+        acls = VolumeACL.objects.filter(volume__in=volumes).filter(
+            Q(user=user) | Q(group_id__in=group_ids)
+        )
+        for acl in acls:
+            perms = acl.permissions if isinstance(acl.permissions, list) else []
+            result[str(acl.volume_id)].update(perms)
+    for v in volumes:
+        if v.public_read:
+            result[str(v.pk)].update({'read', 'list'})
+    return result
+
+
+def _ordered_permissions(perms) -> list:
+    return [p for p in ALL_VOLUME_PERMISSIONS if p in perms]
+
+
+def _visible_volumes(user):
+    """Volumes the caller is allowed to see.
+
+    Superusers see everything; everyone else only sees volumes they hold an
+    ACL entry for (directly or via a group) plus publicly readable volumes.
+    Without this filter any authenticated user can enumerate every bucket.
+    """
+    if not getattr(user, 'is_authenticated', False):
+        return Volume.objects.filter(public_read=True)
+    if getattr(user, 'is_superuser', False):
+        return Volume.objects.all()
+    group_ids = list(
+        Group.objects.filter(user=user).values_list('pk', flat=True)
+    )
+    return Volume.objects.filter(
+        Q(public_read=True) | Q(acls__user=user) | Q(acls__group_id__in=group_ids)
+    ).distinct()
+
 
 @router_volume.get("/", response=List[VolumeSchema])
 def list_volumes(request):
-    return Volume.objects.all()
+    volumes = list(_visible_volumes(request.user))
+    perms = _permission_map(request.user, volumes)
+    for vol in volumes:
+        vol._p2_permissions = _ordered_permissions(perms[str(vol.pk)])
+    return volumes
 
 @router_volume.get("/{volume_uuid}/", response=VolumeSchema)
 def get_volume(request, volume_uuid: str):
-    vol = get_object_or_404(Volume, uuid=volume_uuid)
+    vol = get_object_or_404(_visible_volumes(request.user), uuid=volume_uuid)
     stats = _get_volume_stats(vol)
-    return {**VolumeSchema.from_orm(vol).dict(), **stats}
+    perms = _permission_map(request.user, [vol])[str(vol.pk)]
+    # Present live stats and the caller's permissions without another query.
+    vol.object_count = stats["object_count"]
+    vol.space_used_bytes = stats["space_used_bytes"]
+    vol._p2_permissions = _ordered_permissions(perms)
+    return vol
 
 @router_volume.post("/", response=VolumeSchema)
 def create_volume(request, payload: VolumeCreateSchema):
-    from p2.core.acl import VolumeACL
+    # Only administrators may create buckets. Everyone else is limited to the
+    # buckets explicitly shared with them.
+    if not getattr(request.user, 'is_superuser', False):
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied("Only administrators can create buckets")
     storage = None
     if payload.storage_uuid:
         storage = get_object_or_404(Storage, uuid=payload.storage_uuid)
@@ -60,7 +126,8 @@ def create_volume(request, payload: VolumeCreateSchema):
     vol = Volume.objects.create(name=payload.name, storage=storage, tags=tags, public_read=public_read)
     VolumeACL.objects.create(volume=vol, user=request.user,
                              permissions=['read', 'write', 'delete', 'list', 'admin'])
-    return VolumeSchema.from_orm(vol)
+    vol._p2_permissions = list(ALL_VOLUME_PERMISSIONS)
+    return vol
 
 @router_volume.delete("/{volume_uuid}/")
 def delete_volume(request, volume_uuid: str):

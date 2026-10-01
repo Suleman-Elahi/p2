@@ -1,5 +1,5 @@
 <script setup>
-import { reactive, ref, onMounted } from 'vue'
+import { computed, reactive, ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Button, FormControl, toast, FeatherIcon } from 'frappe-ui'
 import { useLogin, useMfaVerify } from '../stores/auth'
@@ -17,20 +17,37 @@ const mfaStep = ref(false)
 const mfaToken = ref('')
 const mfaCode = ref('')
 
-// Providers enabled for this deployment. Configure credentials for each via
-// /_/admin/socialaccount/socialapp/ — adding a provider there (and to
-// INSTALLED_APPS server-side) is the only step needed; this list should be
-// kept in sync with what's actually configured so users don't see dead buttons.
-const ssoProviders = [
-  { id: 'google', label: 'Google', icon: 'chrome' },
-  { id: 'microsoft', label: 'Microsoft', icon: 'square' },
-  { id: 'github', label: 'GitHub', icon: 'github' },
-]
+// Providers actually configured by an admin (SocialApp rows), fetched from
+// the server so users never see a dead SSO button for an unconfigured
+// provider. Presentation metadata for known providers is merged in below.
+const providerMeta = {
+  google: { label: 'Google', icon: 'chrome' },
+  microsoft: { label: 'Microsoft', icon: 'square' },
+  github: { label: 'GitHub', icon: 'github' },
+}
+const configuredProviders = ref([])
+const ssoProviders = computed(() =>
+  configuredProviders.value.map((p) => ({
+    id: p.id,
+    label: providerMeta[p.id]?.label || p.name || p.id,
+    icon: providerMeta[p.id]?.icon || 'key',
+    loginUrl: p.login_url || `/_/accounts/${p.id}/login/`,
+  })),
+)
 
-function loginWithProvider(providerId) {
+async function fetchConfiguredProviders() {
+  try {
+    const resp = await fetch('/api/v1/system/sso-providers/public/')
+    if (resp.ok) configuredProviders.value = await resp.json()
+  } catch {
+    configuredProviders.value = []
+  }
+}
+
+function loginWithProvider(provider) {
   // Full page navigation is required here (not a fetch/XHR) — the browser
   // must actually visit the provider's consent screen and come back.
-  window.location.href = `/_/accounts/${providerId}/login/`
+  window.location.href = provider.loginUrl
 }
 
 // Step 3: Forced 2FA enrollment (required by organization auth policy)
@@ -113,6 +130,8 @@ function cancelEnrollment() {
 // /login?access=...&refresh=... — pick the tokens up here the same way
 // useLogin() does for password auth, then continue into the app.
 onMounted(() => {
+  fetchConfiguredProviders()
+
   const params = new URLSearchParams(window.location.search)
   const access = params.get('access')
   const refresh = params.get('refresh')
@@ -355,7 +374,7 @@ function cancelMfa() {
           variant="outline"
           theme="gray"
           class="w-full"
-          @click="loginWithProvider(provider.id)"
+          @click="loginWithProvider(provider)"
         >
           <template #prefix>
             <FeatherIcon :name="provider.icon" class="h-4 w-4" />

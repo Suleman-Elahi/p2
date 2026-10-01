@@ -15,13 +15,11 @@ node_modules/
 .env
 *.egg-info/
 
-# Rust build outputs — the image builds extensions from source in the
-# rust-builder stage. Shipping host artifacts into the context is slow and
-# risks the stale-binary problem this build was changed to avoid.
+# The image installs the prebuilt extensions from wheels/, so keep that
+# directory in the context but drop intermediate Rust build outputs.
 # Note: patterns need **/ to match below the context root.
 p2/s3/*/target/
 p2/s3/*/dist/
-wheels/
 **/*.so
 **/*.bak
 .stale-backup/

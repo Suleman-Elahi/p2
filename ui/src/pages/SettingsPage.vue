@@ -29,17 +29,15 @@ const tabs = computed(() => {
     items.push(
       { label: 'Login Policy', value: 'login-policy', icon: 'shield' },
       { label: 'SSO Providers', value: 'sso-providers', icon: 'globe' },
+      { label: 'Serve Rules', value: 'policies', icon: 'layers' },
     )
   }
-  items.push(
-    { label: 'Policies', value: 'policies', icon: 'layers' },
-    { label: 'System', value: 'config', icon: 'settings' },
-  )
+  items.push({ label: 'System', value: 'config', icon: 'settings' })
   return items
 })
 
 watch(isSuperAdmin, (val) => {
-  if (!val && ['users', 'login-policy', 'sso-providers'].includes(activeTab.value)) {
+  if (!val && ['users', 'login-policy', 'sso-providers', 'policies'].includes(activeTab.value)) {
     activeTab.value = 'keys'
   }
 }, { immediate: true })
@@ -798,8 +796,8 @@ async function handleDisableMfa(close) {
           </div>
         </div>
 
-        <!-- ═══ Policies ═══ -->
-        <div v-if="activeTab === 'policies'" class="space-y-4">
+        <!-- ═══ Serve Rules (admin only) ═══ -->
+        <div v-if="isSuperAdmin && activeTab === 'policies'" class="space-y-4">
           <div class="flex items-center justify-between">
             <h2 class="text-base font-medium text-ink-gray-8">Serve Rules</h2>
             <Button variant="solid" theme="gray" icon-left="plus" label="Add Rule" @click="openCreatePolicy" />

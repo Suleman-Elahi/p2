@@ -9,9 +9,10 @@ one-file-per-object layout. Based on a read of `p2/s3/volume_pool.py`,
 ## 1. Overview
 
 Objects used to be stored as one physical file per blob under
-`internal-storage/volumes/<vol>/<shard>/<uuid>`. That design is still present
-as a legacy fallback path (`internal_path` in metadata, `USE_X_ACCEL_REDIRECT`,
-Nginx `internal;` alias) but new writes go through the **Volume Pool**:
+`internal-storage/volumes/<vol>/<shard>/<uuid>`. That locator survives only as
+a synthetic `internal_path` field in metadata (kept so existing rows still
+parse); no proxy or `sendfile()` handoff consumes it any more. New writes go
+through the **Volume Pool**:
 
 ```
 PUT /bucket/key
@@ -118,7 +119,7 @@ serializes what should be parallel).
 There's also a second, independent hot path: `asgi_handler.py` intercepts S3
 GET/PUT/DELETE **before Django middleware/routing** for the common case
 (bucket.s3domain or /bucket/key with AWS SigV4), doing its own header
-parsing, auth, and either inline reads or an Nginx `X-Accel-Redirect` handoff.
+parsing, auth, and inline reads streamed straight back by Granian.
 
 ## 4. Metadata engine (LMDB)
 
@@ -174,8 +175,8 @@ benefit at realistic per-worker concurrency.
 **Full in-memory body buffering on PUT** (`views/objects.py::put`,
 `asgi_handler.py`) — the entire request body is read into a `list[bytes]`,
 joined into one `bytes`, then hashed with MD5 *and* SHA256 sequentially,
-*before* any byte reaches disk. For large objects (multi-GB, given
-`client_max_body_size 2G` in nginx) this means: 2x request-body memory
+*before* any byte reaches disk. For large objects (multi-GB) this means:
+2x request-body memory
 allocated per concurrent upload (raw chunks list + joined buffer), plus two
 full-buffer hash passes, all before `allocate_block`/`write_block` even
 starts. This is the single largest latency and memory-pressure risk in the
@@ -244,9 +245,9 @@ internal_to_fs` and call it against `internal_path` metadata. The function
 exists in `p2/core/storage_path.py` and works — so not currently broken —
 but it's exercising the *legacy* one-file-per-object filesystem deletion
 logic against objects that, under the volume-pool model, have no real file
-at `internal_path` (it's now a synthetic placeholder string used only for
-the X-Accel-Redirect fallback header, not a materialized path with real
-bytes). `os.remove()` on that path will raise `OSError`/`FileNotFoundError`
+at `internal_path` (it's now a synthetic placeholder string retained for
+metadata compatibility, not a materialized path with real bytes).
+`os.remove()` on that path will raise `OSError`/`FileNotFoundError`
 every time for volume-pool objects, which is silently swallowed
 (`except OSError: pass`) — harmless today, but it's dead weight running on
 every delete of a modern object and would mask a real problem if the

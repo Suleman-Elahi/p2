@@ -27,6 +27,10 @@ export function useBuckets() {
       versioning: v.tags?.versioning === 'true' || v.tags?.versioning === true,
       accessPolicy: v.tags?.access_policy || 'private',
       encryption: v.tags?.encryption || 'AES-256',
+      permissions: v.permissions || [],
+      canAdmin: (v.permissions || []).includes('admin'),
+      canWrite: (v.permissions || []).includes('write'),
+      canDelete: (v.permissions || []).includes('delete'),
     }))
   })
 

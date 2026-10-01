@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { Button, Badge, FeatherIcon } from 'frappe-ui'
 import { useBucketsSingleton } from '../stores/buckets'
 import { useSettingsSingleton } from '../stores/settings'
+import { isSuperAdmin } from '../stores/auth'
 import { formatBytes } from '../data/files'
 
 const router = useRouter()
@@ -28,7 +29,14 @@ function accessTheme(policy) {
     <!-- Header -->
     <header class="sticky top-0 z-10 flex min-h-12 items-center justify-between border-b border-outline-gray-1 bg-surface-white px-3 sm:px-5">
       <h1 class="text-2xl font-semibold text-ink-gray-9">Dashboard</h1>
-      <Button variant="solid" theme="gray" icon-left="plus" label="New Bucket" @click="router.push('/buckets')" />
+      <Button
+        v-if="isSuperAdmin"
+        variant="solid"
+        theme="gray"
+        icon-left="plus"
+        label="New Bucket"
+        @click="router.push('/buckets')"
+      />
     </header>
 
     <!-- Content -->
@@ -54,9 +62,15 @@ function accessTheme(policy) {
       <section class="mt-8">
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-base font-medium text-ink-gray-8">Your Buckets</h2>
-          <Button label="View All" variant="ghost" size="sm" @click="router.push('/buckets')" />
+          <Button v-if="buckets.length" label="View All" variant="ghost" size="sm" @click="router.push('/buckets')" />
         </div>
-        <div class="divide-y divide-outline-gray-1 rounded-md border border-outline-gray-1 overflow-hidden">
+        <div
+          v-if="!buckets.length"
+          class="rounded-md border border-dashed border-outline-gray-1 px-4 py-8 text-center text-p-sm text-ink-gray-5"
+        >
+          {{ isSuperAdmin ? 'No buckets yet. Create one to get started.' : 'No buckets have been shared with you.' }}
+        </div>
+        <div v-else class="divide-y divide-outline-gray-1 rounded-md border border-outline-gray-1 overflow-hidden">
           <button
             v-for="b in buckets"
             :key="b.name"

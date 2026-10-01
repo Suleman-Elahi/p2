@@ -113,7 +113,15 @@ export function useRefresh() {
 
   async function refresh() {
     error.value = null
-    refreshBody.value = { refresh: localStorage.getItem('p2_refresh') || '' }
+    const stored = localStorage.getItem('p2_refresh') || ''
+    // No refresh token to exchange — POSTing an empty value only produces a
+    // noisy 400 from the token endpoint. Bail out and let auth redirect.
+    if (!stored) {
+      clearTokens()
+      setUser(null)
+      return false
+    }
+    refreshBody.value = { refresh: stored }
     await execute()
     if (error.value) {
       clearTokens()

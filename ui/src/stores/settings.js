@@ -151,7 +151,7 @@ export function useSettings() {
   // ── Policies ───────────────────────────────────────────────────────────
   const { data: policiesData, isFetching: policiesLoading, execute: fetchPolicies } = useApi(
     '/tier0/policy/',
-    { refetch: true },
+    { immediate: false, refetch: true },
   ).json()
 
   const policiesList = computed(() => {
@@ -366,6 +366,7 @@ export function useSettings() {
   watch(isSuperuser, (val) => {
     if (val) {
       fetchUsers()
+      fetchPolicies()
       fetchAuthPolicies()
       fetchGroups()
       fetchSso()

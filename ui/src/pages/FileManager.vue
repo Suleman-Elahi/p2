@@ -242,10 +242,17 @@ function closeDetails() {
   showPreview.value = false
 }
 
-const newActions = [
-  { label: 'Upload File', icon: 'upload', onClick: () => (showUpload.value = true) },
-  { label: 'Create Folder', icon: 'folder-plus', onClick: () => (showCreateFolder.value = true) },
-]
+const canWrite = computed(() => !!activeBucket.value?.canWrite)
+const canDelete = computed(() => !!activeBucket.value?.canDelete)
+
+const newActions = computed(() => {
+  const actions = []
+  if (canWrite.value) {
+    actions.push({ label: 'Upload File', icon: 'upload', onClick: () => (showUpload.value = true) })
+    actions.push({ label: 'Create Folder', icon: 'folder-plus', onClick: () => (showCreateFolder.value = true) })
+  }
+  return actions
+})
 
 </script>
 
@@ -290,7 +297,7 @@ const newActions = [
           <Button v-if="!allVisibleSelected" label="Select All" variant="ghost" size="sm" @click="selectAllVisible" />
           <Button v-else-if="hasMore && !selectAllMode" label="Select all in folder" variant="ghost" size="sm" @click="selectAllInFolder" />
           <Button icon-left="download" label="Download" variant="subtle" theme="gray" @click="handleBulkDownload" :loading="bulkActionLoading" />
-          <Button icon-left="trash-2" theme="red" label="Delete" variant="solid" @click="handleBulkDelete" :loading="bulkActionLoading" />
+          <Button v-if="canDelete" icon-left="trash-2" theme="red" label="Delete" variant="solid" @click="handleBulkDelete" :loading="bulkActionLoading" />
           <Button icon="x" variant="ghost" @click="clearSelection" />
         </template>
         <template v-else>
@@ -300,7 +307,7 @@ const newActions = [
           <Tooltip text="List view">
             <Button icon="list" :variant="viewMode === 'list' ? 'subtle' : 'ghost'" @click="viewMode = 'list'" />
           </Tooltip>
-          <Dropdown :options="newActions">
+          <Dropdown v-if="newActions.length" :options="newActions">
             <Button variant="solid" theme="gray" icon-left="plus" label="New" />
           </Dropdown>
         </template>
@@ -357,7 +364,7 @@ const newActions = [
                   <Tooltip text="Download ZIP">
                     <Button icon="download" variant="ghost" size="sm" @click.stop="downloadFolder(activeBucket.uuid, folder.prefix)" />
                   </Tooltip>
-                  <Tooltip text="Delete folder">
+                  <Tooltip v-if="canDelete" text="Delete folder">
                     <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteFolder(folder)" />
                   </Tooltip>
                 </div>
@@ -387,7 +394,7 @@ const newActions = [
                   <Tooltip v-if="isPreviewable(file.contentType)" text="Preview">
                     <Button icon="eye" variant="ghost" size="sm" @click.stop="handlePreview(file)" />
                   </Tooltip>
-                  <Tooltip text="Delete">
+                  <Tooltip v-if="canDelete" text="Delete">
                     <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteFile(file)" />
                   </Tooltip>
                 </div>
@@ -416,7 +423,7 @@ const newActions = [
                     <Tooltip text="Download ZIP">
                       <Button icon="download" variant="ghost" size="sm" @click.stop="downloadFolder(activeBucket.uuid, folder.prefix)" />
                     </Tooltip>
-                    <Tooltip text="Delete folder">
+                    <Tooltip v-if="canDelete" text="Delete folder">
                       <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteFolder(folder)" />
                     </Tooltip>
                   </div>
@@ -441,7 +448,7 @@ const newActions = [
                     <p class="w-full text-sm text-ink-gray-9 truncate">{{ file.name }}</p>
                     <p class="text-xs text-ink-gray-5">{{ formatBytes(file.size) }}</p>
                   </button>
-                  <div class="flex gap-1">
+                  <div v-if="canDelete" class="flex gap-1">
                     <Tooltip text="Delete">
                       <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteFile(file)" />
                     </Tooltip>
@@ -471,8 +478,10 @@ const newActions = [
               <FeatherIcon name="folder" class="h-6 w-6 text-ink-gray-5" />
             </div>
             <p class="text-base text-ink-gray-7">This folder is empty</p>
-            <p class="text-p-sm text-ink-gray-5">Upload files or create a subfolder to get started.</p>
-            <Button variant="solid" theme="gray" icon-left="upload" label="Upload File" class="mt-2" @click="showUpload = true" />
+            <p class="text-p-sm text-ink-gray-5">
+              {{ canWrite ? 'Upload files or create a subfolder to get started.' : 'Nothing has been uploaded here yet.' }}
+            </p>
+            <Button v-if="canWrite" variant="solid" theme="gray" icon-left="upload" label="Upload File" class="mt-2" @click="showUpload = true" />
           </div>
         </div>
       </div>

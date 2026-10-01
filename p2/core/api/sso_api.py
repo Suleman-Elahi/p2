@@ -47,6 +47,12 @@ class AvailableProviderSchema(Schema):
     callback_path: str
 
 
+class PublicProviderSchema(Schema):
+    id: str
+    name: str
+    login_url: str
+
+
 def _require_superuser(request):
     if not getattr(request.user, "is_authenticated", False) or not getattr(request.user, "is_superuser", False):
         raise PermissionDenied("Superuser privileges required.")
@@ -56,6 +62,24 @@ def _callback_url_for(request, provider_id: str) -> str:
     host = request.get_host()
     proto = "https" if request.is_secure() else "http"
     return f"{proto}://{host}/_/accounts/{provider_id}/login/callback/"
+
+
+@router_sso.get("/public/", response=List[PublicProviderSchema], auth=None)
+def public_providers(request):
+    """Configured SSO providers for the login page (no auth required).
+
+    Only providers that a superadmin has actually created a SocialApp for
+    are returned, so the login page never shows a dead provider button.
+    """
+    apps = SocialApp.objects.all().order_by("name")
+    return [
+        PublicProviderSchema(
+            id=app.provider,
+            name=app.name,
+            login_url=f"/_/accounts/{app.provider}/login/",
+        )
+        for app in apps
+    ]
 
 
 @router_sso.get("/", response=List[SocialAppSchema])
