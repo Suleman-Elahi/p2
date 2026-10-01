@@ -2,7 +2,7 @@ import { useFetch } from '@vueuse/core'
 import { computed, ref } from 'vue'
 import {
   getAccessToken, saveTokens, clearTokens,
-  isAuthenticated, getUser, setUser, decodeUserFromToken,
+  isAuthenticated, getUser, setUser, decodeUserFromToken, fetchCurrentUser,
 } from './api'
 
 // ── User (shared reactive — set by login / token decode) ────────────────
@@ -18,15 +18,25 @@ const user = getUser()
 // two-factor auth enabled (see p2/auth/mfa_api.py). If the account has no
 // 2FA, the response shape is the same tokens as before, just one hop later.
 
+// useFetch discards the response body on HTTP errors (error is just the
+// status text like "Unauthorized"), so extract the server's `detail`
+// message — e.g. "Incorrect code." vs "MFA challenge expired..." — or the
+// UI can't tell a typo from a dead session.
+function withServerErrorMessage({ data, error }) {
+  const detail = data?.detail || data?.message
+  return { error: new Error(detail || error?.message || 'Request failed'), data }
+}
+
 export function useLogin() {
   const loginBody = ref({ username: '', password: '' })
 
-  const { data, isFetching, error, execute } = useFetch('/api/v1/auth/login', {
+  const { data, isFetching, error, execute, statusCode } = useFetch('/api/v1/auth/login', {
     immediate: false,
     beforeFetch({ options }) {
       // login doesn't need auth header
       return { options }
     },
+    onFetchError: withServerErrorMessage,
   }).post(loginBody).json()
 
   async function login(username, password) {
@@ -41,6 +51,10 @@ export function useLogin() {
       // call useMfaVerify().verify(result.mfa_token, code) to finish login.
       return { mfaRequired: true, mfaToken: result.mfa_token }
     }
+    if (result?.mfa_setup_required) {
+      // Forced TOTP enrollment flow (policy-driven)
+      return { mfaSetupRequired: true, enrollmentToken: result.enrollment_token }
+    }
     if (result?.access) {
       saveTokens(result.access, result.refresh)
       decodeUserFromToken(result.access)
@@ -48,7 +62,7 @@ export function useLogin() {
     return { mfaRequired: false, user: user.value }
   }
 
-  return { login, loading: isFetching, error }
+  return { login, loading: isFetching, error, statusCode }
 }
 
 // ── MFA challenge verification (second factor) ──────────────────────────
@@ -56,18 +70,24 @@ export function useLogin() {
 export function useMfaVerify() {
   const verifyBody = ref({ mfa_token: '', code: '' })
 
-  const { data, isFetching, error, execute } = useFetch('/api/v1/auth/mfa/verify', {
+  const { data, isFetching, error, execute, statusCode } = useFetch('/api/v1/auth/mfa/verify', {
     immediate: false,
     beforeFetch({ options }) {
       return { options }
     },
+    onFetchError: withServerErrorMessage,
   }).post(verifyBody).json()
 
   async function verify(mfaToken, code) {
     error.value = null
-    verifyBody.value = { mfa_token: mfaToken, code }
+    verifyBody.value = { mfa_token: mfaToken, code: String(code ?? '').trim() }
     await execute()
-    if (error.value) throw error.value
+    if (error.value) {
+      // Attach the HTTP status so callers can tell "wrong code, retry"
+      // (401) from "challenge dead, log in again" without parsing text.
+      error.value.statusCode = statusCode.value
+      throw error.value
+    }
     const result = data.value
     if (result?.access) {
       saveTokens(result.access, result.refresh)
@@ -119,4 +139,6 @@ export function logout() {
   window.location.href = '/login'
 }
 
-export { user, isAuthenticated, getAccessToken }
+const isSuperAdmin = computed(() => !!user.value?.is_superuser)
+
+export { user, isAuthenticated, isSuperAdmin, getAccessToken, fetchCurrentUser }

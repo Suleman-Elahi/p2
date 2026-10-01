@@ -8,6 +8,9 @@ from p2.api.endpoints import router_user, router_key, router_config
 from p2.auth.mfa_api import router_login, router_mfa
 from p2.core.api.endpoints import router_volume, router_storage
 from p2.serve.api.endpoints import router_serve
+from p2.core.api.auth_policy_api import router_auth_policy
+from p2.core.api.sso_api import router_sso
+from p2.core.api.acl_api import router_acl
 
 from ninja_jwt.routers.obtain import obtain_pair_router
 from ninja_jwt.routers.verify import verify_router
@@ -38,3 +41,6 @@ api.add_router("/system/config", router_config)
 api.add_router("/core/volume", router_volume)
 api.add_router("/core/storage", router_storage)
 api.add_router("/tier0/policy", router_serve)
+api.add_router("/system/auth-policy", router_auth_policy)
+api.add_router("/system/sso-providers", router_sso)
+api.add_router("/core", router_acl)

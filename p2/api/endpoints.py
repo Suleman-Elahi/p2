@@ -2,8 +2,9 @@
 from typing import List
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import get_object_or_404
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from ninja import Router
+from ninja.errors import HttpError
 from p2.api.models import APIKey
 from p2.api.schemas import (
     APIKeyCreatedSchema,
@@ -11,6 +12,7 @@ from p2.api.schemas import (
     APIKeySchema,
     UserCreateSchema,
     UserSchema,
+    UserUpdateSchema,
 )
 from p2.s3.cache import invalidate_apikey
 from p2.lib.config import CONFIG
@@ -44,16 +46,55 @@ def get_user(request, user_id: int):
 @router_user.post("/", response=UserSchema)
 def create_user(request, payload: UserCreateSchema):
     _require_superuser(request)
+    if User.objects.filter(username=payload.username).exists():
+        raise HttpError(400, f"User '{payload.username}' already exists.")
     user = User.objects.create_user(
         username=payload.username,
         password=payload.password,
-        email=payload.email,
+        email=payload.email or "",
+        is_active=payload.is_active,
     )
     if payload.is_superuser:
         user.is_superuser = True
         user.is_staff = True
         user.save()
+    if payload.groups:
+        for gname in payload.groups:
+            g, _ = Group.objects.get_or_create(name=gname)
+            user.groups.add(g)
     return user
+
+
+@router_user.put("/{user_id}/", response=UserSchema)
+def update_user(request, user_id: int, payload: UserUpdateSchema):
+    _require_superuser(request)
+    target = get_object_or_404(User, id=user_id)
+    if payload.email is not None:
+        target.email = payload.email
+    if payload.is_active is not None:
+        target.is_active = payload.is_active
+    if payload.is_superuser is not None:
+        target.is_superuser = payload.is_superuser
+        target.is_staff = payload.is_superuser
+    if payload.password:
+        target.set_password(payload.password)
+    target.save()
+    if payload.groups is not None:
+        target.groups.clear()
+        for gname in payload.groups:
+            g, _ = Group.objects.get_or_create(name=gname)
+            target.groups.add(g)
+    return target
+
+
+@router_user.delete("/{user_id}/")
+def delete_user(request, user_id: int):
+    _require_superuser(request)
+    target = get_object_or_404(User, id=user_id)
+    if target.id == request.user.id:
+        raise HttpError(400, "Cannot delete your own account.")
+    target.delete()
+    return {"ok": True}
 
 @router_key.get("/", response=List[APIKeySchema])
 def list_keys(request):

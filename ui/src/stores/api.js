@@ -44,11 +44,14 @@ export function decodeUserFromToken(token) {
       user.value = null
       return null
     }
+    const isSuperuser = Boolean(payload.is_superuser)
     user.value = {
       id: payload.user_id,
       username: payload.username || payload.sub || payload.user_id,
       email: payload.email || '',
-      role: 'admin',
+      is_superuser: isSuperuser,
+      is_staff: Boolean(payload.is_staff),
+      role: isSuperuser ? 'admin' : 'member',
     }
     return user.value
   } catch {
@@ -57,11 +60,39 @@ export function decodeUserFromToken(token) {
   }
 }
 
+export async function fetchCurrentUser() {
+  const token = accessToken.value
+  if (!token) return null
+  try {
+    const resp = await fetch('/api/v1/auth/me', {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (resp.ok) {
+      const data = await resp.json()
+      user.value = {
+        ...user.value,
+        id: data.id,
+        username: data.username,
+        email: data.email,
+        is_superuser: Boolean(data.is_superuser),
+        is_staff: Boolean(data.is_staff),
+        role: data.is_superuser ? 'admin' : 'member',
+      }
+      return user.value
+    }
+  } catch {
+    // Ignore network error on boot
+  }
+  return user.value
+}
+
 // Restore session from stored token on load
 if (accessToken.value) {
   const decoded = decodeUserFromToken(accessToken.value)
   if (!decoded) {
     clearTokens()
+  } else {
+    fetchCurrentUser()
   }
 }
 

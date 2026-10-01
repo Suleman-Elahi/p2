@@ -362,6 +362,8 @@ SOCIALACCOUNT_PROVIDERS = {
 # 2FA on their own local/password account instead of using a social login).
 # ---------------------------------------------------------------------------
 MFA_TOTP_ISSUER = CONFIG.y('mfa.totp_issuer', 'p2 Storage')
+# Allow ±2 time steps (±60 seconds) clock skew for authenticator apps (RFC 6238)
+MFA_TOTP_TOLERANCE = int(CONFIG.y('mfa.totp_tolerance', default=2))
 # A short-lived, single-use "MFA challenge" token is minted after password
 # auth succeeds for a user with 2FA enabled, and must be exchanged (together
 # with a valid TOTP/recovery code) for the real ninja-jwt pair within this

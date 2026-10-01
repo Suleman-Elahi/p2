@@ -24,7 +24,7 @@ urlpatterns = [
     # Granian's --static-path-route can take this over if you want it out of Python.
     re_path(r'^assets/(?P<asset_path>.+)$', SpaIndexView.as_view(), name='spa-asset'),
     # Frappe UI SPA routes — serves index.html for SPA frontend routing.
-    re_path(r'^(?:$|(?:login|buckets|settings)(?:/.*)?$)', SpaIndexView.as_view(), name='spa-index'),
+    re_path(r'^(?:$|(?:login|buckets|settings|dashboard)(?:/.*)?$)', SpaIndexView.as_view(), name='spa-index'),
     path('_/admin/', admin.site.urls),
     path('_/api/', include('p2.api.urls', namespace='p2_api')),
     path('api/', include('p2.api.urls', namespace='p2_api_public')),
@@ -36,8 +36,8 @@ urlpatterns = [
     path('_/accounts/', include('allauth.urls')),
     path('_/auth/password/', views.PasswordChangeView.as_view(), name='auth_password'),
     path('_/auth/login/', P2LoginView.as_view(), name='auth_login'),
-    path('_/auth/logout/', views.LogoutView.as_view(), name='auth_logout'),
-    re_path(r'^favicon\.ico/?$', RedirectView.as_view(url='/static/p2/img/icon.png', permanent=True)),
+    re_path(r'^favicon\.ico/?$', RedirectView.as_view(url='/_/static/p2/img/icon.png', permanent=True)),
+    re_path(r'^static/(?P<path>.*)$', RedirectView.as_view(url='/_/static/%(path)s', permanent=False)),
     path('', include('p2.s3.urls', namespace='p2_s3')),
 ] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
 

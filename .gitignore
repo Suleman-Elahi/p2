@@ -21,7 +21,7 @@ coverage.xml
 .pytest_cache/
 .mypy_cache/
 .hypothesis/
-
+static
 # Secrets — .env holds P2_SECRET_KEY and P2_FERNET_KEY. Never commit it.
 # .env.example is the tracked template.
 .env

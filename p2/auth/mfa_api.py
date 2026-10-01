@@ -10,8 +10,11 @@ This sits in front of ninja-jwt's token issuance rather than replacing it:
          JWT is issued yet. Instead a short-lived, single-use "MFA challenge"
          id is returned. The client must immediately follow up with...
   2. POST /api/v1/auth/mfa/verify      — mfa_token + code (TOTP or a
-         recovery code). On success, the challenge is consumed (cannot be
-         reused) and the real ninja-jwt pair is minted and returned.
+         recovery code). A wrong code does NOT burn the challenge — the
+         client may retry with the same mfa_token until it expires,
+         succeeds, or hits the wrong-attempt limit. On success, the
+         challenge is consumed (cannot be replayed) and the real
+         ninja-jwt pair is minted and returned.
 
 Enrollment (done once the user already holds a valid JWT, i.e. from
 Settings in the SPA):
@@ -33,6 +36,7 @@ validation — we do not reimplement TOTP math. We only replace allauth's own
 views, which are session/HTML-form based and don't fit a JWT SPA.
 """
 import logging
+import re
 import secrets
 
 from allauth.mfa.adapter import get_adapter as get_mfa_adapter
@@ -54,6 +58,13 @@ router_mfa = Router(tags=["auth-mfa"])
 
 _CHALLENGE_CACHE_PREFIX = 'p2:mfa:challenge:'
 _PENDING_SECRET_CACHE_PREFIX = 'p2:mfa:pending_secret:'
+_ATTEMPT_CACHE_PREFIX = 'p2:mfa:attempts:'
+
+# How many wrong codes a single MFA challenge tolerates before it is
+# discarded (forcing a fresh password login). The password was already
+# verified to issue the challenge, so this is only a backstop against
+# unbounded guessing on one challenge — not the primary rate limit.
+_MAX_VERIFY_ATTEMPTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +79,8 @@ class LoginSchema(Schema):
 class LoginResponseSchema(Schema):
     mfa_required: bool = False
     mfa_token: str | None = None
+    mfa_setup_required: bool = False
+    enrollment_token: str | None = None
     access: str | None = None
     refresh: str | None = None
 
@@ -99,13 +112,34 @@ class MfaConfirmResponseSchema(Schema):
     recovery_codes: list[str]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+class CurrentUserSchema(Schema):
+    id: int
+    username: str
+    email: str
+    is_superuser: bool
+    is_staff: bool
+
 
 def _mint_jwt_pair(user) -> dict:
     refresh = RefreshToken.for_user(user)
+    refresh['is_superuser'] = bool(user.is_superuser)
+    refresh['is_staff'] = bool(user.is_staff)
+    refresh['username'] = user.username
     return {'access': str(refresh.access_token), 'refresh': str(refresh)}
+
+
+@router_login.get('/me', response=CurrentUserSchema)
+def current_user(request):
+    user = request.user
+    if not getattr(user, 'is_authenticated', False):
+        raise HttpError(401, "Not authenticated")
+    return CurrentUserSchema(
+        id=user.id,
+        username=user.username,
+        email=user.email or '',
+        is_superuser=bool(user.is_superuser),
+        is_staff=bool(user.is_staff),
+    )
 
 
 def _issue_mfa_challenge(user) -> str:
@@ -116,15 +150,28 @@ def _issue_mfa_challenge(user) -> str:
     return token
 
 
-def _consume_mfa_challenge(token: str):
-    """Return the User bound to a challenge token, or None. Always deletes
-    the token so it cannot be replayed, whether or not it was valid."""
-    cache_key = f'{_CHALLENGE_CACHE_PREFIX}{token}'
-    user_pk = cache.get(cache_key)
-    cache.delete(cache_key)
+def _peek_mfa_challenge(token: str):
+    """Return the User bound to a challenge token, or None, without
+    consuming it — so a typo'd code doesn't burn the whole login attempt.
+    The challenge is deleted only on success (see verify), on expiry, or
+    after too many wrong guesses."""
+    if not token:
+        return None
+    user_pk = cache.get(f'{_CHALLENGE_CACHE_PREFIX}{token}')
     if user_pk is None:
         return None
     return User.objects.filter(pk=user_pk, is_active=True).first()
+
+
+def _delete_mfa_challenge(token: str) -> None:
+    cache.delete(f'{_CHALLENGE_CACHE_PREFIX}{token}')
+    cache.delete(f'{_ATTEMPT_CACHE_PREFIX}{token}')
+
+
+def _normalize_code(code: str) -> str:
+    """Strip whitespace/dashes users often copy-paste from authenticator
+    apps ("123 456", "123-456") before comparing."""
+    return re.sub(r'[\s\-]+', '', code or '')
 
 
 def _totp_authenticator(user) -> Authenticator | None:
@@ -144,40 +191,106 @@ def _validate_second_factor(user, code: str) -> bool:
     return False
 
 
+_ENROLLMENT_CACHE_PREFIX = 'p2:mfa:enrollment:'
+
+
+def _issue_enrollment_token(user) -> str:
+    """Like an MFA challenge, but for forced TOTP enrollment."""
+    token = secrets.token_urlsafe(32)
+    cache.set(f'{_ENROLLMENT_CACHE_PREFIX}{token}', user.pk,
+              timeout=settings.MFA_CHALLENGE_TTL_SECONDS)
+    return token
+
+
+def _peek_enrollment_token(token: str):
+    if not token:
+        return None
+    user_pk = cache.get(f'{_ENROLLMENT_CACHE_PREFIX}{token}')
+    if user_pk is None:
+        return None
+    return User.objects.filter(pk=user_pk, is_active=True).first()
+
+
+def _delete_enrollment_token(token: str) -> None:
+    cache.delete(f'{_ENROLLMENT_CACHE_PREFIX}{token}')
+
+
 # ---------------------------------------------------------------------------
 # Login (first factor + MFA gate)
 # ---------------------------------------------------------------------------
 
 @router_login.post('/login', response=LoginResponseSchema, auth=None)
 def login(request, payload: LoginSchema):
-    """Password auth. Returns JWT immediately if the user has no TOTP
-    enrolled, otherwise returns an MFA challenge that must be completed via
-    /mfa/verify.
+    """Password auth with auth-policy enforcement.
+
+    Superusers are exempt from policy (lockout safety §5.1).  For everyone
+    else the effective requirement may block password login entirely
+    (SSO_REQUIRED), force TOTP enrollment (MFA_REQUIRED / SSO_OR_MFA), or
+    allow bare password (NONE).
     """
     user = authenticate(request, username=payload.username, password=payload.password)
     if user is None or not user.is_active:
         raise HttpError(401, "No active account found with the given credentials")
 
-    if _totp_authenticator(user) is not None:
+    # ── superuser exemption (§5.1) ──────────────────────────────────────
+    if user.is_superuser:
+        if _totp_authenticator(user) is not None:
+            return LoginResponseSchema(mfa_required=True, mfa_token=_issue_mfa_challenge(user))
+        return LoginResponseSchema(**_mint_jwt_pair(user))
+
+    # ── resolve effective auth policy ───────────────────────────────────
+    from p2.core.auth_policy import AuthPolicy, resolve_policy
+    policy = resolve_policy(user)
+
+    if policy == AuthPolicy.Requirement.SSO_REQUIRED:
+        raise HttpError(403, 'This account must sign in via SSO. Password login is disabled.')
+
+    if policy in (AuthPolicy.Requirement.MFA_REQUIRED, AuthPolicy.Requirement.SSO_OR_MFA):
+        if _totp_authenticator(user) is None:
+            return LoginResponseSchema(
+                mfa_setup_required=True,
+                enrollment_token=_issue_enrollment_token(user),
+            )
         return LoginResponseSchema(mfa_required=True, mfa_token=_issue_mfa_challenge(user))
 
+    # policy == NONE — existing behaviour
+    if _totp_authenticator(user) is not None:
+        return LoginResponseSchema(mfa_required=True, mfa_token=_issue_mfa_challenge(user))
     return LoginResponseSchema(**_mint_jwt_pair(user))
 
 
 @router_mfa.post('/verify', response=LoginResponseSchema, auth=None)
 def verify(request, payload: MfaVerifySchema):
-    """Second factor. Consumes the challenge token (single use) and, if the
-    TOTP/recovery code is valid, mints and returns the real JWT pair.
+    """Second factor. The challenge stays valid for retries until it
+    expires, succeeds, or exceeds the wrong-code limit — only a successful
+    verification consumes it (so it still cannot be replayed for a second
+    login) and mints the real JWT pair.
     """
-    user = _consume_mfa_challenge(payload.mfa_token)
+    user = _peek_mfa_challenge(payload.mfa_token)
     if user is None:
         raise HttpError(401, "MFA challenge expired or already used. Please log in again.")
 
-    if not _validate_second_factor(user, payload.code):
-        raise HttpError(401, "Incorrect code.")
+    code = _normalize_code(payload.code)
+    if code and _validate_second_factor(user, code):
+        _delete_mfa_challenge(payload.mfa_token)
+        LOGGER.debug("MFA verify: user=%s", user.get_username())
+        return LoginResponseSchema(**_mint_jwt_pair(user))
 
-    LOGGER.debug("MFA verify: user=%s", user.get_username())
-    return LoginResponseSchema(**_mint_jwt_pair(user))
+    attempts_key = f'{_ATTEMPT_CACHE_PREFIX}{payload.mfa_token}'
+    try:
+        attempts = cache.incr(attempts_key)
+    except ValueError:
+        cache.set(
+            attempts_key,
+            1,
+            timeout=settings.MFA_CHALLENGE_TTL_SECONDS,
+        )
+        attempts = 1
+    if attempts >= _MAX_VERIFY_ATTEMPTS:
+        _delete_mfa_challenge(payload.mfa_token)
+        raise HttpError(429, "Too many incorrect attempts. Please log in again.")
+
+    raise HttpError(401, "Incorrect code.")
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +359,60 @@ def disable(request, payload: MfaDisableSchema):
     ).delete()
     LOGGER.debug("MFA disabled: user=%s", request.user.get_username())
     return {'ok': True}
+
+
+# ---------------------------------------------------------------------------
+# Forced TOTP enrollment (policy-driven, before JWT exists)
+# ---------------------------------------------------------------------------
+
+class EnrollmentSetupSchema(Schema):
+    enrollment_token: str
+
+
+class EnrollmentConfirmSchema(Schema):
+    enrollment_token: str
+    code: str
+
+
+@router_mfa.post('/enroll-setup', response=MfaSetupResponseSchema, auth=None)
+def enroll_setup(request, payload: EnrollmentSetupSchema):
+    """Generate a TOTP secret for a user in the forced-enrollment flow.
+    Requires an enrollment_token (not a JWT)."""
+    user = _peek_enrollment_token(payload.enrollment_token)
+    if user is None:
+        raise HttpError(401, 'Enrollment session expired. Please log in again.')
+
+    secret = generate_totp_secret()
+    cache.set(
+        f'{_PENDING_SECRET_CACHE_PREFIX}{user.pk}',
+        secret,
+        timeout=settings.MFA_CHALLENGE_TTL_SECONDS,
+    )
+    adapter = get_mfa_adapter()
+    otpauth_url = adapter.build_totp_url(user, secret)
+    qr_svg = adapter.build_totp_svg(otpauth_url)
+    return MfaSetupResponseSchema(secret=secret, otpauth_url=otpauth_url, qr_svg=qr_svg)
+
+
+@router_mfa.post('/enroll-confirm', auth=None)
+def enroll_confirm(request, payload: EnrollmentConfirmSchema):
+    """Confirm the TOTP code, activate the authenticator, and mint a JWT
+    pair — completing the forced-enrollment flow in one round trip."""
+    user = _peek_enrollment_token(payload.enrollment_token)
+    if user is None:
+        raise HttpError(401, 'Enrollment session expired. Please log in again.')
+
+    secret = cache.get(f'{_PENDING_SECRET_CACHE_PREFIX}{user.pk}')
+    if not secret:
+        raise HttpError(400, 'No pending 2FA setup. Call /mfa/enroll-setup first.')
+
+    if not validate_totp_code(secret, payload.code):
+        raise HttpError(400, 'Incorrect code.')
+
+    cache.delete(f'{_PENDING_SECRET_CACHE_PREFIX}{user.pk}')
+    _delete_enrollment_token(payload.enrollment_token)
+    TOTP.activate(user, secret)
+    recovery_codes = RecoveryCodes.activate(user).generate_codes()
+
+    LOGGER.debug('Forced MFA enrollment completed: user=%s', user.get_username())
+    return {**_mint_jwt_pair(user), 'recovery_codes': recovery_codes}

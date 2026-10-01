@@ -103,6 +103,140 @@ function accessTheme(policy) {
   if (policy === 'public-read') return 'orange'
   return 'red'
 }
+
+// ── Bucket Access Control (ACL) ──────────────────────────────────────────
+const showAcl = ref(false)
+const selectedBucket = ref(null)
+const bucketAcls = ref([])
+const aclsLoading = ref(false)
+const allUsers = ref([])
+const allGroups = ref([])
+
+// Grant Access form
+const showGrantForm = ref(false)
+const grantType = ref('user')
+const grantUserId = ref('')
+const grantGroupId = ref('')
+const grantPerms = ref(['read', 'list'])
+const grantingAcl = ref(false)
+
+async function openAclDialog(bucket) {
+  selectedBucket.value = bucket
+  showAcl.value = true
+  showGrantForm.value = false
+  await fetchBucketAcls(bucket.uuid)
+  fetchGrantees()
+}
+
+async function fetchBucketAcls(uuid) {
+  aclsLoading.value = true
+  try {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/core/volumes/${uuid}/acl/`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (resp.ok) {
+      bucketAcls.value = await resp.json()
+    } else {
+      bucketAcls.value = []
+    }
+  } catch (e) {
+    bucketAcls.value = []
+  } finally {
+    aclsLoading.value = false
+  }
+}
+
+async function fetchGrantees() {
+  const token = localStorage.getItem('p2_token') || ''
+  try {
+    const [usersResp, groupsResp] = await Promise.all([
+      fetch('/api/v1/system/user/', { headers: { Authorization: `Bearer ${token}` } }),
+      fetch('/api/v1/system/auth-policy/groups/', { headers: { Authorization: `Bearer ${token}` } }),
+    ])
+    if (usersResp.ok) allUsers.value = await usersResp.json()
+    if (groupsResp.ok) allGroups.value = await groupsResp.json()
+  } catch {}
+}
+
+function openGrantAccess() {
+  grantType.value = 'user'
+  grantUserId.value = allUsers.value?.[0]?.id ? String(allUsers.value[0].id) : ''
+  grantGroupId.value = allGroups.value?.[0]?.id ? String(allGroups.value[0].id) : ''
+  grantPerms.value = ['read', 'list']
+  showGrantForm.value = true
+}
+
+async function handleGrantAccess() {
+  if (grantType.value === 'user' && !grantUserId.value) {
+    toast.error('Please select a user')
+    return
+  }
+  if (grantType.value === 'group' && !grantGroupId.value) {
+    toast.error('Please select a group')
+    return
+  }
+  if (!grantPerms.value.length) {
+    toast.error('Please select at least one permission')
+    return
+  }
+
+  grantingAcl.value = true
+  try {
+    const token = localStorage.getItem('p2_token') || ''
+    const payload = {
+      user_id: grantType.value === 'user' ? Number(grantUserId.value) : null,
+      group_id: grantType.value === 'group' ? Number(grantGroupId.value) : null,
+      permissions: grantPerms.value,
+    }
+    const resp = await fetch(`/api/v1/core/volumes/${selectedBucket.value.uuid}/acl/`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    toast.success('Access granted')
+    showGrantForm.value = false
+    await fetchBucketAcls(selectedBucket.value.uuid)
+  } catch (e) {
+    toast.error(e.message || 'Failed to grant access')
+  } finally {
+    grantingAcl.value = false
+  }
+}
+
+function promptRevokeAcl(acl) {
+  confirmDialog({
+    title: 'Revoke Access?',
+    message: `Revoke permissions for ${acl.username ? `user "${acl.username}"` : `group "${acl.group_name}"`} on bucket "${selectedBucket.value.name}"?`,
+    theme: 'red',
+    confirmLabel: 'Revoke',
+    onConfirm: async ({ hideDialog }) => {
+      try {
+        const token = localStorage.getItem('p2_token') || ''
+        const resp = await fetch(`/api/v1/core/volumes/${selectedBucket.value.uuid}/acl/${acl.id}/`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        })
+        if (!resp.ok) {
+          const body = await resp.json().catch(() => ({}))
+          throw new Error(body.detail || `HTTP ${resp.status}`)
+        }
+        toast.success('Access revoked')
+        hideDialog()
+        await fetchBucketAcls(selectedBucket.value.uuid)
+      } catch (e) {
+        toast.error(e.message || 'Failed to revoke access')
+      }
+    },
+  })
+}
 </script>
 
 <template>
@@ -135,6 +269,7 @@ function accessTheme(policy) {
             <Badge v-if="b.versioning" label="Versioned" theme="blue" variant="subtle" size="sm" />
             <Badge :label="b.accessPolicy" :theme="accessTheme(b.accessPolicy)" variant="subtle" size="sm" />
             <Badge :label="b.encryption" theme="gray" variant="subtle" size="sm" />
+            <Button icon="shield" variant="ghost" theme="gray" size="sm" title="Bucket Permissions" @click.stop="openAclDialog(b)" />
             <Button icon="settings" variant="ghost" theme="gray" size="sm" @click.stop="openEditBucket(b)" />
             <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click.stop="promptDeleteBucket(b)" />
             <Button icon="chevron-right" variant="ghost" size="sm" @click="openBucket(b)" />
@@ -254,6 +389,135 @@ function accessTheme(policy) {
           :loading="updating"
           @click="handleUpdate(close)"
         />
+      </template>
+    </Dialog>
+
+    <!-- Manage Bucket Access / ACL Dialog -->
+    <Dialog
+      v-model="showAcl"
+      :key="'acl-bucket-' + showAcl"
+      :options="{
+        title: `Bucket Access: ${selectedBucket?.name}`,
+        icon: { name: 'shield' },
+        size: 'xl',
+      }"
+    >
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <div class="flex items-center justify-between">
+            <p class="text-xs text-ink-gray-5">
+              Control which users and groups have permissions on this bucket. Superusers and the bucket owner always have full access.
+            </p>
+            <Button
+              v-if="!showGrantForm"
+              variant="solid"
+              theme="gray"
+              size="sm"
+              icon-left="plus"
+              label="Grant Access"
+              @click="openGrantAccess"
+            />
+          </div>
+
+          <!-- Grant Access Inline Form -->
+          <div v-if="showGrantForm" class="rounded-md border border-outline-gray-1 bg-surface-gray-1 p-4 space-y-3">
+            <div class="flex items-center justify-between">
+              <h4 class="text-sm font-medium text-ink-gray-9">Grant New Permission</h4>
+              <Button variant="ghost" size="sm" icon="x" @click="showGrantForm = false" />
+            </div>
+
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="block text-xs font-medium text-ink-gray-5 mb-1">Grantee Type</label>
+                <div class="flex items-center gap-4 py-1">
+                  <label class="flex items-center gap-1.5 text-sm text-ink-gray-8 cursor-pointer">
+                    <input type="radio" value="user" v-model="grantType" class="text-gray-900" />
+                    <span>User</span>
+                  </label>
+                  <label class="flex items-center gap-1.5 text-sm text-ink-gray-8 cursor-pointer">
+                    <input type="radio" value="group" v-model="grantType" class="text-gray-900" />
+                    <span>Group</span>
+                  </label>
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-xs font-medium text-ink-gray-5 mb-1">{{ grantType === 'user' ? 'Select User' : 'Select Group' }}</label>
+                <select
+                  v-if="grantType === 'user'"
+                  v-model="grantUserId"
+                  class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                >
+                  <option v-for="u in allUsers" :key="u.id" :value="String(u.id)">
+                    {{ u.username }} ({{ u.email || 'no email' }})
+                  </option>
+                </select>
+                <select
+                  v-else
+                  v-model="grantGroupId"
+                  class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-1.5 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+                >
+                  <option v-for="g in allGroups" :key="g.id" :value="String(g.id)">
+                    {{ g.name }} ({{ g.user_count }} members)
+                  </option>
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label class="block text-xs font-medium text-ink-gray-5 mb-1.5">Permissions</label>
+              <div class="flex flex-wrap gap-4">
+                <label v-for="p in ['read', 'write', 'delete', 'list', 'admin']" :key="p" class="flex items-center gap-1.5 text-sm text-ink-gray-8 cursor-pointer">
+                  <input type="checkbox" :value="p" v-model="grantPerms" class="rounded text-gray-900" />
+                  <span class="capitalize">{{ p }}</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="flex justify-end gap-2 pt-2">
+              <Button size="sm" label="Cancel" @click="showGrantForm = false" />
+              <Button size="sm" variant="solid" theme="gray" label="Grant" :loading="grantingAcl" @click="handleGrantAccess" />
+            </div>
+          </div>
+
+          <!-- ACL Entries Table -->
+          <div v-if="aclsLoading" class="py-8 text-center text-sm text-ink-gray-5">Loading access rules...</div>
+          <div v-else-if="bucketAcls.length" class="divide-y divide-outline-gray-1 rounded-md border border-outline-gray-1 overflow-hidden">
+            <div
+              v-for="acl in bucketAcls"
+              :key="acl.id"
+              class="flex items-center justify-between bg-surface-white px-4 py-3"
+            >
+              <div>
+                <div class="flex items-center gap-2">
+                  <FeatherIcon :name="acl.username ? 'user' : 'users'" class="h-4 w-4 text-ink-gray-5" />
+                  <p class="text-sm font-medium text-ink-gray-9">
+                    {{ acl.username || acl.group_name }}
+                  </p>
+                  <Badge :label="acl.username ? 'User' : 'Group'" theme="gray" variant="subtle" size="sm" />
+                </div>
+                <div class="flex items-center gap-1.5 mt-1">
+                  <Badge
+                    v-for="perm in acl.permissions"
+                    :key="perm"
+                    :label="perm"
+                    :theme="perm === 'admin' ? 'red' : perm === 'write' ? 'blue' : 'gray'"
+                    variant="subtle"
+                    size="sm"
+                  />
+                </div>
+              </div>
+              <Button icon="trash-2" variant="ghost" theme="red" size="sm" title="Revoke permissions" @click="promptRevokeAcl(acl)" />
+            </div>
+          </div>
+          <div v-else class="rounded-md border border-dashed border-outline-gray-1 py-8 text-center text-p-sm text-ink-gray-5">
+            No custom permissions granted on this bucket. Only the bucket owner and superusers have access.
+          </div>
+        </div>
+      </template>
+
+      <template #actions="{ close }">
+        <Button variant="solid" theme="gray" label="Done" @click="close" />
       </template>
     </Dialog>
   </div>

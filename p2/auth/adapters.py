@@ -30,7 +30,27 @@ SPA_LOGIN_PATH = '/login'
 
 
 def _build_jwt_redirect(user) -> str:
+    # ── SSO policy enforcement (§3.3) ───────────────────────────────
+    if not getattr(user, 'is_superuser', False):
+        try:
+            from p2.core.auth_policy import AuthPolicy, resolve_policy
+            from p2.auth.mfa_api import _issue_enrollment_token, _totp_authenticator
+
+            if resolve_policy(user) == AuthPolicy.Requirement.MFA_REQUIRED and _totp_authenticator(user) is None:
+                token = _issue_enrollment_token(user)
+                params = urlencode({
+                    'mfa_setup_required': 'true',
+                    'enrollment_token': token,
+                })
+                LOGGER.debug("SSO login: redirecting to forced MFA setup for user=%s", user.get_username())
+                return f'{SPA_LOGIN_PATH}?{params}'
+        except Exception as exc:
+            LOGGER.warning("Error checking auth policy for SSO login: %s", exc)
+
     refresh = RefreshToken.for_user(user)
+    refresh['is_superuser'] = bool(user.is_superuser)
+    refresh['is_staff'] = bool(user.is_staff)
+    refresh['username'] = user.username
     params = urlencode({
         'access': str(refresh.access_token),
         'refresh': str(refresh),

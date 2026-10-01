@@ -1,17 +1,48 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 import { Button, Dialog, Badge, TabButtons, FormControl, toast, FeatherIcon, confirmDialog } from 'frappe-ui'
 import { useSettingsSingleton } from '../stores/settings'
+import { isSuperAdmin } from '../stores/auth'
 
 const {
   config, configLoading,
   apiKeys, keysLoading, createApiKey, keyCreating, deleteApiKey,
-  users, usersLoading, createUser, userCreating,
+  users, usersLoading, createUser, userCreating, updateUser, deleteUser,
   policies, policiesLoading, createPolicy, updatePolicy, deletePolicy,
   mfaEnabled, mfaStatusLoading, setupMfa, mfaSettingUp, confirmMfa, mfaConfirming, disableMfa, mfaDisabling,
+  authPolicies, authPoliciesLoading, fetchAuthPolicies, createAuthPolicy, updateAuthPolicy, deleteAuthPolicy, getAffectedCount,
+  groups, groupsLoading, fetchGroups,
+  ssoProviders, ssoProvidersLoading, fetchSsoProviders, availableProviders, createSsoProvider, updateSsoProvider, deleteSsoProvider,
 } = useSettingsSingleton()
 
 const activeTab = ref('keys')
+
+const tabs = computed(() => {
+  const items = [
+    { label: 'API Keys', value: 'keys', icon: 'key' },
+  ]
+  if (isSuperAdmin.value) {
+    items.push({ label: 'Users', value: 'users', icon: 'users' })
+  }
+  items.push({ label: 'Security', value: 'security', icon: 'lock' })
+  if (isSuperAdmin.value) {
+    items.push(
+      { label: 'Login Policy', value: 'login-policy', icon: 'shield' },
+      { label: 'SSO Providers', value: 'sso-providers', icon: 'globe' },
+    )
+  }
+  items.push(
+    { label: 'Policies', value: 'policies', icon: 'layers' },
+    { label: 'System', value: 'config', icon: 'settings' },
+  )
+  return items
+})
+
+watch(isSuperAdmin, (val) => {
+  if (!val && ['users', 'login-policy', 'sso-providers'].includes(activeTab.value)) {
+    activeTab.value = 'keys'
+  }
+}, { immediate: true })
 
 // ── API Key create dialog ──────────────────────────────────────────────────
 const showKeyDialog = ref(false)
@@ -115,15 +146,24 @@ function promptDeletePolicy(policy) {
   })
 }
 
-// ── User creation dialog ──────────────────────────────────────────────────
+// ── User management ───────────────────────────────────────────────────────
 const showUserDialog = ref(false)
 const userName = ref('')
 const userPassword = ref('')
 const userEmail = ref('')
+const userIsActive = ref(true)
 const userIsAdmin = ref(false)
+const userGroups = ref('')
 
 watch(showUserDialog, (val) => {
-  if (val) { userName.value = ''; userPassword.value = ''; userEmail.value = ''; userIsAdmin.value = false }
+  if (val) {
+    userName.value = ''
+    userPassword.value = ''
+    userEmail.value = ''
+    userIsActive.value = true
+    userIsAdmin.value = false
+    userGroups.value = ''
+  }
 })
 
 async function handleCreateUser(close) {
@@ -133,13 +173,317 @@ async function handleCreateUser(close) {
       username: userName.value.trim(),
       password: userPassword.value,
       email: userEmail.value.trim(),
+      is_active: userIsActive.value,
       is_superuser: userIsAdmin.value,
+      groups: userGroups.value.split(',').map(s => s.trim()).filter(Boolean),
     })
     toast.success(`User "${userName.value}" created`)
     close()
   } catch (e) {
     toast.error(e.message || 'Failed to create user')
   }
+}
+
+// Edit User
+const showEditUserDialog = ref(false)
+const editingUser = ref(null)
+const editUserEmail = ref('')
+const editUserPassword = ref('')
+const editUserIsActive = ref(true)
+const editUserIsAdmin = ref(false)
+const editUserGroups = ref('')
+const userUpdating = ref(false)
+
+function openEditUser(u) {
+  editingUser.value = u
+  editUserEmail.value = u.email || ''
+  editUserPassword.value = ''
+  editUserIsActive.value = u.is_active !== undefined ? u.is_active : true
+  editUserIsAdmin.value = !!u.is_superuser
+  editUserGroups.value = (u.groups || []).join(', ')
+  showEditUserDialog.value = true
+}
+
+async function handleUpdateUser(close) {
+  if (!editingUser.value) return
+  userUpdating.value = true
+  try {
+    const payload = {
+      email: editUserEmail.value.trim(),
+      is_active: editUserIsActive.value,
+      is_superuser: editUserIsAdmin.value,
+      groups: editUserGroups.value.split(',').map(s => s.trim()).filter(Boolean),
+    }
+    if (editUserPassword.value.trim()) {
+      payload.password = editUserPassword.value
+    }
+    await updateUser(editingUser.value.id, payload)
+    toast.success(`User "${editingUser.value.username}" updated`)
+    close()
+  } catch (e) {
+    toast.error(e.message || 'Failed to update user')
+  } finally {
+    userUpdating.value = false
+  }
+}
+
+function promptDeleteUser(u) {
+  confirmDialog({
+    title: 'Delete User?',
+    message: `Are you sure you want to permanently delete user "${u.username}"?`,
+    theme: 'red',
+    confirmLabel: 'Delete',
+    onConfirm: async ({ hideDialog }) => {
+      try {
+        await deleteUser(u.id)
+        toast.success(`User "${u.username}" deleted`)
+        hideDialog()
+      } catch (e) {
+        toast.error(e.message || 'Failed to delete user')
+      }
+    },
+  })
+}
+
+// ── Login Policy ───────────────────────────────────────────────────────────
+const policyOptions = [
+  { value: 'none', label: 'No requirement', description: 'Password alone is allowed' },
+  { value: 'mfa_required', label: 'Require 2FA', description: 'Password + TOTP two-factor authentication required' },
+  { value: 'sso_or_mfa', label: 'Require SSO or 2FA', description: 'No bare password — must sign in with SSO or password + 2FA' },
+  { value: 'sso_required', label: 'Require SSO only', description: 'Password login completely disabled — SSO required' },
+]
+
+const globalPolicyReq = ref('none')
+const globalPolicySaved = ref('none')
+const globalPolicyId = ref(null)
+const savingGlobalPolicy = ref(false)
+
+const globalPolicyChanged = computed(() => globalPolicyReq.value !== globalPolicySaved.value)
+
+const groupOverrides = computed(() => {
+  return (authPolicies.value || []).filter(p => p.group_id !== null)
+})
+
+watch(() => authPolicies.value, (policies) => {
+  const global = (policies || []).find(p => p.group_id === null)
+  if (global) {
+    globalPolicyReq.value = global.requirement
+    globalPolicySaved.value = global.requirement
+    globalPolicyId.value = global.id
+  } else {
+    globalPolicyReq.value = 'none'
+    globalPolicySaved.value = 'none'
+    globalPolicyId.value = null
+  }
+}, { immediate: true })
+
+// Step-up password dialog for SSO_REQUIRED
+const showStepUpDialog = ref(false)
+const stepUpPassword = ref('')
+const stepUpTargetReq = ref('')
+const stepUpLoading = ref(false)
+
+async function saveGlobalPolicy() {
+  const req = globalPolicyReq.value
+  if (req === 'sso_required') {
+    stepUpPassword.value = ''
+    stepUpTargetReq.value = req
+    showStepUpDialog.value = true
+    return
+  }
+
+  if (req !== 'none') {
+    const { count } = await getAffectedCount(req)
+    confirmDialog({
+      title: 'Change Organization Login Policy?',
+      message: `This will affect ${count} active non-superuser user(s). Superusers are always exempt to prevent accidental lockout.`,
+      theme: 'orange',
+      confirmLabel: 'Apply Policy',
+      onConfirm: async ({ hideDialog }) => {
+        await executeSaveGlobal(req, null)
+        hideDialog()
+      },
+    })
+    return
+  }
+
+  await executeSaveGlobal(req, null)
+}
+
+async function handleConfirmStepUp(close) {
+  if (!stepUpPassword.value.trim()) return
+  stepUpLoading.value = true
+  try {
+    await executeSaveGlobal(stepUpTargetReq.value, stepUpPassword.value)
+    close()
+  } catch (e) {
+    toast.error(e.message || 'Incorrect password')
+  } finally {
+    stepUpLoading.value = false
+  }
+}
+
+async function executeSaveGlobal(req, confirmPass) {
+  savingGlobalPolicy.value = true
+  try {
+    if (globalPolicyId.value) {
+      await updateAuthPolicy(globalPolicyId.value, {
+        requirement: req,
+        confirm_password: confirmPass,
+      })
+    } else {
+      await createAuthPolicy({ requirement: req })
+    }
+    globalPolicySaved.value = req
+    toast.success('Organization login policy updated')
+  } catch (e) {
+    toast.error(e.message || 'Failed to update policy')
+  } finally {
+    savingGlobalPolicy.value = false
+  }
+}
+
+function policyLabel(req) {
+  return policyOptions.find(o => o.value === req)?.label || req
+}
+
+// Override dialog
+const showOverrideDialog = ref(false)
+const overrideEditing = ref(null)
+const overrideGroupId = ref('')
+const overrideReq = ref('mfa_required')
+const overrideSaving = ref(false)
+
+function openAddOverride() {
+  overrideEditing.value = null
+  overrideGroupId.value = groups.value?.[0]?.id ? String(groups.value[0].id) : ''
+  overrideReq.value = 'mfa_required'
+  showOverrideDialog.value = true
+}
+
+function openEditOverride(policy) {
+  overrideEditing.value = policy
+  overrideGroupId.value = String(policy.group_id)
+  overrideReq.value = policy.requirement
+  showOverrideDialog.value = true
+}
+
+async function handleSaveOverride(close) {
+  overrideSaving.value = true
+  try {
+    if (overrideEditing.value) {
+      await updateAuthPolicy(overrideEditing.value.id, {
+        requirement: overrideReq.value,
+      })
+      toast.success('Override updated')
+    } else {
+      if (!overrideGroupId.value) {
+        toast.error('Please specify a group')
+        overrideSaving.value = false
+        return
+      }
+      await createAuthPolicy({
+        group_id: Number(overrideGroupId.value),
+        requirement: overrideReq.value,
+      })
+      toast.success('Group override added')
+    }
+    close()
+  } catch (e) {
+    toast.error(e.message || 'Failed to save override')
+  } finally {
+    overrideSaving.value = false
+  }
+}
+
+function promptDeleteOverride(policy) {
+  confirmDialog({
+    title: 'Remove Override?',
+    message: `Remove the login policy override for group "${policy.group_name}"? Members will fall back to the organization default.`,
+    theme: 'red',
+    confirmLabel: 'Remove',
+    onConfirm: async ({ hideDialog }) => {
+      await deleteAuthPolicy(policy.id)
+      toast.success('Group override removed')
+      hideDialog()
+    },
+  })
+}
+
+// ── SSO Providers ──────────────────────────────────────────────────────────
+const showSsoDialog = ref(false)
+const ssoEditing = ref(null)
+const ssoProvider = ref('google')
+const ssoName = ref('')
+const ssoClientId = ref('')
+const ssoClientSecret = ref('')
+const ssoSaving = ref(false)
+
+function openAddSso() {
+  ssoEditing.value = null
+  ssoProvider.value = availableProviders.value?.[0]?.id || 'google'
+  ssoName.value = availableProviders.value?.[0]?.name || 'Google'
+  ssoClientId.value = ''
+  ssoClientSecret.value = ''
+  showSsoDialog.value = true
+}
+
+function openEditSso(app) {
+  ssoEditing.value = app
+  ssoProvider.value = app.provider
+  ssoName.value = app.name
+  ssoClientId.value = app.client_id
+  ssoClientSecret.value = ''
+  showSsoDialog.value = true
+}
+
+async function handleSaveSso(close) {
+  if (!ssoName.value.trim() || !ssoClientId.value.trim()) return
+  if (!ssoEditing.value && !ssoClientSecret.value.trim()) {
+    toast.error('Client secret is required')
+    return
+  }
+  ssoSaving.value = true
+  try {
+    if (ssoEditing.value) {
+      const payload = {
+        name: ssoName.value.trim(),
+        client_id: ssoClientId.value.trim(),
+      }
+      if (ssoClientSecret.value.trim()) {
+        payload.client_secret = ssoClientSecret.value.trim()
+      }
+      await updateSsoProvider(ssoEditing.value.id, payload)
+      toast.success(`SSO Provider "${ssoName.value}" updated`)
+    } else {
+      await createSsoProvider({
+        provider: ssoProvider.value,
+        name: ssoName.value.trim(),
+        client_id: ssoClientId.value.trim(),
+        client_secret: ssoClientSecret.value.trim(),
+      })
+      toast.success(`SSO Provider "${ssoName.value}" added`)
+    }
+    close()
+  } catch (e) {
+    toast.error(e.message || 'Failed to save SSO provider')
+  } finally {
+    ssoSaving.value = false
+  }
+}
+
+function promptDeleteSso(app) {
+  confirmDialog({
+    title: 'Remove SSO Provider?',
+    message: `Remove SSO credentials for "${app.name}"? Users will no longer be able to log in with this provider.`,
+    theme: 'red',
+    confirmLabel: 'Remove',
+    onConfirm: async ({ hideDialog }) => {
+      await deleteSsoProvider(app.id)
+      toast.success(`SSO Provider "${app.name}" removed`)
+      hideDialog()
+    },
+  })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -202,13 +546,7 @@ async function handleDisableMfa(close) {
     <nav class="border-b border-outline-gray-1 bg-surface-white px-3 sm:px-5">
       <TabButtons
         v-model="activeTab"
-        :buttons="[
-          { label: 'API Keys', value: 'keys', icon: 'key' },
-          { label: 'Users', value: 'users', icon: 'users' },
-          { label: 'Security', value: 'security', icon: 'lock' },
-          { label: 'Policies', value: 'policies', icon: 'shield' },
-          { label: 'System', value: 'config', icon: 'settings' },
-        ]"
+        :buttons="tabs"
       />
     </nav>
 
@@ -257,7 +595,7 @@ async function handleDisableMfa(close) {
         </div>
 
         <!-- ═══ Users ═══ -->
-        <div v-if="activeTab === 'users'" class="space-y-4">
+        <div v-if="isSuperAdmin && activeTab === 'users'" class="space-y-4">
           <div class="flex items-center justify-between">
             <h2 class="text-base font-medium text-ink-gray-8">Users</h2>
             <Button variant="solid" theme="gray" icon-left="plus" label="Create User" @click="showUserDialog = true" />
@@ -272,10 +610,23 @@ async function handleDisableMfa(close) {
               class="flex items-center justify-between bg-surface-white px-4 py-3"
             >
               <div>
-                <p class="text-sm font-medium text-ink-gray-9">{{ u.username }}</p>
-                <p class="text-xs text-ink-gray-5">{{ u.email || 'No email' }}</p>
+                <div class="flex items-center gap-2">
+                  <p class="text-sm font-medium text-ink-gray-9">{{ u.username }}</p>
+                  <Badge :label="u.is_superuser ? 'Admin' : 'User'" :theme="u.is_superuser ? 'red' : 'gray'" variant="subtle" size="sm" />
+                  <Badge :label="u.is_active ? 'Active' : 'Inactive'" :theme="u.is_active ? 'green' : 'orange'" variant="subtle" size="sm" />
+                </div>
+                <p class="text-xs text-ink-gray-5">
+                  {{ u.email || 'No email' }}
+                  <span v-if="u.groups && u.groups.length"> · Groups: {{ u.groups.join(', ') }}</span>
+                </p>
               </div>
-              <Badge :label="u.is_superuser ? 'Admin' : 'User'" :theme="u.is_superuser ? 'red' : 'gray'" variant="subtle" size="sm" />
+              <div class="flex items-center gap-2">
+                <Button icon="edit-2" variant="ghost" size="sm" @click="openEditUser(u)" />
+                <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click="promptDeleteUser(u)" />
+              </div>
+            </div>
+            <div v-if="!users.length" class="px-4 py-8 text-center text-p-sm text-ink-gray-5">
+              No users yet.
             </div>
           </div>
         </div>
@@ -309,6 +660,140 @@ async function handleDisableMfa(close) {
                 variant="outline" theme="red" label="Disable 2FA"
                 @click="showMfaDisableDialog = true"
               />
+            </div>
+          </div>
+        </div>
+
+        <!-- ═══ Login Policy ═══ -->
+        <div v-if="isSuperAdmin && activeTab === 'login-policy'" class="space-y-6">
+          <div>
+            <h2 class="text-base font-medium text-ink-gray-8">Organization Login Policy</h2>
+            <p class="text-p-sm text-ink-gray-5 mt-1">
+              Set the organization-wide default login requirement for all users.
+              Per-group overrides take precedence over the default.
+            </p>
+          </div>
+
+          <div class="rounded-md border border-outline-gray-1 bg-surface-white p-5 space-y-4">
+            <div class="space-y-3">
+              <label
+                v-for="opt in policyOptions"
+                :key="opt.value"
+                class="flex items-start gap-3 p-3 rounded-md border border-outline-gray-1 hover:bg-surface-gray-1 cursor-pointer transition-colors"
+                :class="{ 'border-gray-900 bg-surface-gray-1': globalPolicyReq === opt.value }"
+              >
+                <input
+                  type="radio"
+                  name="globalPolicy"
+                  :value="opt.value"
+                  v-model="globalPolicyReq"
+                  class="mt-1 text-gray-900 focus:ring-gray-900"
+                />
+                <div>
+                  <p class="text-sm font-medium text-ink-gray-9">{{ opt.label }}</p>
+                  <p class="text-xs text-ink-gray-5">{{ opt.description }}</p>
+                </div>
+              </label>
+            </div>
+
+            <div class="rounded-md bg-blue-50 border border-blue-200 p-3 flex items-start gap-2">
+              <FeatherIcon name="info" class="h-4 w-4 text-blue-600 mt-0.5 shrink-0" />
+              <p class="text-xs text-blue-800">
+                <strong>Superuser Exemption:</strong> Superusers are always exempt from login policies to prevent accidental lockouts. Policies apply to all non-admin accounts.
+              </p>
+            </div>
+
+            <div class="flex items-center gap-3 pt-2">
+              <Button
+                variant="solid"
+                theme="gray"
+                label="Save Default Policy"
+                :loading="savingGlobalPolicy"
+                :disabled="!globalPolicyChanged"
+                @click="saveGlobalPolicy"
+              />
+              <span v-if="globalPolicyChanged" class="text-xs text-orange-600">Unsaved changes</span>
+            </div>
+          </div>
+
+          <!-- Per-Group Overrides -->
+          <div class="space-y-4 pt-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <h3 class="text-base font-medium text-ink-gray-8">Per-Group Overrides</h3>
+                <p class="text-xs text-ink-gray-5 mt-0.5">
+                  Users who belong to a group with an override will follow the group policy instead of the default.
+                </p>
+              </div>
+              <Button variant="solid" theme="gray" icon-left="plus" label="Add Override" @click="openAddOverride" />
+            </div>
+
+            <div v-if="authPoliciesLoading" class="py-8 text-center text-sm text-ink-gray-5">Loading...</div>
+
+            <div v-else class="divide-y divide-outline-gray-1 rounded-md border border-outline-gray-1 overflow-hidden">
+              <div
+                v-for="p in groupOverrides"
+                :key="p.id"
+                class="flex items-center justify-between bg-surface-white px-4 py-3"
+              >
+                <div>
+                  <div class="flex items-center gap-2">
+                    <FeatherIcon name="users" class="h-4 w-4 text-ink-gray-5" />
+                    <p class="text-sm font-medium text-ink-gray-9">{{ p.group_name }}</p>
+                  </div>
+                  <p class="text-xs text-ink-gray-5 mt-0.5">Requirement: <span class="font-medium text-ink-gray-8">{{ policyLabel(p.requirement) }}</span></p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <Button icon="edit-2" variant="ghost" size="sm" @click="openEditOverride(p)" />
+                  <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click="promptDeleteOverride(p)" />
+                </div>
+              </div>
+              <div v-if="!groupOverrides.length" class="px-4 py-8 text-center text-p-sm text-ink-gray-5">
+                No group overrides configured. All users follow the organization default.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ═══ SSO Providers ═══ -->
+        <div v-if="isSuperAdmin && activeTab === 'sso-providers'" class="space-y-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-base font-medium text-ink-gray-8">SSO Providers</h2>
+              <p class="text-p-sm text-ink-gray-5 mt-0.5">
+                Manage OAuth2 / OpenID Connect credentials for third-party identity providers.
+              </p>
+            </div>
+            <Button variant="solid" theme="gray" icon-left="plus" label="Add Provider" @click="openAddSso" />
+          </div>
+
+          <div v-if="ssoProvidersLoading" class="py-8 text-center text-sm text-ink-gray-5">Loading...</div>
+
+          <div v-else class="divide-y divide-outline-gray-1 rounded-md border border-outline-gray-1 overflow-hidden">
+            <div
+              v-for="app in ssoProviders"
+              :key="app.id"
+              class="flex items-center justify-between bg-surface-white px-4 py-3"
+            >
+              <div class="min-w-0">
+                <div class="flex items-center gap-2">
+                  <p class="text-sm font-medium text-ink-gray-9">{{ app.name }}</p>
+                  <Badge :label="app.provider" theme="blue" variant="subtle" size="sm" />
+                </div>
+                <p class="text-xs text-ink-gray-5 font-mono truncate max-w-[400px]">Client ID: {{ app.client_id }}</p>
+                <div class="flex items-center gap-1.5 mt-1">
+                  <span class="text-xs text-ink-gray-4">Callback:</span>
+                  <code class="text-xs text-ink-gray-6 font-mono bg-surface-gray-2 px-1.5 py-0.5 rounded">{{ app.callback_url }}</code>
+                  <Button icon="copy" variant="ghost" size="sm" @click="copyToClipboard(app.callback_url)" />
+                </div>
+              </div>
+              <div class="flex items-center gap-2 shrink-0">
+                <Button icon="edit-2" variant="ghost" size="sm" @click="openEditSso(app)" />
+                <Button icon="trash-2" variant="ghost" theme="red" size="sm" @click="promptDeleteSso(app)" />
+              </div>
+            </div>
+            <div v-if="!ssoProviders.length" class="px-4 py-8 text-center text-p-sm text-ink-gray-5">
+              No SSO providers configured yet. Click "Add Provider" to connect Google, GitHub, or Microsoft.
             </div>
           </div>
         </div>
@@ -528,10 +1013,23 @@ async function handleDisableMfa(close) {
             placeholder="jdoe@example.com"
           />
           <FormControl
-            v-model="userIsAdmin"
-            type="checkbox"
-            label="Superuser (admin)"
+            v-model="userGroups"
+            label="Groups (comma-separated)"
+            type="text"
+            placeholder="engineering, devops"
           />
+          <div class="flex items-center gap-4">
+            <FormControl
+              v-model="userIsActive"
+              type="checkbox"
+              label="Active"
+            />
+            <FormControl
+              v-model="userIsAdmin"
+              type="checkbox"
+              label="Superuser (admin)"
+            />
+          </div>
         </div>
       </template>
       <template #actions="{ close }">
@@ -541,6 +1039,203 @@ async function handleDisableMfa(close) {
             variant="solid" theme="gray" label="Create User"
             :loading="userCreating" :disabled="!userName.trim() || !userPassword.trim()"
             @click="handleCreateUser(close)"
+          />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Edit User -->
+    <Dialog v-model="showEditUserDialog" :key="'edit-user-' + showEditUserDialog" :options="{ title: `Edit User: ${editingUser?.username}`, icon: { name: 'user-check' }, size: 'lg' }">
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <FormControl
+            v-model="editUserEmail"
+            label="Email"
+            type="text"
+            placeholder="user@example.com"
+          />
+          <FormControl
+            v-model="editUserPassword"
+            type="password"
+            label="New Password (leave blank to keep current)"
+            placeholder="••••••••"
+          />
+          <FormControl
+            v-model="editUserGroups"
+            label="Groups (comma-separated)"
+            type="text"
+            placeholder="engineering, devops"
+          />
+          <div class="flex items-center gap-4">
+            <FormControl
+              v-model="editUserIsActive"
+              type="checkbox"
+              label="Active"
+            />
+            <FormControl
+              v-model="editUserIsAdmin"
+              type="checkbox"
+              label="Superuser (admin)"
+            />
+          </div>
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button label="Cancel" @click="close" />
+          <Button
+            variant="solid" theme="gray" label="Save Changes"
+            :loading="userUpdating"
+            @click="handleUpdateUser(close)"
+          />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Step-Up Password Confirmation Dialog (for SSO_REQUIRED) -->
+    <Dialog v-model="showStepUpDialog" :key="'step-up-' + showStepUpDialog" :options="{ title: 'Confirm Password for SSO-Only Policy', icon: { name: 'shield-alert' }, size: 'md' }">
+      <template #body-content>
+        <div class="space-y-3" @pointerdown.stop>
+          <p class="text-p-sm text-ink-gray-6">
+            Disabling password login across the organization requires step-up authentication. Please enter your administrator password to proceed.
+          </p>
+          <FormControl
+            v-model="stepUpPassword"
+            type="password"
+            label="Admin Password"
+            placeholder="••••••••"
+            required
+          />
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button label="Cancel" @click="close" />
+          <Button
+            variant="solid" theme="red" label="Confirm & Apply"
+            :loading="stepUpLoading" :disabled="!stepUpPassword.trim()"
+            @click="handleConfirmStepUp(close)"
+          />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Add / Edit Group Override Dialog -->
+    <Dialog v-model="showOverrideDialog" :key="'override-' + showOverrideDialog" :options="{ title: overrideEditing ? 'Edit Group Policy Override' : 'Add Group Policy Override', icon: { name: 'shield' }, size: 'lg' }">
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <div v-if="!overrideEditing">
+            <label class="block text-xs font-medium text-ink-gray-5 mb-1">Group</label>
+            <select
+              v-if="groups && groups.length"
+              v-model="overrideGroupId"
+              class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-2 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+            >
+              <option v-for="g in groups" :key="g.id" :value="String(g.id)">
+                {{ g.name }} ({{ g.user_count }} member{{ g.user_count !== 1 ? 's' : '' }})
+              </option>
+            </select>
+            <FormControl
+              v-else
+              v-model="overrideGroupId"
+              label="Group ID"
+              type="text"
+              placeholder="e.g. 1"
+              required
+            />
+          </div>
+          <div v-else>
+            <p class="text-sm font-medium text-ink-gray-9">Group: {{ overrideEditing.group_name }}</p>
+          </div>
+
+          <div>
+            <label class="block text-xs font-medium text-ink-gray-5 mb-1">Requirement</label>
+            <select
+              v-model="overrideReq"
+              class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-2 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+            >
+              <option v-for="opt in policyOptions" :key="opt.value" :value="opt.value">
+                {{ opt.label }} — {{ opt.description }}
+              </option>
+            </select>
+          </div>
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button label="Cancel" @click="close" />
+          <Button
+            variant="solid" theme="gray" :label="overrideEditing ? 'Update Override' : 'Create Override'"
+            :loading="overrideSaving"
+            @click="handleSaveOverride(close)"
+          />
+        </div>
+      </template>
+    </Dialog>
+
+    <!-- Add / Edit SSO Provider Dialog -->
+    <Dialog v-model="showSsoDialog" :key="'sso-' + showSsoDialog" :options="{ title: ssoEditing ? 'Edit SSO Provider' : 'Add SSO Provider', icon: { name: 'globe' }, size: 'lg' }">
+      <template #body-content>
+        <div class="space-y-4" @pointerdown.stop>
+          <div v-if="!ssoEditing">
+            <label class="block text-xs font-medium text-ink-gray-5 mb-1">Provider Type</label>
+            <select
+              v-model="ssoProvider"
+              class="w-full rounded-md border border-outline-gray-1 bg-surface-white px-3 py-2 text-sm text-ink-gray-9 focus:border-gray-900 focus:outline-none"
+              @change="ssoName = availableProviders.find(p => p.id === ssoProvider)?.name || ssoProvider"
+            >
+              <option v-for="p in availableProviders" :key="p.id" :value="p.id">
+                {{ p.name }} ({{ p.id }})
+              </option>
+            </select>
+          </div>
+
+          <FormControl
+            v-model="ssoName"
+            label="Display Name"
+            type="text"
+            placeholder="Google Workspace, GitHub Org, etc."
+            required
+          />
+
+          <FormControl
+            v-model="ssoClientId"
+            label="Client ID / App ID"
+            type="text"
+            placeholder="e.g. 123456789.apps.googleusercontent.com"
+            required
+          />
+
+          <FormControl
+            v-model="ssoClientSecret"
+            type="password"
+            :label="ssoEditing ? 'Client Secret (leave blank to keep current)' : 'Client Secret'"
+            placeholder="••••••••••••••••••••••••••••••••"
+            :required="!ssoEditing"
+          />
+
+          <div v-if="ssoProvider" class="rounded-md border border-outline-gray-1 bg-surface-gray-1 p-3">
+            <p class="text-xs text-ink-gray-5 font-medium mb-1">OAuth Authorized Redirect URI / Callback URL</p>
+            <div class="flex items-center gap-2">
+              <code class="text-xs font-mono text-ink-gray-8 bg-surface-white px-2 py-1 rounded border border-outline-gray-1 flex-1 break-all">
+                /_/accounts/{{ ssoProvider }}/login/callback/
+              </code>
+              <Button size="sm" variant="outline" label="Copy path" @click="copyToClipboard(`/_/accounts/${ssoProvider}/login/callback/`)" />
+            </div>
+            <p class="text-p-xs text-ink-gray-4 mt-1.5">
+              Copy this callback path and register it in your OAuth provider console (e.g. Google Cloud Console, GitHub OAuth App, Microsoft Entra ID).
+            </p>
+          </div>
+        </div>
+      </template>
+      <template #actions="{ close }">
+        <div class="flex justify-end gap-2 w-full">
+          <Button label="Cancel" @click="close" />
+          <Button
+            variant="solid" theme="gray" :label="ssoEditing ? 'Update Provider' : 'Save Provider'"
+            :loading="ssoSaving"
+            :disabled="!ssoName.trim() || !ssoClientId.trim() || (!ssoEditing && !ssoClientSecret.trim())"
+            @click="handleSaveSso(close)"
           />
         </div>
       </template>

@@ -156,11 +156,16 @@ POST /api/v1/auth/login  {username, password}
                           200 {access, refresh}   (401 if wrong/expired)
 ```
 
-The `mfa_token` is a short-lived (`MFA_CHALLENGE_TTL_SECONDS`, default 300s),
-single-use value stored server-side in the Django cache (Redis in
-production) — it is not a JWT itself and carries no user data client-side,
-it is just an opaque lookup key. It is deleted on first use whether or not
-the code was correct, so it cannot be replayed.
+The `mfa_token` is a short-lived (`MFA_CHALLENGE_TTL_SECONDS`, default 300s)
+value stored server-side in the Django cache (Redis in production) — it is
+not a JWT itself and carries no user data client-side, it is just an opaque
+lookup key. A wrong code does NOT consume it: the client may retry with the
+same token until it expires, succeeds, or hits the wrong-attempt limit
+(then the server discards it and the user must log in again). Only a
+successful verification consumes it, so it cannot be replayed for a second
+login. If `/mfa/verify` reports the challenge expired/used, the SPA must
+send the user back to the password step for a fresh token — retrying the
+old one can never succeed.
 
 ### Enrollment flow (Settings → Security in the SPA)
 

@@ -80,7 +80,7 @@ def test_totp_enrollment_and_login_flow(client):
     assert verify_body['access']
     assert verify_body['refresh']
 
-    # 7. Challenge token is single-use — replay must fail.
+    # 7. Challenge token is consumed on success — replay must fail.
     r = client.post('/api/v1/auth/mfa/verify', data={'mfa_token': mfa_token, 'code': code2}, content_type='application/json')
     assert r.status_code == 401
 
@@ -103,3 +103,39 @@ def test_totp_enrollment_and_login_flow(client):
 
     r = client.get('/api/v1/auth/mfa/status', HTTP_AUTHORIZATION=f'Bearer {new_access}')
     assert r.json()['enabled'] is False
+
+
+@override_settings(CACHES=_LOCMEM_CACHES)
+def test_mfa_verify_survives_wrong_code_then_succeeds(client):
+    """Regression test: a wrong TOTP code must NOT burn the MFA challenge.
+    The same mfa_token must still accept the correct code afterwards, and
+    codes with pasted whitespace (e.g. "123 456") must be accepted."""
+    user = User.objects.create_user(username='mfa_retry_user', password='correct-pw-123', email='retry@test.local')
+
+    r = client.post('/api/v1/auth/login', data={'username': 'mfa_retry_user', 'password': 'correct-pw-123'}, content_type='application/json')
+    access = r.json()['access']
+
+    r = client.post('/api/v1/auth/mfa/setup', content_type='application/json', HTTP_AUTHORIZATION=f'Bearer {access}')
+    secret = r.json()['secret']
+    code = _hotp(secret, int(time.time()) // 30)
+    r = client.post('/api/v1/auth/mfa/confirm', data={'code': code}, content_type='application/json', HTTP_AUTHORIZATION=f'Bearer {access}')
+    assert r.status_code == 200, r.content
+
+    r = client.post('/api/v1/auth/login', data={'username': 'mfa_retry_user', 'password': 'correct-pw-123'}, content_type='application/json')
+    mfa_token = r.json()['mfa_token']
+
+    # Wrong code -> 401 "Incorrect code.", but the challenge must survive.
+    r = client.post('/api/v1/auth/mfa/verify', data={'mfa_token': mfa_token, 'code': '000000'}, content_type='application/json')
+    assert r.status_code == 401
+    assert 'Incorrect code' in r.json()['detail']
+
+    # Correct code (with pasted whitespace) on the SAME token -> success.
+    code2 = _hotp(secret, int(time.time()) // 30)
+    spaced = f'{code2[:3]} {code2[3:]}'
+    r = client.post('/api/v1/auth/mfa/verify', data={'mfa_token': mfa_token, 'code': spaced}, content_type='application/json')
+    assert r.status_code == 200, r.content
+    assert r.json()['access']
+
+    # ...but the consumed challenge still cannot be replayed.
+    r = client.post('/api/v1/auth/mfa/verify', data={'mfa_token': mfa_token, 'code': code2}, content_type='application/json')
+    assert r.status_code == 401

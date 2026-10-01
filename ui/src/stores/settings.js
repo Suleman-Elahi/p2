@@ -1,5 +1,5 @@
-import { useApi } from './api'
-import { computed, ref } from 'vue'
+import { useApi, getUser } from './api'
+import { computed, ref, watch } from 'vue'
 
 // ── Shared config ────────────────────────────────────────────────────────
 const config = ref({
@@ -12,10 +12,17 @@ const config = ref({
 const apiKeys = ref([])
 const users = ref([])
 const policies = ref([])
+const authPolicies = ref([])
+const groups = ref([])
+const ssoProviders = ref([])
+const availableProviders = ref([])
 
 // ── Composable: all settings ─────────────────────────────────────────────
 
 export function useSettings() {
+  const user = getUser()
+  const isSuperuser = computed(() => !!user.value?.is_superuser)
+
   // ── System Config ────────────────────────────────────────────────────
   const { data: cfgData, isFetching: cfgLoading, execute: fetchCfg } = useApi(
     '/system/config/',
@@ -82,7 +89,7 @@ export function useSettings() {
   // ── Users ──────────────────────────────────────────────────────────────
   const { data: usersData, isFetching: usersLoading, execute: fetchUsers } = useApi(
     '/system/user/',
-    { refetch: true },
+    { immediate: false, refetch: true },
   ).json()
 
   const usersList = computed(() => {
@@ -102,10 +109,42 @@ export function useSettings() {
       username: payload.username,
       password: payload.password,
       email: payload.email,
-      is_superuser: payload.is_superuser,
+      is_active: payload.is_active !== undefined ? payload.is_active : true,
+      is_superuser: payload.is_superuser || false,
+      groups: payload.groups || [],
     }
     await userCreate()
     if (userCreateError.value) throw userCreateError.value
+    await fetchUsers()
+  }
+
+  async function updateUser(id, payload) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/user/${id}/`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchUsers()
+  }
+
+  async function deleteUser(id) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/user/${id}/`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
     await fetchUsers()
   }
 
@@ -220,6 +259,169 @@ export function useSettings() {
     await fetchMfaStatus()
   }
 
+  // ── Auth Policies ────────────────────────────────────────────────────────
+  const { data: authPoliciesData, isFetching: authPoliciesLoading, execute: fetchAuthPolicies } = useApi(
+    '/system/auth-policy/',
+    { immediate: false, refetch: true },
+  ).json()
+
+  const authPoliciesList = computed(() => {
+    if (authPoliciesData.value) authPolicies.value = authPoliciesData.value
+    return authPolicies.value
+  })
+
+  async function createAuthPolicy(payload) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch('/api/v1/system/auth-policy/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchAuthPolicies()
+    return resp.json()
+  }
+
+  async function updateAuthPolicy(id, payload) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/auth-policy/${id}/`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchAuthPolicies()
+    return resp.json()
+  }
+
+  async function deleteAuthPolicy(id) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/auth-policy/${id}/`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchAuthPolicies()
+  }
+
+  async function getAffectedCount(requirement, groupId) {
+    const token = localStorage.getItem('p2_token') || ''
+    const params = new URLSearchParams({ requirement })
+    if (groupId) params.append('group_id', groupId)
+    const resp = await fetch(`/api/v1/system/auth-policy/affected-count/?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!resp.ok) return { count: 0 }
+    return resp.json()
+  }
+
+  // ── Groups ───────────────────────────────────────────────────────────────
+  const { data: groupsData, isFetching: groupsLoading, execute: fetchGroups } = useApi(
+    '/system/auth-policy/groups/',
+    { immediate: false, refetch: true },
+  ).json()
+
+  const groupsList = computed(() => {
+    if (groupsData.value) groups.value = groupsData.value
+    return groups.value
+  })
+
+  // ── SSO Providers ────────────────────────────────────────────────────────
+  const { data: ssoData, isFetching: ssoProvidersLoading, execute: fetchSso } = useApi(
+    '/system/sso-providers/',
+    { immediate: false, refetch: true },
+  ).json()
+
+  const ssoList = computed(() => {
+    if (ssoData.value) ssoProviders.value = ssoData.value
+    return ssoProviders.value
+  })
+
+  const { data: availData, isFetching: availLoading, execute: fetchAvail } = useApi(
+    '/system/sso-providers/available/',
+    { immediate: false, refetch: true },
+  ).json()
+
+  const availList = computed(() => {
+    if (availData.value) availableProviders.value = availData.value
+    return availableProviders.value
+  })
+
+  // Auto-fetch superuser-only data only when user is a superuser
+  watch(isSuperuser, (val) => {
+    if (val) {
+      fetchUsers()
+      fetchAuthPolicies()
+      fetchGroups()
+      fetchSso()
+      fetchAvail()
+    }
+  }, { immediate: true })
+
+  async function createSsoProvider(payload) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch('/api/v1/system/sso-providers/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchSso()
+    return resp.json()
+  }
+
+  async function updateSsoProvider(id, payload) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/sso-providers/${id}/`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchSso()
+    return resp.json()
+  }
+
+  async function deleteSsoProvider(id) {
+    const token = localStorage.getItem('p2_token') || ''
+    const resp = await fetch(`/api/v1/system/sso-providers/${id}/`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}))
+      throw new Error(body.detail || `HTTP ${resp.status}`)
+    }
+    await fetchSso()
+  }
+
   return {
     // Config
     config: cfg,
@@ -239,6 +441,8 @@ export function useSettings() {
     fetchUsers,
     createUser,
     userCreating,
+    updateUser,
+    deleteUser,
     // Policies
     policies: policiesList,
     policiesLoading,
@@ -259,6 +463,28 @@ export function useSettings() {
     mfaConfirming,
     disableMfa,
     mfaDisabling,
+    // Auth Policies
+    authPolicies: authPoliciesList,
+    authPoliciesLoading,
+    fetchAuthPolicies,
+    createAuthPolicy,
+    updateAuthPolicy,
+    deleteAuthPolicy,
+    getAffectedCount,
+    // Groups
+    groups: groupsList,
+    groupsLoading,
+    fetchGroups,
+    // SSO Providers
+    ssoProviders: ssoList,
+    ssoProvidersLoading,
+    fetchSsoProviders: fetchSso,
+    availableProviders: availList,
+    availLoading,
+    fetchAvailableProviders: fetchAvail,
+    createSsoProvider,
+    updateSsoProvider,
+    deleteSsoProvider,
   }
 }
 
@@ -270,4 +496,4 @@ export function useSettingsSingleton() {
   return defaultInstance
 }
 
-export { config, apiKeys, users, policies }
+export { config, apiKeys, users, policies, authPolicies, groups, ssoProviders, availableProviders }
