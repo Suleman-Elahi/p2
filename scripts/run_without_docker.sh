@@ -60,6 +60,31 @@ _set_env_default() {
     _set_env_value "$key" "$value"
 }
 
+# Like _set_env_default, but values matching the placeholder regex ($3) are
+# treated as "unset" and rewritten with the native default. Compose overrides
+# these to the `redis` service name via `environment:`, so .env keeps Docker
+# values by default — but outside compose that hostname has no DNS entry, so
+# every Redis client hangs on connect until it times out.
+_set_env_default_native() {
+    local key="$1"
+    local value="$2"
+    local placeholder_re="$3"
+    local current
+
+    current="$(_get_env_value "$key")"
+    if [[ -n "$current" && ! "$current" =~ $placeholder_re ]]; then
+        info "Preserving .env ${key}=${current}"
+        return
+    fi
+
+    if [[ -n "$current" ]]; then
+        info "Replacing Docker placeholder .env ${key}=${current} -> ${value}"
+    else
+        info "Setting native default ${key}=${value}"
+    fi
+    _set_env_value "$key" "$value"
+}
+
 _generate_secret_key() {
     if command -v python3 &>/dev/null; then
         python3 -c 'import secrets; print(secrets.token_urlsafe(64))'
@@ -159,8 +184,14 @@ else
     info "Preserving .env P2_STORAGE__ROOT=$CONFIGURED_STORAGE_ROOT"
 fi
 
-_set_env_default "P2_REDIS__HOST" "127.0.0.1"
-_set_env_default "P2_REDIS__ARQ_URL" "redis://127.0.0.1:6379/1"
+_set_env_default_native "P2_REDIS__HOST" "127.0.0.1" '^redis$'
+_set_env_default_native "P2_REDIS__ARQ_URL" "redis://127.0.0.1:6379/1" '^rediss?://redis([:/]|$)'
+# P2_REDIS__URL is optional (settings falls back to redis.host), so only
+# rewrite it when a Docker placeholder is actually present.
+_p2_redis_url="$(_get_env_value "P2_REDIS__URL")"
+if [[ "$_p2_redis_url" =~ ^rediss?://redis([:/]|$) ]]; then
+    _set_env_default_native "P2_REDIS__URL" "redis://127.0.0.1:6379/0" '^rediss?://redis([:/]|$)'
+fi
 _set_env_default "P2_STORAGE__VOLUME_SIZE_BYTES" "104857600"
 _set_env_default "P2_STORAGE__VOLUME_ACTIVE_POOL_SIZE" "2"
 _set_env_default "P2_SECURITY__SSL_REDIRECT" "false"
